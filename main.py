@@ -13,6 +13,13 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from optimizer import optimize_route
+from emails import (
+    send_welcome_email,
+    send_delivery_started_email,
+    send_delivery_completed_email,
+    send_delivery_failed_email,
+    send_daily_summary_email
+)
 
 # Cargar variables de entorno
 load_dotenv()
@@ -83,6 +90,46 @@ class LocationUpdate(BaseModel):
     lng: float
     speed: Optional[float] = None
     accuracy: Optional[float] = None
+
+
+# -- Modelos de Email --
+
+class WelcomeEmailRequest(BaseModel):
+    to_email: str
+    user_name: str
+
+
+class DeliveryStartedEmailRequest(BaseModel):
+    to_email: str
+    client_name: str
+    driver_name: str
+    estimated_time: Optional[str] = None
+    tracking_url: Optional[str] = None
+
+
+class DeliveryCompletedEmailRequest(BaseModel):
+    to_email: str
+    client_name: str
+    delivery_time: str
+    photo_url: Optional[str] = None
+    recipient_name: Optional[str] = None
+
+
+class DeliveryFailedEmailRequest(BaseModel):
+    to_email: str
+    client_name: str
+    reason: Optional[str] = None
+    next_attempt: Optional[str] = None
+
+
+class DailySummaryEmailRequest(BaseModel):
+    to_email: str
+    dispatcher_name: str
+    date: str
+    total_routes: int
+    total_stops: int
+    completed_stops: int
+    failed_stops: int
 
 
 # === ENDPOINTS BÁSICOS ===
@@ -298,6 +345,78 @@ async def get_location_history(driver_id: str, route_id: Optional[str] = None, l
 
     result = query.order("recorded_at", desc=True).limit(limit).execute()
     return {"locations": result.data}
+
+
+# === EMAILS ===
+
+@app.post("/email/welcome")
+async def api_send_welcome_email(request: WelcomeEmailRequest):
+    """Envía email de bienvenida a nuevo usuario"""
+    result = send_welcome_email(request.to_email, request.user_name)
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
+    return result
+
+
+@app.post("/email/delivery-started")
+async def api_send_delivery_started_email(request: DeliveryStartedEmailRequest):
+    """Envía email cuando el pedido está en camino"""
+    result = send_delivery_started_email(
+        request.to_email,
+        request.client_name,
+        request.driver_name,
+        request.estimated_time,
+        request.tracking_url
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
+    return result
+
+
+@app.post("/email/delivery-completed")
+async def api_send_delivery_completed_email(request: DeliveryCompletedEmailRequest):
+    """Envía email de confirmación de entrega"""
+    result = send_delivery_completed_email(
+        request.to_email,
+        request.client_name,
+        request.delivery_time,
+        request.photo_url,
+        request.recipient_name
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
+    return result
+
+
+@app.post("/email/delivery-failed")
+async def api_send_delivery_failed_email(request: DeliveryFailedEmailRequest):
+    """Envía email cuando la entrega falla"""
+    result = send_delivery_failed_email(
+        request.to_email,
+        request.client_name,
+        request.reason,
+        request.next_attempt
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
+    return result
+
+
+@app.post("/email/daily-summary")
+async def api_send_daily_summary_email(request: DailySummaryEmailRequest):
+    """Envía resumen diario al dispatcher"""
+    result = send_daily_summary_email(
+        request.to_email,
+        request.dispatcher_name,
+        request.date,
+        request.total_routes,
+        request.total_stops,
+        request.completed_stops,
+        request.failed_stops
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
+    return result
 
 
 # === MAIN ===
