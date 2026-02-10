@@ -12,7 +12,14 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-from optimizer import optimize_route
+from optimizer import (
+    optimize_route,
+    calculate_eta,
+    calculate_route_etas,
+    cluster_stops_by_zone,
+    assign_drivers_to_zones,
+    optimize_multi_vehicle
+)
 from emails import (
     send_welcome_email,
     send_delivery_started_email,
@@ -61,6 +68,47 @@ class Location(BaseModel):
 class OptimizeRequest(BaseModel):
     locations: List[Location] = Field(..., min_length=1)
     start_index: Optional[int] = Field(default=0)
+
+
+class MultiVehicleOptimizeRequest(BaseModel):
+    locations: List[Location] = Field(..., min_length=1)
+    num_vehicles: int = Field(..., ge=1, le=50)
+    depot_index: Optional[int] = Field(default=0)
+    max_distance_per_vehicle_km: Optional[float] = None
+
+
+class ClusterRequest(BaseModel):
+    stops: List[Location] = Field(..., min_length=1)
+    n_zones: Optional[int] = Field(default=None, ge=1, le=20)
+    max_stops_per_zone: Optional[int] = Field(default=15, ge=5, le=50)
+
+
+class ETARequest(BaseModel):
+    current_lat: float
+    current_lng: float
+    destination_lat: float
+    destination_lng: float
+    avg_speed_kmh: Optional[float] = Field(default=30.0, ge=5, le=120)
+    stop_time_minutes: Optional[float] = Field(default=5.0, ge=0, le=60)
+
+
+class RouteETARequest(BaseModel):
+    route: List[Location] = Field(..., min_length=1)
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    avg_speed_kmh: Optional[float] = Field(default=30.0)
+    stop_time_minutes: Optional[float] = Field(default=5.0)
+
+
+class DriverInfo(BaseModel):
+    id: str
+    location: Optional[dict] = None  # {lat, lng}
+
+
+class AssignDriversRequest(BaseModel):
+    zones: List[dict]  # Output from cluster endpoint
+    drivers: List[DriverInfo]
+    driver_routes: Optional[dict] = {}  # driver_id -> pending_routes
 
 
 class GeocodeRequest(BaseModel):
@@ -170,6 +218,149 @@ async def geocode(request: GeocodeRequest):
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
+# === ENDPOINTS AVANZADOS DE OPTIMIZACIÓN ===
+
+@app.post("/optimize-multi")
+async def optimize_multi(request: MultiVehicleOptimizeRequest):
+    """Optimiza rutas para múltiples vehículos (CVRP)"""
+    if len(request.locations) > 200:
+        raise HTTPException(status_code=400, detail="Máximo 200 paradas para multi-vehicle")
+
+    locations_data = [loc.model_dump() for loc in request.locations]
+
+    max_distance = None
+    if request.max_distance_per_vehicle_km:
+        max_distance = int(request.max_distance_per_vehicle_km * 1000)
+
+    result = optimize_multi_vehicle(
+        locations=locations_data,
+        num_vehicles=request.num_vehicles,
+        depot_index=request.depot_index or 0,
+        max_distance_per_vehicle=max_distance
+    )
+    return result
+
+
+@app.post("/cluster-zones")
+async def cluster_zones(request: ClusterRequest):
+    """Agrupa paradas en zonas geográficas"""
+    if len(request.stops) > 500:
+        raise HTTPException(status_code=400, detail="Máximo 500 paradas para clustering")
+
+    stops_data = [stop.model_dump() for stop in request.stops]
+
+    result = cluster_stops_by_zone(
+        stops=stops_data,
+        n_zones=request.n_zones,
+        max_stops_per_zone=request.max_stops_per_zone or 15
+    )
+    return result
+
+
+@app.post("/eta")
+async def get_eta(request: ETARequest):
+    """Calcula ETA entre dos puntos"""
+    result = calculate_eta(
+        current_location=(request.current_lat, request.current_lng),
+        destination=(request.destination_lat, request.destination_lng),
+        avg_speed_kmh=request.avg_speed_kmh or 30.0,
+        stop_time_minutes=request.stop_time_minutes or 5.0
+    )
+    return {"success": True, **result}
+
+
+@app.post("/route-etas")
+async def get_route_etas(request: RouteETARequest):
+    """Calcula ETAs para todas las paradas de una ruta"""
+    route_data = [loc.model_dump() for loc in request.route]
+
+    start_location = None
+    if request.start_lat and request.start_lng:
+        start_location = (request.start_lat, request.start_lng)
+
+    result = calculate_route_etas(
+        route=route_data,
+        start_location=start_location,
+        avg_speed_kmh=request.avg_speed_kmh or 30.0,
+        stop_time_minutes=request.stop_time_minutes or 5.0
+    )
+
+    return {"success": True, "route": result, "num_stops": len(result)}
+
+
+@app.post("/assign-drivers")
+async def assign_drivers(request: AssignDriversRequest):
+    """Asigna conductores a zonas de forma inteligente"""
+    drivers_data = [
+        {
+            "id": d.id,
+            "location": d.location
+        }
+        for d in request.drivers
+    ]
+
+    result = assign_drivers_to_zones(
+        zones=request.zones,
+        drivers=drivers_data,
+        driver_routes=request.driver_routes or {}
+    )
+    return {"success": True, **result}
+
+
+@app.get("/stats/daily")
+async def get_daily_stats(company_id: Optional[str] = None):
+    """Obtiene estadísticas del día para el dashboard"""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        # Obtener rutas de hoy
+        query = supabase.table("routes").select("*, stops(*)")
+        if company_id:
+            query = query.eq("company_id", company_id)
+
+        routes_result = query.execute()
+        routes = routes_result.data or []
+
+        # Calcular estadísticas
+        total_routes = len(routes)
+        completed_routes = len([r for r in routes if r.get('status') == 'completed'])
+        pending_routes = len([r for r in routes if r.get('status') != 'completed'])
+
+        all_stops = []
+        for route in routes:
+            all_stops.extend(route.get('stops', []))
+
+        total_stops = len(all_stops)
+        completed_stops = len([s for s in all_stops if s.get('status') == 'completed'])
+        failed_stops = len([s for s in all_stops if s.get('status') == 'failed'])
+        pending_stops = total_stops - completed_stops - failed_stops
+
+        success_rate = round((completed_stops / total_stops * 100) if total_stops > 0 else 0, 1)
+
+        total_distance = sum(r.get('total_distance_km', 0) or 0 for r in routes)
+
+        return {
+            "success": True,
+            "date": today,
+            "routes": {
+                "total": total_routes,
+                "completed": completed_routes,
+                "pending": pending_routes
+            },
+            "stops": {
+                "total": total_stops,
+                "completed": completed_stops,
+                "failed": failed_stops,
+                "pending": pending_stops
+            },
+            "success_rate": success_rate,
+            "total_distance_km": round(total_distance, 1)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # === ENDPOINTS SUPABASE ===
