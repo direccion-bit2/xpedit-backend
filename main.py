@@ -98,8 +98,13 @@ async def get_current_user(authorization: str = Header(default=None)):
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado - cierra sesion y vuelve a entrar")
     except pyjwt.InvalidTokenError as e:
-        print(f"[AUTH] InvalidTokenError: {e}, secret_len={len(SUPABASE_JWT_SECRET)}, token_start={token[:20]}")
-        raise HTTPException(status_code=401, detail=f"Token invalido: {str(e)[:100]}")
+        try:
+            h = pyjwt.get_unverified_header(token)
+            alg_info = f" (alg={h.get('alg')}, typ={h.get('typ')})"
+        except Exception:
+            alg_info = " (header unreadable)"
+        print(f"[AUTH] InvalidTokenError: {e}{alg_info}")
+        raise HTTPException(status_code=401, detail=f"Token invalido: {str(e)[:80]}{alg_info}")
     except HTTPException:
         raise
     except Exception as e:
