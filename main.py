@@ -63,6 +63,8 @@ class Location(BaseModel):
     notes: Optional[str] = None
     phone: Optional[str] = None
     priority: Optional[int] = Field(default=0, ge=0, le=10)
+    time_window_start: Optional[str] = None  # "HH:MM"
+    time_window_end: Optional[str] = None    # "HH:MM"
 
 
 class OptimizeRequest(BaseModel):
@@ -122,6 +124,8 @@ class StopCreate(BaseModel):
     position: int
     notes: Optional[str] = None
     phone: Optional[str] = None
+    time_window_start: Optional[str] = None
+    time_window_end: Optional[str] = None
 
 
 class RouteCreate(BaseModel):
@@ -422,7 +426,9 @@ async def create_route(route: RouteCreate):
             "lng": stop.lng,
             "position": stop.position,
             "notes": stop.notes,
-            "phone": stop.phone
+            "phone": stop.phone,
+            "time_window_start": stop.time_window_start,
+            "time_window_end": stop.time_window_end,
         }
         for stop in route.stops
     ]

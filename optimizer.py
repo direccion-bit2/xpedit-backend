@@ -52,18 +52,35 @@ def create_distance_matrix(locations: List[Dict[str, float]]) -> List[List[int]]
     return matrix
 
 
+def _parse_time_to_minutes(time_str: Optional[str]) -> Optional[int]:
+    """Convierte '09:00' a minutos desde medianoche (540)."""
+    if not time_str:
+        return None
+    try:
+        parts = time_str.split(':')
+        return int(parts[0]) * 60 + int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
 def optimize_route(
     locations: List[Dict[str, Any]],
     depot_index: int = 0,
-    num_vehicles: int = 1
+    num_vehicles: int = 1,
+    avg_speed_kmh: float = 30.0,
+    stop_time_minutes: float = 5.0
 ) -> Dict[str, Any]:
     """
     Optimiza la ruta para visitar todas las ubicaciones.
+    Soporta ventanas horarias (time_window_start, time_window_end) en cada parada.
 
     Args:
-        locations: Lista de paradas con 'lat', 'lng', y opcionalmente 'id', 'address'
+        locations: Lista de paradas con 'lat', 'lng', y opcionalmente 'id', 'address',
+                   'time_window_start' ("HH:MM"), 'time_window_end' ("HH:MM")
         depot_index: Índice del punto de inicio (default: primera ubicación)
         num_vehicles: Número de vehículos/conductores
+        avg_speed_kmh: Velocidad promedio para calcular tiempos
+        stop_time_minutes: Tiempo de servicio por parada
 
     Returns:
         Dict con la ruta optimizada y métricas
@@ -79,6 +96,12 @@ def optimize_route(
 
     # Crear matriz de distancias
     distance_matrix = create_distance_matrix(locations)
+
+    # Comprobar si hay ventanas horarias
+    has_time_windows = any(
+        loc.get('time_window_start') or loc.get('time_window_end')
+        for loc in locations
+    )
 
     # Crear el modelo de routing
     manager = pywrapcp.RoutingIndexManager(
@@ -98,6 +121,53 @@ def optimize_route(
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
+    # Si hay ventanas horarias, añadir dimensión de tiempo
+    if has_time_windows:
+        # Crear callback de tiempo (minutos de viaje entre nodos)
+        def time_callback(from_index, to_index):
+            from_node = manager.IndexToNode(from_index)
+            to_node = manager.IndexToNode(to_index)
+            distance_m = distance_matrix[from_node][to_node]
+            travel_time_min = int((distance_m / 1000 / avg_speed_kmh) * 60)
+            return travel_time_min + int(stop_time_minutes)
+
+        time_callback_index = routing.RegisterTransitCallback(time_callback)
+
+        # Dimensión de tiempo: max 24 horas (1440 minutos)
+        routing.AddDimension(
+            time_callback_index,
+            60,    # max espera (slack) en minutos - esperar hasta 60 min
+            1440,  # max tiempo total (24h)
+            False, # no forzar start a cero
+            'Time'
+        )
+
+        time_dimension = routing.GetDimensionOrDie('Time')
+
+        # Hora actual en minutos desde medianoche
+        now = datetime.now()
+        current_time_minutes = now.hour * 60 + now.minute
+
+        # Aplicar ventanas horarias a cada nodo
+        for i, loc in enumerate(locations):
+            index = manager.NodeToIndex(i)
+            tw_start = _parse_time_to_minutes(loc.get('time_window_start'))
+            tw_end = _parse_time_to_minutes(loc.get('time_window_end'))
+
+            if i == depot_index:
+                # Depot: empezar ahora
+                time_dimension.CumulVar(index).SetRange(
+                    current_time_minutes, current_time_minutes
+                )
+            elif tw_start is not None and tw_end is not None:
+                # Parada con ventana horaria
+                time_dimension.CumulVar(index).SetRange(tw_start, tw_end)
+            else:
+                # Sin ventana: cualquier hora del día
+                time_dimension.CumulVar(index).SetRange(
+                    current_time_minutes, 1440
+                )
+
     # Configurar parámetros de búsqueda
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
@@ -112,6 +182,14 @@ def optimize_route(
     solution = routing.SolveWithParameters(search_parameters)
 
     if not solution:
+        # Si falla con time windows, reintentar sin ellas
+        if has_time_windows:
+            for loc in locations:
+                loc.pop('time_window_start', None)
+                loc.pop('time_window_end', None)
+            result = optimize_route(locations, depot_index, num_vehicles)
+            result['warning'] = 'No se pudo respetar todas las ventanas horarias. Ruta optimizada sin restricciones horarias.'
+            return result
         return {
             "success": False,
             "error": "No se encontró solución",
@@ -136,6 +214,7 @@ def optimize_route(
         "total_distance_meters": total_distance,
         "total_distance_km": round(total_distance / 1000, 2),
         "num_stops": len(optimized_route),
+        "has_time_windows": has_time_windows,
         "message": f"Ruta optimizada: {len(optimized_route)} paradas, {round(total_distance/1000, 2)} km"
     }
 
