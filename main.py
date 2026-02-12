@@ -50,7 +50,9 @@ supabase: Client = create_client(
 )
 
 # Supabase JWT secret for token verification
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+_raw_jwt = os.getenv("SUPABASE_JWT_SECRET", "")
+# Railway strips trailing '=' — restore base64 padding
+SUPABASE_JWT_SECRET = _raw_jwt + "=" * ((4 - len(_raw_jwt) % 4) % 4) if _raw_jwt else ""
 
 # Stripe
 import stripe
