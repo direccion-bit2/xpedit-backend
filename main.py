@@ -73,6 +73,7 @@ async def get_current_user(authorization: str = Header(default=None)):
 
     try:
         # Verify the JWT token
+        print(f"[AUTH] JWT secret length: {len(SUPABASE_JWT_SECRET)}, token length: {len(token)}")
         payload = pyjwt.decode(
             token,
             SUPABASE_JWT_SECRET,
@@ -92,7 +93,7 @@ async def get_current_user(authorization: str = Header(default=None)):
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado")
     except pyjwt.InvalidTokenError as e:
-        print(f"[AUTH] InvalidTokenError: {e}")
+        print(f"[AUTH] InvalidTokenError: {e}, secret_len={len(SUPABASE_JWT_SECRET)}")
         raise HTTPException(status_code=401, detail="Token invalido")
     except HTTPException:
         raise
