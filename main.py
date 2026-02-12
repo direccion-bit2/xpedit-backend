@@ -77,11 +77,12 @@ async def get_current_user(authorization: str = Header(default=None)):
         # Verify the JWT token
         # Decode header to check algorithm
         header = pyjwt.get_unverified_header(token)
-        print(f"[AUTH] JWT alg={header.get('alg')}, secret_len={len(SUPABASE_JWT_SECRET)}, token_len={len(token)}")
+        alg = header.get("alg", "HS256")
+        print(f"[AUTH] JWT alg={alg}, secret_len={len(SUPABASE_JWT_SECRET)}, token_len={len(token)}")
         payload = pyjwt.decode(
             token,
             SUPABASE_JWT_SECRET,
-            algorithms=["HS256", "HS384", "HS512"],
+            algorithms=[alg],
             audience="authenticated"
         )
         user_id = payload.get("sub")
