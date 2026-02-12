@@ -104,6 +104,68 @@ async def require_admin_or_dispatcher(user=Depends(get_current_user)):
     return user
 
 
+# === OWNERSHIP HELPERS ===
+
+async def get_user_driver_id(user: dict) -> Optional[str]:
+    """Get the driver_id for the authenticated user"""
+    result = supabase.table("drivers").select("id, company_id").eq("user_id", user["id"]).limit(1).execute()
+    if result.data:
+        return result.data[0]["id"]
+    return None
+
+
+async def verify_route_access(route_id: str, user: dict):
+    """Verify the user can access this route. Returns route data or raises 403."""
+    route_result = supabase.table("routes").select("id, driver_id").eq("id", route_id).limit(1).execute()
+    if not route_result.data:
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+    route = route_result.data[0]
+    if user["role"] == "admin":
+        return route
+    user_driver_id = await get_user_driver_id(user)
+    if route["driver_id"] == user_driver_id:
+        return route
+    # Dispatcher can access routes from same company
+    if user["role"] == "dispatcher" and user.get("company_id"):
+        driver_result = supabase.table("drivers").select("company_id").eq("id", route["driver_id"]).limit(1).execute()
+        if driver_result.data and driver_result.data[0].get("company_id") == user["company_id"]:
+            return route
+    raise HTTPException(status_code=403, detail="No tienes acceso a esta ruta")
+
+
+async def verify_stop_access(stop_id: str, user: dict):
+    """Verify the user can access this stop via route ownership."""
+    stop_result = supabase.table("stops").select("id, route_id").eq("id", stop_id).limit(1).execute()
+    if not stop_result.data:
+        raise HTTPException(status_code=404, detail="Parada no encontrada")
+    await verify_route_access(stop_result.data[0]["route_id"], user)
+    return stop_result.data[0]
+
+
+async def verify_driver_access(driver_id: str, user: dict):
+    """Verify the user can access this driver's data."""
+    if user["role"] == "admin":
+        return True
+    user_driver_id = await get_user_driver_id(user)
+    if driver_id == user_driver_id:
+        return True
+    if user["role"] == "dispatcher" and user.get("company_id"):
+        driver_result = supabase.table("drivers").select("company_id").eq("id", driver_id).limit(1).execute()
+        if driver_result.data and driver_result.data[0].get("company_id") == user["company_id"]:
+            return True
+    raise HTTPException(status_code=403, detail="No tienes acceso a este conductor")
+
+
+async def verify_company_management(user: dict, company_id: str = None):
+    """Verify the user can manage this company (admin or dispatcher of the company)."""
+    if user["role"] == "admin":
+        return True
+    if user["role"] == "dispatcher" and user.get("company_id"):
+        if company_id is None or user["company_id"] == company_id:
+            return True
+    raise HTTPException(status_code=403, detail="No tienes permisos para gestionar esta empresa")
+
+
 app = FastAPI(
     title="RutaMax API",
     description="API de optimización de rutas para entregas de última milla",
@@ -386,14 +448,27 @@ async def assign_drivers(request: AssignDriversRequest, user=Depends(get_current
 
 @app.get("/stats/daily")
 async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_current_user)):
-    """Obtiene estadísticas del día para el dashboard"""
+    """Obtiene estadísticas del día - filtradas por permisos del usuario"""
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        # Obtener rutas de hoy
+        # Obtener rutas filtradas por permisos
         query = supabase.table("routes").select("*, stops(*)")
-        if company_id:
-            query = query.eq("company_id", company_id)
+        if user["role"] == "admin":
+            if company_id:
+                query = query.eq("company_id", company_id)
+        elif user["role"] == "dispatcher" and user.get("company_id"):
+            company_drivers = supabase.table("drivers").select("id").eq("company_id", user["company_id"]).execute()
+            driver_ids = [d["id"] for d in (company_drivers.data or [])]
+            if driver_ids:
+                query = query.in_("driver_id", driver_ids)
+            else:
+                return {"success": True, "date": today, "routes": {"total": 0, "completed": 0, "pending": 0}, "stops": {"total": 0, "completed": 0, "failed": 0, "pending": 0}, "success_rate": 0, "total_distance_km": 0}
+        else:
+            user_driver_id = await get_user_driver_id(user)
+            if not user_driver_id:
+                return {"success": True, "date": today, "routes": {"total": 0, "completed": 0, "pending": 0}, "stops": {"total": 0, "completed": 0, "failed": 0, "pending": 0}, "success_rate": 0, "total_distance_km": 0}
+            query = query.eq("driver_id", user_driver_id)
 
         routes_result = query.execute()
         routes = routes_result.data or []
@@ -444,14 +519,22 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
 
 @app.get("/drivers")
 async def get_drivers(user=Depends(get_current_user)):
-    """Lista todos los conductores"""
-    result = supabase.table("drivers").select("*").eq("active", True).execute()
+    """Lista conductores - admin ve todos, dispatcher ve su empresa, driver ve solo él"""
+    query = supabase.table("drivers").select("*").eq("active", True)
+    if user["role"] == "admin":
+        pass  # Admin sees all
+    elif user["role"] == "dispatcher" and user.get("company_id"):
+        query = query.eq("company_id", user["company_id"])
+    else:
+        query = query.eq("user_id", user["id"])
+    result = query.execute()
     return {"drivers": result.data}
 
 
 @app.get("/drivers/{driver_id}")
 async def get_driver(driver_id: str, user=Depends(get_current_user)):
-    """Obtiene un conductor por ID"""
+    """Obtiene un conductor por ID - verificando acceso"""
+    await verify_driver_access(driver_id, user)
     result = supabase.table("drivers").select("*").eq("id", driver_id).single().execute()
     return result.data
 
@@ -460,11 +543,33 @@ async def get_driver(driver_id: str, user=Depends(get_current_user)):
 
 @app.get("/routes")
 async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None, user=Depends(get_current_user)):
-    """Lista rutas, opcionalmente filtradas por conductor o fecha"""
+    """Lista rutas - filtradas por propiedad del usuario"""
     query = supabase.table("routes").select("*, stops(*)")
 
-    if driver_id:
-        query = query.eq("driver_id", driver_id)
+    if user["role"] == "admin":
+        if driver_id:
+            query = query.eq("driver_id", driver_id)
+    elif user["role"] == "dispatcher" and user.get("company_id"):
+        # Dispatcher: only routes from drivers in their company
+        company_drivers = supabase.table("drivers").select("id").eq("company_id", user["company_id"]).execute()
+        company_driver_ids = [d["id"] for d in (company_drivers.data or [])]
+        if driver_id:
+            if driver_id not in company_driver_ids:
+                raise HTTPException(status_code=403, detail="No tienes acceso a este conductor")
+            query = query.eq("driver_id", driver_id)
+        elif company_driver_ids:
+            query = query.in_("driver_id", company_driver_ids)
+        else:
+            return {"routes": []}
+    else:
+        # Regular driver: only own routes
+        user_driver_id = await get_user_driver_id(user)
+        if not user_driver_id:
+            return {"routes": []}
+        if driver_id and driver_id != user_driver_id:
+            raise HTTPException(status_code=403, detail="No tienes acceso a estas rutas")
+        query = query.eq("driver_id", user_driver_id)
+
     if date:
         query = query.eq("date", date)
 
@@ -476,6 +581,11 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
 @app.post("/routes")
 async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     """Crea una nueva ruta con sus paradas"""
+    # Verify user can create route for this driver
+    if user["role"] != "admin":
+        user_driver_id = await get_user_driver_id(user)
+        if route.driver_id != user_driver_id:
+            raise HTTPException(status_code=403, detail="No puedes crear rutas para otro conductor")
     # Crear la ruta
     route_data = {
         "driver_id": route.driver_id,
@@ -513,14 +623,16 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
 
 @app.get("/routes/{route_id}")
 async def get_route(route_id: str, user=Depends(get_current_user)):
-    """Obtiene una ruta con sus paradas"""
+    """Obtiene una ruta con sus paradas - verificando acceso"""
+    await verify_route_access(route_id, user)
     result = supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
     return result.data
 
 
 @app.patch("/routes/{route_id}/start")
 async def start_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como iniciada"""
+    """Marca una ruta como iniciada - verificando acceso"""
+    await verify_route_access(route_id, user)
     result = supabase.table("routes").update({
         "status": "in_progress",
         "started_at": datetime.now().isoformat()
@@ -530,7 +642,8 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 
 @app.patch("/routes/{route_id}/complete")
 async def complete_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como completada"""
+    """Marca una ruta como completada - verificando acceso"""
+    await verify_route_access(route_id, user)
     result = supabase.table("routes").update({
         "status": "completed",
         "completed_at": datetime.now().isoformat()
@@ -540,7 +653,8 @@ async def complete_route(route_id: str, user=Depends(get_current_user)):
 
 @app.delete("/routes/{route_id}")
 async def delete_route(route_id: str, user=Depends(get_current_user)):
-    """Elimina una ruta y todas sus dependencias (proofs, tracking, stops)"""
+    """Elimina una ruta y todas sus dependencias - verificando acceso"""
+    await verify_route_access(route_id, user)
     # Get stop IDs for this route
     stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
     stop_ids = [s["id"] for s in (stops_result.data or [])]
@@ -565,7 +679,8 @@ async def delete_route(route_id: str, user=Depends(get_current_user)):
 
 @app.patch("/stops/{stop_id}/complete")
 async def complete_stop(stop_id: str, user=Depends(get_current_user)):
-    """Marca una parada como completada"""
+    """Marca una parada como completada - verificando acceso"""
+    await verify_stop_access(stop_id, user)
     result = supabase.table("stops").update({
         "status": "completed",
         "completed_at": datetime.now().isoformat()
@@ -575,7 +690,8 @@ async def complete_stop(stop_id: str, user=Depends(get_current_user)):
 
 @app.patch("/stops/{stop_id}/fail")
 async def fail_stop(stop_id: str, user=Depends(get_current_user)):
-    """Marca una parada como fallida"""
+    """Marca una parada como fallida - verificando acceso"""
+    await verify_stop_access(stop_id, user)
     result = supabase.table("stops").update({
         "status": "failed",
         "completed_at": datetime.now().isoformat()
@@ -587,9 +703,15 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
 
 @app.post("/location")
 async def update_location(location: LocationUpdate, user=Depends(get_current_user)):
-    """Registra la ubicación actual del conductor"""
+    """Registra la ubicación actual del conductor - fuerza driver_id del usuario"""
+    # Force driver_id to be the authenticated user's driver
+    user_driver_id = await get_user_driver_id(user)
+    if not user_driver_id:
+        raise HTTPException(status_code=400, detail="No se encontró perfil de conductor")
+    if user["role"] != "admin" and location.driver_id != user_driver_id:
+        raise HTTPException(status_code=403, detail="No puedes registrar ubicación de otro conductor")
     data = {
-        "driver_id": location.driver_id,
+        "driver_id": user_driver_id if user["role"] != "admin" else location.driver_id,
         "route_id": location.route_id,
         "lat": location.lat,
         "lng": location.lng,
@@ -603,7 +725,8 @@ async def update_location(location: LocationUpdate, user=Depends(get_current_use
 
 @app.get("/location/{driver_id}/latest")
 async def get_latest_location(driver_id: str, user=Depends(get_current_user)):
-    """Obtiene la última ubicación conocida de un conductor"""
+    """Obtiene la última ubicación conocida de un conductor - verificando acceso"""
+    await verify_driver_access(driver_id, user)
     result = supabase.table("location_history")\
         .select("*")\
         .eq("driver_id", driver_id)\
@@ -619,7 +742,8 @@ async def get_latest_location(driver_id: str, user=Depends(get_current_user)):
 
 @app.get("/location/{driver_id}/history")
 async def get_location_history(driver_id: str, route_id: Optional[str] = None, limit: int = 100, user=Depends(get_current_user)):
-    """Obtiene el historial de ubicaciones de un conductor"""
+    """Obtiene el historial de ubicaciones de un conductor - verificando acceso"""
+    await verify_driver_access(driver_id, user)
     query = supabase.table("location_history")\
         .select("*")\
         .eq("driver_id", driver_id)
@@ -817,7 +941,9 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
 
 @app.get("/promo/check/{user_id}")
 async def check_promo_benefit(user_id: str, user=Depends(get_current_user)):
-    """Check if a user has an active promo benefit"""
+    """Check if a user has an active promo benefit - only own data or admin"""
+    if user["role"] != "admin" and user["id"] != user_id:
+        raise HTTPException(status_code=403, detail="No tienes acceso a estos datos")
     try:
         result = supabase.table("drivers")\
             .select("promo_plan, promo_plan_expires_at")\
@@ -1118,8 +1244,10 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
 # 15. GET /company/check-access/{user_id}
 # NOTE: Defined before /company/{company_id} to avoid route shadowing
 @app.get("/company/check-access/{user_id}")
-async def check_company_access(user_id: str):
-    """Check if a driver has company-paid access"""
+async def check_company_access(user_id: str, user=Depends(get_current_user)):
+    """Check if a driver has company-paid access - only own data or admin"""
+    if user["role"] != "admin" and user["id"] != user_id:
+        raise HTTPException(status_code=403, detail="No tienes acceso a estos datos")
     try:
         # Look up active company_driver_links for this user
         link_result = supabase.table("company_driver_links")\
@@ -1374,7 +1502,8 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
 # 6. POST /company/invites
 @app.post("/company/invites")
 async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_current_user)):
-    """Generate an invite code for a company"""
+    """Generate an invite code for a company - admin/dispatcher only"""
+    await verify_company_management(user, request.company_id)
     try:
         # Generate unique code
         for _ in range(10):
@@ -1437,8 +1566,12 @@ async def get_company_invites(company_id: str, user=Depends(get_current_user)):
 # 8. DELETE /company/invites/{invite_id}
 @app.delete("/company/invites/{invite_id}")
 async def deactivate_company_invite(invite_id: str, user=Depends(get_current_user)):
-    """Deactivate an invite code"""
+    """Deactivate an invite code - verify ownership"""
     try:
+        # Verify invite belongs to user's company
+        invite_check = supabase.table("company_invites").select("company_id").eq("id", invite_id).limit(1).execute()
+        if invite_check.data:
+            await verify_company_management(user, invite_check.data[0]["company_id"])
         result = supabase.table("company_invites")\
             .update({"active": False})\
             .eq("id", invite_id)\
@@ -1616,7 +1749,8 @@ async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_u
 # 11. POST /company/drivers
 @app.post("/company/drivers")
 async def create_company_driver(request: CompanyCreateDriverRequest, user=Depends(get_current_user)):
-    """Create a driver directly (admin creates account for driver)"""
+    """Create a driver directly - admin/dispatcher of the company only"""
+    await verify_company_management(user, request.company_id)
     try:
         # Use supabase admin auth to create a new user
         auth_response = supabase.auth.admin.create_user({
@@ -1682,9 +1816,9 @@ async def create_company_driver(request: CompanyCreateDriverRequest, user=Depend
 # 12. DELETE /company/drivers/{user_id}
 @app.delete("/company/drivers/{user_id}")
 async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
-    """Remove a driver from the company (admin-initiated)"""
+    """Remove a driver from the company - admin/dispatcher only"""
     try:
-        # Get current driver link to check mode
+        # Get current driver link to check mode and verify company ownership
         link_result = supabase.table("company_driver_links")\
             .select("*")\
             .eq("user_id", user_id)\
@@ -1696,6 +1830,7 @@ async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="Driver is not linked to any company")
 
         link = link_result.data[0]
+        await verify_company_management(user, link["company_id"])
         mode = link.get("mode", "driver_pays")
 
         # Remove company_id from users
@@ -1731,7 +1866,7 @@ async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
 # 13b. PATCH /company/drivers/{user_id}/active - toggle driver active/inactive
 @app.patch("/company/drivers/{user_id}/active")
 async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
-    """Toggle a driver's active status within the company (deactivate/reactivate)"""
+    """Toggle a driver's active status - admin/dispatcher of company only"""
     try:
         # Get current driver link
         link_result = supabase.table("company_driver_links")\
@@ -1744,6 +1879,7 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="Driver link not found")
 
         link = link_result.data[0]
+        await verify_company_management(user, link["company_id"])
         new_active = not link.get("active", True)
         mode = link.get("mode", "driver_pays")
 
@@ -1791,7 +1927,7 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
 # 13. PATCH /company/drivers/{user_id}/mode
 @app.patch("/company/drivers/{user_id}/mode")
 async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, user=Depends(get_current_user)):
-    """Change a driver's payment mode within the company"""
+    """Change a driver's payment mode - admin/dispatcher of company only"""
     try:
         if request.mode not in ("driver_pays", "company_pays", "company_complete"):
             raise HTTPException(status_code=400, detail="Invalid mode. Must be driver_pays, company_pays, or company_complete")
@@ -1808,6 +1944,7 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
             raise HTTPException(status_code=404, detail="Driver is not linked to any company")
 
         link = link_result.data[0]
+        await verify_company_management(user, link["company_id"])
         company_id = link["company_id"]
 
         # Get subscription for period end date
@@ -1899,6 +2036,86 @@ async def get_company_subscription(company_id: str, user=Depends(get_current_use
             raise HTTPException(status_code=404, detail="No subscription found for this company")
 
         return {"success": True, "subscription": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === OCR PROXY ===
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
+class OCRLabelRequest(BaseModel):
+    image_base64: str
+    media_type: str = "image/jpeg"
+
+
+@app.post("/ocr/label")
+async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
+    """Proxy OCR request to Anthropic API - keeps API key server-side"""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="OCR service not configured")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-3-haiku-20240307",
+                    "max_tokens": 500,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": request.media_type,
+                                    "data": request.image_base64,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": """Esta es una foto de una etiqueta de envío de paquetería (iMile, Shein, etc.).
+IMPORTANTE: La imagen puede estar ROTADA 90°, 180° o 270°. Analiza la orientación del texto primero.
+
+Busca la sección "TO" o destinatario que contiene:
+- Nombre del destinatario (persona)
+- Dirección: calle y número
+- Ciudad (ej: Arcos De La Frontera)
+- Código postal (5 dígitos, ej: 11630)
+- Provincia (ej: Cádiz)
+
+Responde ÚNICAMENTE con este JSON (sin explicaciones):
+{
+  "name": "Nombre completo del destinatario",
+  "street": "Calle y número exacto",
+  "city": "Ciudad/Localidad",
+  "postalCode": "Código postal de 5 dígitos",
+  "province": "Provincia"
+}
+
+CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
+                            },
+                        ],
+                    }],
+                },
+            )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"OCR API error: {response.status_code}")
+
+        data = response.json()
+        content = data.get("content", [{}])[0].get("text", "")
+        return {"success": True, "content": content}
 
     except HTTPException:
         raise
