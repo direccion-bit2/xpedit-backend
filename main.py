@@ -11,7 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import httpx
-import jwt as pyjwt
+try:
+    import jwt as pyjwt
+    # Verify it's PyJWT, not the 'jwt' package
+    if not hasattr(pyjwt, 'decode'):
+        raise ImportError("Wrong jwt package")
+except ImportError:
+    import subprocess
+    subprocess.check_call(["pip", "install", "PyJWT"])
+    import jwt as pyjwt
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -71,11 +79,13 @@ async def get_current_user(authorization: str = Header(default=None)):
         return result.data
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado")
-    except pyjwt.InvalidTokenError:
+    except pyjwt.InvalidTokenError as e:
+        print(f"[AUTH] InvalidTokenError: {e}")
         raise HTTPException(status_code=401, detail="Token invalido")
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[AUTH] Unexpected error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=401, detail="Error de autenticacion")
 
 
@@ -244,7 +254,13 @@ class DailySummaryEmailRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "RutaMax API", "version": "0.2.0"}
+    return {
+        "status": "ok",
+        "service": "RutaMax API",
+        "version": "0.2.0",
+        "jwt_configured": bool(SUPABASE_JWT_SECRET),
+        "jwt_secret_len": len(SUPABASE_JWT_SECRET),
+    }
 
 
 @app.post("/optimize")
