@@ -42,10 +42,11 @@ from emails import (
 # Cargar variables de entorno
 load_dotenv()
 
-# Inicializar Supabase
+# Inicializar Supabase (service role key para bypass RLS en servidor)
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
+    SUPABASE_SERVICE_KEY
 )
 
 # Supabase JWT secret for token verification
@@ -256,10 +257,8 @@ class DailySummaryEmailRequest(BaseModel):
 async def root():
     return {
         "status": "ok",
-        "service": "RutaMax API",
-        "version": "0.2.0",
-        "jwt_configured": bool(SUPABASE_JWT_SECRET),
-        "jwt_secret_len": len(SUPABASE_JWT_SECRET),
+        "service": "Xpedit API",
+        "version": "0.3.0",
     }
 
 
