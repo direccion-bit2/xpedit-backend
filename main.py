@@ -2322,6 +2322,87 @@ async def create_stripe_portal(user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# === GOOGLE PLACES PROXY ===
+# Proxy to avoid API key restrictions on mobile clients
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyCa5qb-hGr-3_j00yxbPZ52Fd4JLq1cAcM")
+
+@app.get("/places/autocomplete")
+async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
+    """Proxy for Google Places Autocomplete API"""
+    params = {
+        "input": input,
+        "types": "address",
+        "components": "country:es",
+        "language": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    if lat and lng:
+        params["location"] = f"{lat},{lng}"
+        params["radius"] = "50000"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
+        data = resp.json()
+
+    if data.get("status") != "OK":
+        # Fallback: Nominatim (OpenStreetMap) - free, no API key
+        async with httpx.AsyncClient() as client:
+            nom_resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": f"{input}, España",
+                    "format": "json",
+                    "addressdetails": "1",
+                    "limit": "5",
+                    "accept-language": "es",
+                },
+                headers={"User-Agent": "Xpedit/1.1"}
+            )
+            nom_data = nom_resp.json()
+
+        if nom_data:
+            results = [{"place_id": None, "display_name": r["display_name"], "lat": r["lat"], "lon": r["lon"], "source": "nominatim"} for r in nom_data]
+            return {"status": "OK", "predictions": results, "source": "nominatim"}
+        return {"status": "ZERO_RESULTS", "predictions": []}
+
+    return data
+
+
+@app.get("/places/details")
+async def places_details(place_id: str, user=Depends(get_current_user)):
+    """Proxy for Google Places Details API"""
+    params = {
+        "place_id": place_id,
+        "fields": "geometry,address_components,formatted_address",
+        "language": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.get("https://maps.googleapis.com/maps/api/place/details/json", params=params)
+    return resp.json()
+
+
+@app.get("/places/directions")
+async def places_directions(
+    origin: str,
+    destination: str,
+    waypoints: Optional[str] = None,
+    user=Depends(get_current_user)
+):
+    """Proxy for Google Directions API"""
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "key": GOOGLE_API_KEY,
+        "language": "es",
+    }
+    if waypoints:
+        params["waypoints"] = waypoints
+    async with httpx.AsyncClient() as client:
+        resp = await client.get("https://maps.googleapis.com/maps/api/directions/json", params=params)
+    return resp.json()
+
+
 # === MAIN ===
 if __name__ == "__main__":
     import uvicorn
