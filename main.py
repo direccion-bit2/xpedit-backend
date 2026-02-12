@@ -3,7 +3,7 @@ RutaMax API - Backend de optimización de rutas
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -614,6 +614,292 @@ async def api_send_daily_summary_email(request: DailySummaryEmailRequest):
     if not result["success"]:
         raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
     return result
+
+
+# === PROMO CODE MODELS ===
+
+class PromoRedeemRequest(BaseModel):
+    code: str
+    user_id: str
+
+
+class PromoCodeCreateRequest(BaseModel):
+    code: str
+    description: Optional[str] = None
+    benefit_type: str = "free_days"
+    benefit_value: int = Field(..., ge=1)
+    benefit_plan: str = "pro_plus"
+    max_uses: Optional[int] = None
+    expires_at: Optional[str] = None
+
+
+class PromoCodeUpdateRequest(BaseModel):
+    active: Optional[bool] = None
+    max_uses: Optional[int] = None
+    description: Optional[str] = None
+    expires_at: Optional[str] = None
+
+
+class AdminGrantRequest(BaseModel):
+    plan: str
+    days: int = Field(..., ge=1)
+
+
+# === PROMO CODE ENDPOINTS ===
+
+@app.post("/promo/redeem")
+async def redeem_promo_code(request: PromoRedeemRequest):
+    """Redeem a promo code for a user"""
+    try:
+        # 1. Find the promo code
+        code_result = supabase.table("promo_codes")\
+            .select("*")\
+            .eq("code", request.code.strip().upper())\
+            .execute()
+
+        if not code_result.data:
+            raise HTTPException(status_code=404, detail="Promo code not found")
+
+        promo = code_result.data[0]
+
+        # 2. Validate: is active
+        if not promo.get("active", False):
+            raise HTTPException(status_code=400, detail="This promo code is no longer active")
+
+        # 3. Validate: not expired
+        if promo.get("expires_at"):
+            expires_at = datetime.fromisoformat(promo["expires_at"].replace("Z", "+00:00"))
+            if datetime.now(expires_at.tzinfo) > expires_at:
+                raise HTTPException(status_code=400, detail="This promo code has expired")
+
+        # 4. Validate: max_uses not exceeded
+        if promo.get("max_uses") is not None:
+            if promo.get("current_uses", 0) >= promo["max_uses"]:
+                raise HTTPException(status_code=400, detail="This promo code has reached its maximum number of uses")
+
+        # 5. Validate: user hasn't already redeemed this code
+        existing = supabase.table("code_redemptions")\
+            .select("id")\
+            .eq("code_id", promo["id"])\
+            .eq("user_id", request.user_id)\
+            .execute()
+
+        if existing.data:
+            raise HTTPException(status_code=400, detail="You have already redeemed this promo code")
+
+        # 6. Calculate benefit expiration
+        now = datetime.now()
+        benefit_expires_at = now + timedelta(days=promo["benefit_value"])
+        benefit_expires_at_iso = benefit_expires_at.isoformat()
+
+        # 7. Increment current_uses on promo code
+        supabase.table("promo_codes")\
+            .update({"current_uses": (promo.get("current_uses", 0) + 1)})\
+            .eq("id", promo["id"])\
+            .execute()
+
+        # 8. Create code_redemption record
+        supabase.table("code_redemptions").insert({
+            "code_id": promo["id"],
+            "user_id": request.user_id,
+            "redeemed_at": now.isoformat(),
+            "benefit_expires_at": benefit_expires_at_iso
+        }).execute()
+
+        # 9. Update drivers table with promo plan
+        supabase.table("drivers").update({
+            "promo_plan": promo["benefit_plan"],
+            "promo_plan_expires_at": benefit_expires_at_iso
+        }).eq("id", request.user_id).execute()
+
+        return {
+            "success": True,
+            "benefit": promo["benefit_plan"],
+            "expires_at": benefit_expires_at_iso,
+            "message": f"Promo code redeemed! You have {promo['benefit_plan']} for {promo['benefit_value']} days."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/promo/check/{user_id}")
+async def check_promo_benefit(user_id: str):
+    """Check if a user has an active promo benefit"""
+    try:
+        result = supabase.table("drivers")\
+            .select("promo_plan, promo_plan_expires_at")\
+            .eq("id", user_id)\
+            .single()\
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        driver = result.data
+        promo_plan = driver.get("promo_plan")
+        expires_at_str = driver.get("promo_plan_expires_at")
+
+        if not promo_plan or not expires_at_str:
+            return {
+                "has_promo": False,
+                "plan": None,
+                "expires_at": None,
+                "days_remaining": 0
+            }
+
+        expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+        now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+        remaining = expires_at - now
+        days_remaining = max(0, remaining.days)
+
+        has_promo = days_remaining > 0
+
+        return {
+            "has_promo": has_promo,
+            "plan": promo_plan if has_promo else None,
+            "expires_at": expires_at_str if has_promo else None,
+            "days_remaining": days_remaining
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === ADMIN ENDPOINTS ===
+
+@app.get("/admin/promo-codes")
+async def list_promo_codes():
+    """List all promo codes with their stats (admin)"""
+    try:
+        result = supabase.table("promo_codes")\
+            .select("*")\
+            .order("created_at", desc=True)\
+            .execute()
+
+        return {"success": True, "promo_codes": result.data}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/promo-codes")
+async def create_promo_code(request: PromoCodeCreateRequest):
+    """Create a new promo code (admin)"""
+    try:
+        # Check if code already exists
+        existing = supabase.table("promo_codes")\
+            .select("id")\
+            .eq("code", request.code.strip().upper())\
+            .execute()
+
+        if existing.data:
+            raise HTTPException(status_code=400, detail="A promo code with this code already exists")
+
+        data = {
+            "code": request.code.strip().upper(),
+            "description": request.description,
+            "benefit_type": request.benefit_type,
+            "benefit_value": request.benefit_value,
+            "benefit_plan": request.benefit_plan,
+            "max_uses": request.max_uses,
+            "expires_at": request.expires_at,
+            "active": True,
+            "current_uses": 0
+        }
+
+        result = supabase.table("promo_codes").insert(data).execute()
+
+        return {"success": True, "promo_code": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/admin/promo-codes/{code_id}")
+async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest):
+    """Update a promo code (admin)"""
+    try:
+        # Build update dict with only provided fields
+        update_data = {}
+        if request.active is not None:
+            update_data["active"] = request.active
+        if request.max_uses is not None:
+            update_data["max_uses"] = request.max_uses
+        if request.description is not None:
+            update_data["description"] = request.description
+        if request.expires_at is not None:
+            update_data["expires_at"] = request.expires_at
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        result = supabase.table("promo_codes")\
+            .update(update_data)\
+            .eq("id", code_id)\
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Promo code not found")
+
+        return {"success": True, "promo_code": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/users")
+async def list_admin_users():
+    """List all users/drivers with promo status (admin)"""
+    try:
+        result = supabase.table("drivers")\
+            .select("*")\
+            .order("created_at", desc=True)\
+            .execute()
+
+        return {"success": True, "users": result.data}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/admin/users/{user_id}/grant")
+async def grant_free_days(user_id: str, request: AdminGrantRequest):
+    """Grant free days to a user (admin)"""
+    try:
+        now = datetime.now()
+        expires_at = now + timedelta(days=request.days)
+        expires_at_iso = expires_at.isoformat()
+
+        result = supabase.table("drivers").update({
+            "promo_plan": request.plan,
+            "promo_plan_expires_at": expires_at_iso
+        }).eq("id", user_id).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "plan": request.plan,
+            "expires_at": expires_at_iso,
+            "days": request.days,
+            "message": f"Granted {request.days} days of {request.plan} to user."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # === MAIN ===
