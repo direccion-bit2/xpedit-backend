@@ -10,16 +10,19 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
+import json
 import httpx
 try:
     import jwt as pyjwt
+    from jwt import PyJWKClient
     # Verify it's PyJWT, not the 'jwt' package
     if not hasattr(pyjwt, 'decode'):
         raise ImportError("Wrong jwt package")
 except ImportError:
     import subprocess
-    subprocess.check_call(["pip", "install", "PyJWT"])
+    subprocess.check_call(["pip", "install", "PyJWT[crypto]"])
     import jwt as pyjwt
+    from jwt import PyJWKClient
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -65,6 +68,11 @@ STRIPE_PLANS = {
     "pro_plus": {"name": "Xpedit Pro+", "amount": 999, "interval": "month"},
 }
 
+# JWKS client for ES256 token verification (Supabase uses ES256)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+_jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+_jwks_client = PyJWKClient(_jwks_url) if SUPABASE_URL else None
+
 
 async def get_current_user(authorization: str = Header(default=None)):
     """Verify Supabase JWT token and return user info"""
@@ -75,13 +83,21 @@ async def get_current_user(authorization: str = Header(default=None)):
 
     try:
         # Verify the JWT token
-        # Decode header to check algorithm
         header = pyjwt.get_unverified_header(token)
         alg = header.get("alg", "HS256")
-        print(f"[AUTH] JWT alg={alg}, secret_len={len(SUPABASE_JWT_SECRET)}, token_len={len(token)}")
+        print(f"[AUTH] JWT alg={alg}, token_len={len(token)}")
+
+        if alg == "ES256" and _jwks_client:
+            # ES256: use JWKS public key from Supabase
+            signing_key = _jwks_client.get_signing_key_from_jwt(token)
+            key = signing_key.key
+        else:
+            # HS256 fallback: use symmetric secret
+            key = SUPABASE_JWT_SECRET
+
         payload = pyjwt.decode(
             token,
-            SUPABASE_JWT_SECRET,
+            key,
             algorithms=[alg],
             audience="authenticated"
         )
@@ -342,13 +358,9 @@ async def root():
     return {
         "status": "ok",
         "service": "Xpedit API",
-        "version": "0.4.0",
-        "jwt_len": len(SUPABASE_JWT_SECRET),
-        "jwt_ends": SUPABASE_JWT_SECRET[-5:] if SUPABASE_JWT_SECRET else "EMPTY",
-        "jwt_starts": SUPABASE_JWT_SECRET[:10] if SUPABASE_JWT_SECRET else "EMPTY",
-        "jwt_plus_count": SUPABASE_JWT_SECRET.count("+"),
-        "jwt_space_count": SUPABASE_JWT_SECRET.count(" "),
+        "version": "0.5.0",
         "stripe_ok": bool(STRIPE_SECRET_KEY),
+        "jwks_ok": _jwks_client is not None,
     }
 
 
