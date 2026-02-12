@@ -3,6 +3,8 @@ RutaMax API - Backend de optimización de rutas
 """
 
 import os
+import random
+import time
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -895,6 +897,832 @@ async def grant_free_days(user_id: str, request: AdminGrantRequest):
             "days": request.days,
             "message": f"Granted {request.days} days of {request.plan} to user."
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === COMPANY / FLEET MANAGEMENT MODELS ===
+
+INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+DRIVER_PLAN_PRICES = {
+    "free": 0,
+    "pro": 4.99,
+    "pro_plus": 9.99,
+}
+
+FLEET_RATE_PER_DRIVER = 18.0
+
+
+class CompanyRegisterRequest(BaseModel):
+    name: str
+    email: str
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    owner_user_id: str
+
+
+class CompanyUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    payment_model: Optional[str] = None
+
+
+class CompanyInviteRequest(BaseModel):
+    company_id: str
+    role: str = "driver"
+    max_uses: Optional[int] = None
+    expires_hours: int = 168  # 7 days
+
+
+class CompanyJoinRequest(BaseModel):
+    code: str
+    user_id: str
+
+
+class CompanyLeaveRequest(BaseModel):
+    user_id: str
+
+
+class CompanyCreateDriverRequest(BaseModel):
+    company_id: str
+    email: str
+    full_name: str
+    phone: Optional[str] = None
+    password: str
+
+
+class CompanyDriverModeRequest(BaseModel):
+    mode: str  # 'driver_pays', 'company_pays', 'company_complete'
+
+
+# === COMPANY / FLEET MANAGEMENT ENDPOINTS ===
+
+
+def _generate_invite_code() -> str:
+    """Generate a random invite code in the format XPD-XXXX"""
+    suffix = "".join(random.choice(INVITE_CHARS) for _ in range(4))
+    return f"XPD-{suffix}"
+
+
+# 1. POST /company/register
+@app.post("/company/register")
+async def register_company(request: CompanyRegisterRequest):
+    """Register a new company and set up owner"""
+    try:
+        # Create company
+        company_data = {
+            "name": request.name,
+            "email": request.email,
+            "phone": request.phone,
+            "address": request.address,
+            "owner_id": request.owner_user_id,
+            "payment_model": "driver_pays",
+            "active": True,
+        }
+        company_result = supabase.table("companies").insert(company_data).execute()
+
+        if not company_result.data:
+            raise HTTPException(status_code=500, detail="Failed to create company")
+
+        company = company_result.data[0]
+        company_id = company["id"]
+
+        # Update owner's role to admin in users table
+        supabase.table("users").update({
+            "role": "admin",
+            "company_id": company_id,
+        }).eq("id", request.owner_user_id).execute()
+
+        # Update owner's company_id in drivers table
+        supabase.table("drivers").update({
+            "company_id": company_id,
+        }).eq("user_id", request.owner_user_id).execute()
+
+        # Create subscription with 14-day trial
+        now = datetime.now()
+        trial_end = now + timedelta(days=14)
+        subscription_data = {
+            "company_id": company_id,
+            "plan": "free",
+            "max_drivers": 5,
+            "price_per_month": 0,
+            "status": "trialing",
+            "trial_ends_at": trial_end.isoformat(),
+            "current_period_start": now.isoformat(),
+            "current_period_end": trial_end.isoformat(),
+        }
+        supabase.table("company_subscriptions").insert(subscription_data).execute()
+
+        return {"success": True, "company": company}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 15. GET /company/check-access/{user_id}
+# NOTE: Defined before /company/{company_id} to avoid route shadowing
+@app.get("/company/check-access/{user_id}")
+async def check_company_access(user_id: str):
+    """Check if a driver has company-paid access"""
+    try:
+        # Look up active company_driver_links for this user
+        link_result = supabase.table("company_driver_links")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .eq("active", True)\
+            .limit(1)\
+            .execute()
+
+        if not link_result.data:
+            return {"has_access": False}
+
+        link = link_result.data[0]
+        mode = link.get("mode", "driver_pays")
+
+        if mode in ("company_pays", "company_complete"):
+            # Get company name
+            company_result = supabase.table("companies")\
+                .select("name")\
+                .eq("id", link["company_id"])\
+                .limit(1)\
+                .execute()
+
+            company_name = company_result.data[0]["name"] if company_result.data else None
+
+            return {
+                "has_access": True,
+                "plan": "pro_plus",
+                "company_name": company_name,
+            }
+
+        return {"has_access": False}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 2. GET /company/{company_id}
+@app.get("/company/{company_id}")
+async def get_company(company_id: str):
+    """Get company details with subscription info"""
+    try:
+        company_result = supabase.table("companies")\
+            .select("*")\
+            .eq("id", company_id)\
+            .single()\
+            .execute()
+
+        if not company_result.data:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+        sub_result = supabase.table("company_subscriptions")\
+            .select("*")\
+            .eq("company_id", company_id)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+
+        subscription = sub_result.data[0] if sub_result.data else None
+
+        return {
+            "success": True,
+            "company": company_result.data,
+            "subscription": subscription,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 3. PATCH /company/{company_id}
+@app.patch("/company/{company_id}")
+async def update_company(company_id: str, request: CompanyUpdateRequest):
+    """Update company details"""
+    try:
+        update_data = {}
+        if request.name is not None:
+            update_data["name"] = request.name
+        if request.email is not None:
+            update_data["email"] = request.email
+        if request.phone is not None:
+            update_data["phone"] = request.phone
+        if request.address is not None:
+            update_data["address"] = request.address
+        if request.payment_model is not None:
+            if request.payment_model not in ("driver_pays", "company_pays", "company_complete"):
+                raise HTTPException(status_code=400, detail="Invalid payment_model")
+            update_data["payment_model"] = request.payment_model
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        update_data["updated_at"] = datetime.now().isoformat()
+
+        result = supabase.table("companies")\
+            .update(update_data)\
+            .eq("id", company_id)\
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+        return {"success": True, "company": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 4. GET /company/{company_id}/drivers
+@app.get("/company/{company_id}/drivers")
+async def get_company_drivers(company_id: str):
+    """List drivers in a company with mode, cost, plan info"""
+    try:
+        # Get all driver links for this company
+        links_result = supabase.table("company_driver_links")\
+            .select("*")\
+            .eq("company_id", company_id)\
+            .eq("active", True)\
+            .execute()
+
+        links = links_result.data or []
+        drivers_list = []
+
+        for link in links:
+            # Get driver info
+            driver_result = supabase.table("drivers")\
+                .select("*")\
+                .eq("user_id", link["user_id"])\
+                .limit(1)\
+                .execute()
+
+            # Get user info
+            user_result = supabase.table("users")\
+                .select("id, email, full_name, phone, role")\
+                .eq("id", link["user_id"])\
+                .limit(1)\
+                .execute()
+
+            driver_data = driver_result.data[0] if driver_result.data else {}
+            user_data = user_result.data[0] if user_result.data else {}
+
+            drivers_list.append({
+                "link_id": link["id"],
+                "user_id": link["user_id"],
+                "driver_id": link.get("driver_id"),
+                "mode": link.get("mode", "driver_pays"),
+                "company_cost": link.get("company_cost"),
+                "joined_at": link.get("joined_at"),
+                "driver_plan_at_link": link.get("driver_plan_at_link"),
+                "email": user_data.get("email"),
+                "full_name": user_data.get("full_name"),
+                "phone": user_data.get("phone"),
+                "promo_plan": driver_data.get("promo_plan"),
+                "promo_plan_expires_at": driver_data.get("promo_plan_expires_at"),
+            })
+
+        return {"success": True, "drivers": drivers_list, "total": len(drivers_list)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 5. GET /company/{company_id}/stats
+@app.get("/company/{company_id}/stats")
+async def get_company_stats(company_id: str):
+    """Get fleet stats: total drivers, active today, routes/stops/deliveries today"""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Total drivers in company
+        links_result = supabase.table("company_driver_links")\
+            .select("user_id")\
+            .eq("company_id", company_id)\
+            .eq("active", True)\
+            .execute()
+        total_drivers = len(links_result.data or [])
+        driver_user_ids = [l["user_id"] for l in (links_result.data or [])]
+
+        # Get driver IDs from drivers table for these users
+        active_today = 0
+        routes_today = 0
+        stops_today = 0
+        deliveries_today = 0
+
+        if driver_user_ids:
+            # Get driver records
+            drivers_result = supabase.table("drivers")\
+                .select("id, user_id")\
+                .in_("user_id", driver_user_ids)\
+                .execute()
+
+            driver_ids = [d["id"] for d in (drivers_result.data or [])]
+
+            if driver_ids:
+                # Routes today for these drivers
+                routes_result = supabase.table("routes")\
+                    .select("*, stops(*)")\
+                    .in_("driver_id", driver_ids)\
+                    .gte("created_at", f"{today}T00:00:00")\
+                    .lte("created_at", f"{today}T23:59:59")\
+                    .execute()
+
+                routes = routes_result.data or []
+                routes_today = len(routes)
+
+                # Unique drivers who have routes today
+                active_driver_ids = set(r["driver_id"] for r in routes)
+                active_today = len(active_driver_ids)
+
+                # Count stops and completed deliveries
+                for route in routes:
+                    route_stops = route.get("stops", [])
+                    stops_today += len(route_stops)
+                    deliveries_today += len([
+                        s for s in route_stops if s.get("status") == "completed"
+                    ])
+
+        return {
+            "success": True,
+            "total_drivers": total_drivers,
+            "active_today": active_today,
+            "routes_today": routes_today,
+            "stops_today": stops_today,
+            "deliveries_today": deliveries_today,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 6. POST /company/invites
+@app.post("/company/invites")
+async def create_company_invite(request: CompanyInviteRequest):
+    """Generate an invite code for a company"""
+    try:
+        # Generate unique code
+        for _ in range(10):
+            code = _generate_invite_code()
+            existing = supabase.table("company_invites")\
+                .select("id")\
+                .eq("code", code)\
+                .execute()
+            if not existing.data:
+                break
+        else:
+            raise HTTPException(status_code=500, detail="Failed to generate unique invite code")
+
+        expires_at = (datetime.now() + timedelta(hours=request.expires_hours)).isoformat()
+
+        invite_data = {
+            "code": code,
+            "company_id": request.company_id,
+            "role": request.role,
+            "max_uses": request.max_uses,
+            "current_uses": 0,
+            "active": True,
+            "expires_at": expires_at,
+        }
+
+        result = supabase.table("company_invites").insert(invite_data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create invite")
+
+        return {"success": True, "invite": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 7. GET /company/{company_id}/invites
+@app.get("/company/{company_id}/invites")
+async def get_company_invites(company_id: str):
+    """List invite codes for a company"""
+    try:
+        result = supabase.table("company_invites")\
+            .select("*")\
+            .eq("company_id", company_id)\
+            .order("created_at", desc=True)\
+            .execute()
+
+        return {"success": True, "invites": result.data or []}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 8. DELETE /company/invites/{invite_id}
+@app.delete("/company/invites/{invite_id}")
+async def deactivate_company_invite(invite_id: str):
+    """Deactivate an invite code"""
+    try:
+        result = supabase.table("company_invites")\
+            .update({"active": False})\
+            .eq("id", invite_id)\
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Invite not found")
+
+        return {"success": True, "invite": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 9. POST /company/join
+@app.post("/company/join")
+async def join_company(request: CompanyJoinRequest):
+    """Driver joins a company via invite code"""
+    try:
+        code = request.code.strip().upper()
+
+        # Find the invite
+        invite_result = supabase.table("company_invites")\
+            .select("*")\
+            .eq("code", code)\
+            .execute()
+
+        if not invite_result.data:
+            raise HTTPException(status_code=404, detail="Invite code not found")
+
+        invite = invite_result.data[0]
+
+        # Validate: active
+        if not invite.get("active", False):
+            raise HTTPException(status_code=400, detail="This invite code is no longer active")
+
+        # Validate: not expired
+        if invite.get("expires_at"):
+            expires_at = datetime.fromisoformat(invite["expires_at"].replace("Z", "+00:00"))
+            now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+            if now > expires_at:
+                raise HTTPException(status_code=400, detail="This invite code has expired")
+
+        # Validate: max uses
+        if invite.get("max_uses") is not None:
+            if invite.get("current_uses", 0) >= invite["max_uses"]:
+                raise HTTPException(status_code=400, detail="This invite code has reached its maximum uses")
+
+        # Check driver is not already in a company
+        user_result = supabase.table("users")\
+            .select("id, company_id")\
+            .eq("id", request.user_id)\
+            .single()\
+            .execute()
+
+        if not user_result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if user_result.data.get("company_id"):
+            raise HTTPException(status_code=400, detail="User is already part of a company")
+
+        company_id = invite["company_id"]
+
+        # Update users table
+        supabase.table("users").update({
+            "company_id": company_id,
+        }).eq("id", request.user_id).execute()
+
+        # Update drivers table
+        supabase.table("drivers").update({
+            "company_id": company_id,
+        }).eq("user_id", request.user_id).execute()
+
+        # Get driver record for driver_id
+        driver_result = supabase.table("drivers")\
+            .select("id, promo_plan")\
+            .eq("user_id", request.user_id)\
+            .limit(1)\
+            .execute()
+
+        driver_id = driver_result.data[0]["id"] if driver_result.data else None
+        driver_plan = driver_result.data[0].get("promo_plan") if driver_result.data else None
+
+        # Create company_driver_links entry
+        link_data = {
+            "company_id": company_id,
+            "driver_id": driver_id,
+            "user_id": request.user_id,
+            "mode": "driver_pays",
+            "company_cost": None,
+            "driver_plan_at_link": driver_plan,
+            "active": True,
+        }
+        supabase.table("company_driver_links").insert(link_data).execute()
+
+        # Increment current_uses
+        supabase.table("company_invites").update({
+            "current_uses": invite.get("current_uses", 0) + 1,
+        }).eq("id", invite["id"]).execute()
+
+        # Record in company_invite_uses
+        supabase.table("company_invite_uses").insert({
+            "invite_id": invite["id"],
+            "user_id": request.user_id,
+        }).execute()
+
+        return {
+            "success": True,
+            "company_id": company_id,
+            "message": "Successfully joined the company",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 10. POST /company/leave
+@app.post("/company/leave")
+async def leave_company(request: CompanyLeaveRequest):
+    """Driver leaves their company"""
+    try:
+        user_id = request.user_id
+
+        # Get current driver link to check mode
+        link_result = supabase.table("company_driver_links")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .eq("active", True)\
+            .limit(1)\
+            .execute()
+
+        if not link_result.data:
+            raise HTTPException(status_code=404, detail="User is not linked to any company")
+
+        link = link_result.data[0]
+        mode = link.get("mode", "driver_pays")
+
+        # Remove company_id from users
+        supabase.table("users").update({
+            "company_id": None,
+        }).eq("id", user_id).execute()
+
+        # Remove company_id from drivers
+        supabase.table("drivers").update({
+            "company_id": None,
+        }).eq("user_id", user_id).execute()
+
+        # Deactivate driver link
+        supabase.table("company_driver_links").update({
+            "active": False,
+        }).eq("id", link["id"]).execute()
+
+        # If was company_pays or company_complete, remove promo benefits
+        if mode in ("company_pays", "company_complete"):
+            supabase.table("drivers").update({
+                "promo_plan": None,
+                "promo_plan_expires_at": None,
+            }).eq("user_id", user_id).execute()
+
+        return {"success": True, "message": "Successfully left the company"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 11. POST /company/drivers
+@app.post("/company/drivers")
+async def create_company_driver(request: CompanyCreateDriverRequest):
+    """Create a driver directly (admin creates account for driver)"""
+    try:
+        # Use supabase admin auth to create a new user
+        auth_response = supabase.auth.admin.create_user({
+            "email": request.email,
+            "password": request.password,
+            "email_confirm": True,
+            "user_metadata": {
+                "full_name": request.full_name,
+                "phone": request.phone,
+            },
+        })
+
+        new_user_id = auth_response.user.id
+
+        # Wait briefly for database triggers to fire (users + drivers auto-created)
+        time.sleep(2)
+
+        # Update company_id in users
+        supabase.table("users").update({
+            "company_id": request.company_id,
+            "full_name": request.full_name,
+            "phone": request.phone,
+        }).eq("id", str(new_user_id)).execute()
+
+        # Update company_id in drivers
+        supabase.table("drivers").update({
+            "company_id": request.company_id,
+        }).eq("user_id", str(new_user_id)).execute()
+
+        # Get driver record
+        driver_result = supabase.table("drivers")\
+            .select("id")\
+            .eq("user_id", str(new_user_id))\
+            .limit(1)\
+            .execute()
+
+        driver_id = driver_result.data[0]["id"] if driver_result.data else None
+
+        # Create company_driver_links entry
+        link_data = {
+            "company_id": request.company_id,
+            "driver_id": driver_id,
+            "user_id": str(new_user_id),
+            "mode": "driver_pays",
+            "active": True,
+        }
+        supabase.table("company_driver_links").insert(link_data).execute()
+
+        return {
+            "success": True,
+            "user_id": str(new_user_id),
+            "driver_id": driver_id,
+            "email": request.email,
+            "message": "Driver account created and added to company",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 12. DELETE /company/drivers/{user_id}
+@app.delete("/company/drivers/{user_id}")
+async def remove_company_driver(user_id: str):
+    """Remove a driver from the company (admin-initiated)"""
+    try:
+        # Get current driver link to check mode
+        link_result = supabase.table("company_driver_links")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .eq("active", True)\
+            .limit(1)\
+            .execute()
+
+        if not link_result.data:
+            raise HTTPException(status_code=404, detail="Driver is not linked to any company")
+
+        link = link_result.data[0]
+        mode = link.get("mode", "driver_pays")
+
+        # Remove company_id from users
+        supabase.table("users").update({
+            "company_id": None,
+        }).eq("id", user_id).execute()
+
+        # Remove company_id from drivers
+        supabase.table("drivers").update({
+            "company_id": None,
+        }).eq("user_id", user_id).execute()
+
+        # Deactivate driver link
+        supabase.table("company_driver_links").update({
+            "active": False,
+        }).eq("id", link["id"]).execute()
+
+        # If was company_pays or company_complete, remove promo benefits
+        if mode in ("company_pays", "company_complete"):
+            supabase.table("drivers").update({
+                "promo_plan": None,
+                "promo_plan_expires_at": None,
+            }).eq("user_id", user_id).execute()
+
+        return {"success": True, "message": "Driver removed from company"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 13. PATCH /company/drivers/{user_id}/mode
+@app.patch("/company/drivers/{user_id}/mode")
+async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest):
+    """Change a driver's payment mode within the company"""
+    try:
+        if request.mode not in ("driver_pays", "company_pays", "company_complete"):
+            raise HTTPException(status_code=400, detail="Invalid mode. Must be driver_pays, company_pays, or company_complete")
+
+        # Get active driver link
+        link_result = supabase.table("company_driver_links")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .eq("active", True)\
+            .limit(1)\
+            .execute()
+
+        if not link_result.data:
+            raise HTTPException(status_code=404, detail="Driver is not linked to any company")
+
+        link = link_result.data[0]
+        company_id = link["company_id"]
+
+        # Get subscription for period end date
+        sub_result = supabase.table("company_subscriptions")\
+            .select("*")\
+            .eq("company_id", company_id)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+
+        subscription = sub_result.data[0] if sub_result.data else None
+        period_end = subscription.get("current_period_end") if subscription else None
+
+        link_update = {"mode": request.mode}
+        driver_update = {}
+
+        if request.mode == "company_pays":
+            # Company pays: grant pro_plus to driver
+            driver_update["promo_plan"] = "pro_plus"
+            driver_update["promo_plan_expires_at"] = period_end
+            link_update["company_cost"] = FLEET_RATE_PER_DRIVER
+
+        elif request.mode == "company_complete":
+            # Company complete: grant pro_plus and calculate cost
+            driver_update["promo_plan"] = "pro_plus"
+            driver_update["promo_plan_expires_at"] = period_end
+
+            # Get driver's current plan to calculate company_cost
+            driver_result = supabase.table("drivers")\
+                .select("promo_plan")\
+                .eq("user_id", user_id)\
+                .limit(1)\
+                .execute()
+
+            current_plan = link.get("driver_plan_at_link") or "free"
+            driver_price = DRIVER_PLAN_PRICES.get(current_plan, 0)
+            company_cost = FLEET_RATE_PER_DRIVER - driver_price
+            link_update["company_cost"] = round(company_cost, 2)
+
+        elif request.mode == "driver_pays":
+            # Driver pays: remove promo benefits
+            driver_update["promo_plan"] = None
+            driver_update["promo_plan_expires_at"] = None
+            link_update["company_cost"] = None
+
+        # Update driver link
+        supabase.table("company_driver_links")\
+            .update(link_update)\
+            .eq("id", link["id"])\
+            .execute()
+
+        # Update driver record
+        if driver_update:
+            supabase.table("drivers")\
+                .update(driver_update)\
+                .eq("user_id", user_id)\
+                .execute()
+
+        return {
+            "success": True,
+            "mode": request.mode,
+            "company_cost": link_update.get("company_cost"),
+            "message": f"Driver mode changed to {request.mode}",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 14. GET /company/{company_id}/subscription
+@app.get("/company/{company_id}/subscription")
+async def get_company_subscription(company_id: str):
+    """Get company subscription details"""
+    try:
+        result = supabase.table("company_subscriptions")\
+            .select("*")\
+            .eq("company_id", company_id)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No subscription found for this company")
+
+        return {"success": True, "subscription": result.data[0]}
 
     except HTTPException:
         raise
