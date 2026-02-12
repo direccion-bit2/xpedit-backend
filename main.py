@@ -2049,7 +2049,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 
 class OCRLabelRequest(BaseModel):
-    image_base64: str
+    image_base64: str = Field(..., max_length=10_000_000)  # ~7.5MB max image
     media_type: str = "image/jpeg"
 
 
