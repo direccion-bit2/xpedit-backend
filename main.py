@@ -471,7 +471,23 @@ async def complete_route(route_id: str):
 
 @app.delete("/routes/{route_id}")
 async def delete_route(route_id: str):
-    """Elimina una ruta y sus paradas"""
+    """Elimina una ruta y todas sus dependencias (proofs, tracking, stops)"""
+    # Get stop IDs for this route
+    stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
+    stop_ids = [s["id"] for s in (stops_result.data or [])]
+
+    if stop_ids:
+        # Delete delivery proofs linked to these stops
+        for sid in stop_ids:
+            supabase.table("delivery_proofs").delete().eq("stop_id", sid).execute()
+
+        # Delete tracking links for this route
+        supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
+
+        # Delete stops
+        supabase.table("stops").delete().eq("route_id", route_id).execute()
+
+    # Delete the route itself
     supabase.table("routes").delete().eq("id", route_id).execute()
     return {"success": True}
 
