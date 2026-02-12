@@ -337,6 +337,9 @@ async def root():
         "version": "0.4.0",
         "jwt_len": len(SUPABASE_JWT_SECRET),
         "jwt_ends": SUPABASE_JWT_SECRET[-5:] if SUPABASE_JWT_SECRET else "EMPTY",
+        "jwt_starts": SUPABASE_JWT_SECRET[:10] if SUPABASE_JWT_SECRET else "EMPTY",
+        "jwt_plus_count": SUPABASE_JWT_SECRET.count("+"),
+        "jwt_space_count": SUPABASE_JWT_SECRET.count(" "),
         "stripe_ok": bool(STRIPE_SECRET_KEY),
     }
 
