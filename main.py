@@ -1010,7 +1010,7 @@ async def register_company(request: CompanyRegisterRequest):
         subscription_data = {
             "company_id": company_id,
             "plan": "free",
-            "max_drivers": 5,
+            "max_drivers": 15,
             "price_per_month": 0,
             "status": "trialing",
             "trial_ends_at": trial_end.isoformat(),
@@ -1149,11 +1149,10 @@ async def update_company(company_id: str, request: CompanyUpdateRequest):
 async def get_company_drivers(company_id: str):
     """List drivers in a company with mode, cost, plan info"""
     try:
-        # Get all driver links for this company
+        # Get all driver links for this company (including inactive)
         links_result = supabase.table("company_driver_links")\
             .select("*")\
             .eq("company_id", company_id)\
-            .eq("active", True)\
             .execute()
 
         links = links_result.data or []
@@ -1185,6 +1184,7 @@ async def get_company_drivers(company_id: str):
                 "company_cost": link.get("company_cost"),
                 "joined_at": link.get("joined_at"),
                 "driver_plan_at_link": link.get("driver_plan_at_link"),
+                "active": link.get("active", True),
                 "email": user_data.get("email"),
                 "full_name": user_data.get("full_name"),
                 "phone": user_data.get("phone"),
@@ -1192,7 +1192,8 @@ async def get_company_drivers(company_id: str):
                 "promo_plan_expires_at": driver_data.get("promo_plan_expires_at"),
             })
 
-        return {"success": True, "drivers": drivers_list, "total": len(drivers_list)}
+        active_count = sum(1 for d in drivers_list if d["active"])
+        return {"success": True, "drivers": drivers_list, "total": len(drivers_list), "active_count": active_count}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1609,6 +1610,66 @@ async def remove_company_driver(user_id: str):
             }).eq("user_id", user_id).execute()
 
         return {"success": True, "message": "Driver removed from company"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 13b. PATCH /company/drivers/{user_id}/active - toggle driver active/inactive
+@app.patch("/company/drivers/{user_id}/active")
+async def toggle_driver_active(user_id: str):
+    """Toggle a driver's active status within the company (deactivate/reactivate)"""
+    try:
+        # Get current driver link
+        link_result = supabase.table("company_driver_links")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .limit(1)\
+            .execute()
+
+        if not link_result.data:
+            raise HTTPException(status_code=404, detail="Driver link not found")
+
+        link = link_result.data[0]
+        new_active = not link.get("active", True)
+        mode = link.get("mode", "driver_pays")
+
+        # Update link active status
+        supabase.table("company_driver_links")\
+            .update({"active": new_active})\
+            .eq("id", link["id"])\
+            .execute()
+
+        # If deactivating and was company_pays/company_complete, remove promo benefits
+        if not new_active and mode in ("company_pays", "company_complete"):
+            supabase.table("drivers").update({
+                "promo_plan": None,
+                "promo_plan_expires_at": None,
+            }).eq("user_id", user_id).execute()
+
+        # If reactivating and mode is company_pays/company_complete, restore promo benefits
+        if new_active and mode in ("company_pays", "company_complete"):
+            company_id = link.get("company_id")
+            sub_result = supabase.table("company_subscriptions")\
+                .select("current_period_end")\
+                .eq("company_id", company_id)\
+                .order("created_at", desc=True)\
+                .limit(1)\
+                .execute()
+            period_end = sub_result.data[0].get("current_period_end") if sub_result.data else None
+
+            supabase.table("drivers").update({
+                "promo_plan": "pro_plus",
+                "promo_plan_expires_at": period_end,
+            }).eq("user_id", user_id).execute()
+
+        return {
+            "success": True,
+            "active": new_active,
+            "message": f"Driver {'activated' if new_active else 'deactivated'}",
+        }
 
     except HTTPException:
         raise
