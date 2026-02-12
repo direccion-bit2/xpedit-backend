@@ -6,7 +6,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -51,6 +51,17 @@ supabase: Client = create_client(
 
 # Supabase JWT secret for token verification
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+
+# Stripe
+import stripe
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+stripe.api_key = STRIPE_SECRET_KEY
+
+STRIPE_PLANS = {
+    "pro": {"name": "Xpedit Pro", "amount": 499, "interval": "month"},
+    "pro_plus": {"name": "Xpedit Pro+", "amount": 999, "interval": "month"},
+}
 
 
 async def get_current_user(authorization: str = Header(default=None)):
@@ -2117,6 +2128,139 @@ CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
         content = data.get("content", [{}])[0].get("text", "")
         return {"success": True, "content": content}
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === STRIPE CHECKOUT ===
+
+
+class StripeCheckoutRequest(BaseModel):
+    plan: str  # "pro" or "pro_plus"
+
+
+@app.post("/stripe/create-checkout")
+async def create_stripe_checkout(request: StripeCheckoutRequest, user=Depends(get_current_user)):
+    """Create a Stripe Checkout Session for subscription"""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+
+    plan_info = STRIPE_PLANS.get(request.plan)
+    if not plan_info:
+        raise HTTPException(status_code=400, detail="Plan invalido. Use 'pro' o 'pro_plus'")
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "eur",
+                    "product_data": {"name": plan_info["name"]},
+                    "unit_amount": plan_info["amount"],
+                    "recurring": {"interval": plan_info["interval"]},
+                },
+                "quantity": 1,
+            }],
+            client_reference_id=user["id"],
+            metadata={"plan": request.plan, "user_id": user["id"]},
+            success_url="https://xpedit.es/dashboard?payment=success",
+            cancel_url="https://xpedit.es/dashboard?payment=cancel",
+        )
+        return {"success": True, "url": session.url}
+
+    except stripe.StripeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhook events - no JWT auth, uses Stripe signature"""
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    if STRIPE_WEBHOOK_SECRET and sig_header:
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        except stripe.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+    else:
+        import json
+        event = json.loads(payload)
+
+    event_type = event.get("type", "")
+
+    if event_type == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session.get("client_reference_id")
+        plan = session.get("metadata", {}).get("plan", "pro")
+        customer_id = session.get("customer")
+
+        if user_id:
+            expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+            # Activate plan
+            supabase.table("drivers").update({
+                "promo_plan": plan,
+                "promo_plan_expires_at": expires_at,
+            }).eq("user_id", user_id).execute()
+            # Store stripe customer_id for future portal/cancellation
+            supabase.table("users").update({
+                "stripe_customer_id": customer_id,
+            }).eq("id", user_id).execute()
+
+    elif event_type == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        customer_id = subscription.get("customer")
+        if customer_id:
+            # Find user by stripe_customer_id
+            user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
+            if user_result.data:
+                user_id = user_result.data[0]["id"]
+                supabase.table("drivers").update({
+                    "promo_plan": None,
+                    "promo_plan_expires_at": None,
+                }).eq("user_id", user_id).execute()
+
+    elif event_type == "invoice.payment_succeeded":
+        invoice = event["data"]["object"]
+        customer_id = invoice.get("customer")
+        if customer_id and invoice.get("billing_reason") == "subscription_cycle":
+            # Renewal - extend plan by 30 days
+            user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
+            if user_result.data:
+                user_id = user_result.data[0]["id"]
+                expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+                supabase.table("drivers").update({
+                    "promo_plan_expires_at": expires_at,
+                }).eq("user_id", user_id).execute()
+
+    return {"received": True}
+
+
+@app.post("/stripe/portal")
+async def create_stripe_portal(user=Depends(get_current_user)):
+    """Create a Stripe Customer Portal session to manage subscription"""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+
+    try:
+        # Get stripe_customer_id from users table
+        user_result = supabase.table("users").select("stripe_customer_id").eq("id", user["id"]).single().execute()
+        customer_id = user_result.data.get("stripe_customer_id") if user_result.data else None
+
+        if not customer_id:
+            raise HTTPException(status_code=404, detail="No tienes una suscripcion activa")
+
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="https://xpedit.es/dashboard",
+        )
+        return {"success": True, "url": session.url}
+
+    except stripe.StripeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
