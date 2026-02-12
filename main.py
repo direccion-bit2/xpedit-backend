@@ -2210,60 +2210,86 @@ async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
-    if STRIPE_WEBHOOK_SECRET and sig_header:
-        try:
+    try:
+        if STRIPE_WEBHOOK_SECRET and sig_header:
             event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        except stripe.SignatureVerificationError:
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        import json
-        event = json.loads(payload)
+        else:
+            event = json.loads(payload)
+    except stripe.SignatureVerificationError:
+        print("[STRIPE WEBHOOK] Invalid signature")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        print(f"[STRIPE WEBHOOK] Parse error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid payload")
 
-    event_type = event.get("type", "")
+    event_type = event.get("type", "") if isinstance(event, dict) else event.type
+    print(f"[STRIPE WEBHOOK] Received event: {event_type}")
 
-    if event_type == "checkout.session.completed":
-        session = event["data"]["object"]
-        user_id = session.get("client_reference_id")
-        plan = session.get("metadata", {}).get("plan", "pro")
-        customer_id = session.get("customer")
+    try:
+        data_obj = event["data"]["object"] if isinstance(event, dict) else event.data.object
 
-        if user_id:
-            expires_at = (datetime.now() + timedelta(days=30)).isoformat()
-            # Activate plan
-            supabase.table("drivers").update({
-                "promo_plan": plan,
-                "promo_plan_expires_at": expires_at,
-            }).eq("user_id", user_id).execute()
-            # Store stripe customer_id for future portal/cancellation
-            supabase.table("users").update({
-                "stripe_customer_id": customer_id,
-            }).eq("id", user_id).execute()
+        if event_type == "checkout.session.completed":
+            user_id = data_obj.get("client_reference_id") if isinstance(data_obj, dict) else getattr(data_obj, "client_reference_id", None)
+            metadata = data_obj.get("metadata", {}) if isinstance(data_obj, dict) else getattr(data_obj, "metadata", {})
+            plan = metadata.get("plan", "pro") if isinstance(metadata, dict) else getattr(metadata, "plan", "pro")
+            customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else getattr(data_obj, "customer", None)
 
-    elif event_type == "customer.subscription.deleted":
-        subscription = event["data"]["object"]
-        customer_id = subscription.get("customer")
-        if customer_id:
-            # Find user by stripe_customer_id
-            user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
-            if user_result.data:
-                user_id = user_result.data[0]["id"]
-                supabase.table("drivers").update({
-                    "promo_plan": None,
-                    "promo_plan_expires_at": None,
-                }).eq("user_id", user_id).execute()
+            print(f"[STRIPE WEBHOOK] checkout.session.completed: user_id={user_id}, plan={plan}, customer={customer_id}")
 
-    elif event_type == "invoice.payment_succeeded":
-        invoice = event["data"]["object"]
-        customer_id = invoice.get("customer")
-        if customer_id and invoice.get("billing_reason") == "subscription_cycle":
-            # Renewal - extend plan by 30 days
-            user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
-            if user_result.data:
-                user_id = user_result.data[0]["id"]
+            if user_id:
                 expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+                # Update drivers table (if user has a linked driver)
                 supabase.table("drivers").update({
+                    "promo_plan": plan,
                     "promo_plan_expires_at": expires_at,
                 }).eq("user_id", user_id).execute()
+                # Update users table (plan + stripe customer id)
+                supabase.table("users").update({
+                    "stripe_customer_id": customer_id,
+                    "promo_plan": plan,
+                    "promo_plan_expires_at": expires_at,
+                }).eq("id", user_id).execute()
+                print(f"[STRIPE WEBHOOK] Plan {plan} activated for user {user_id}")
+
+        elif event_type == "customer.subscription.deleted":
+            customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else getattr(data_obj, "customer", None)
+            if customer_id:
+                user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
+                if user_result.data:
+                    user_id = user_result.data[0]["id"]
+                    supabase.table("drivers").update({
+                        "promo_plan": None,
+                        "promo_plan_expires_at": None,
+                    }).eq("user_id", user_id).execute()
+                    supabase.table("users").update({
+                        "promo_plan": None,
+                        "promo_plan_expires_at": None,
+                    }).eq("id", user_id).execute()
+                    print(f"[STRIPE WEBHOOK] Subscription deleted for user {user_id}")
+
+        elif event_type in ("invoice.payment_succeeded", "invoice.paid"):
+            customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else getattr(data_obj, "customer", None)
+            billing_reason = data_obj.get("billing_reason") if isinstance(data_obj, dict) else getattr(data_obj, "billing_reason", None)
+            if customer_id and billing_reason == "subscription_cycle":
+                user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
+                if user_result.data:
+                    user_id = user_result.data[0]["id"]
+                    expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+                    supabase.table("drivers").update({
+                        "promo_plan_expires_at": expires_at,
+                    }).eq("user_id", user_id).execute()
+                    supabase.table("users").update({
+                        "promo_plan_expires_at": expires_at,
+                    }).eq("id", user_id).execute()
+                    print(f"[STRIPE WEBHOOK] Renewal for user {user_id}")
+
+        else:
+            print(f"[STRIPE WEBHOOK] Unhandled event type: {event_type} (ignored)")
+
+    except Exception as e:
+        print(f"[STRIPE WEBHOOK] Error processing {event_type}: {type(e).__name__}: {e}")
+        # Return 200 anyway so Stripe doesn't retry indefinitely
+        return {"received": True, "error": str(e)}
 
     return {"received": True}
 
