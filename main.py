@@ -334,7 +334,10 @@ async def root():
     return {
         "status": "ok",
         "service": "Xpedit API",
-        "version": "0.3.0",
+        "version": "0.4.0",
+        "jwt_len": len(SUPABASE_JWT_SECRET),
+        "jwt_ends": SUPABASE_JWT_SECRET[-5:] if SUPABASE_JWT_SECRET else "EMPTY",
+        "stripe_ok": bool(STRIPE_SECRET_KEY),
     }
 
 
