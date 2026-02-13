@@ -12,17 +12,8 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 import json
 import httpx
-try:
-    import jwt as pyjwt
-    from jwt import PyJWKClient
-    # Verify it's PyJWT, not the 'jwt' package
-    if not hasattr(pyjwt, 'decode'):
-        raise ImportError("Wrong jwt package")
-except ImportError:
-    import subprocess
-    subprocess.check_call(["pip", "install", "PyJWT[crypto]"])
-    import jwt as pyjwt
-    from jwt import PyJWKClient
+import jwt as pyjwt
+from jwt import PyJWKClient
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -82,10 +73,14 @@ async def get_current_user(authorization: str = Header(default=None)):
     token = authorization.replace("Bearer ", "")
 
     try:
-        # Verify the JWT token
+        # Verify the JWT token - only allow HS256 and ES256
+        ALLOWED_ALGORITHMS = ["HS256", "ES256"]
         header = pyjwt.get_unverified_header(token)
         alg = header.get("alg", "HS256")
         print(f"[AUTH] JWT alg={alg}, token_len={len(token)}")
+
+        if alg not in ALLOWED_ALGORITHMS:
+            raise HTTPException(status_code=401, detail=f"Algorithm {alg} not allowed")
 
         if alg == "ES256" and _jwks_client:
             # ES256: use JWKS public key from Supabase
@@ -98,7 +93,7 @@ async def get_current_user(authorization: str = Header(default=None)):
         payload = pyjwt.decode(
             token,
             key,
-            algorithms=[alg],
+            algorithms=ALLOWED_ALGORITHMS,
             audience="authenticated"
         )
         user_id = payload.get("sub")
@@ -964,7 +959,7 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
         supabase.table("drivers").update({
             "promo_plan": promo["benefit_plan"],
             "promo_plan_expires_at": benefit_expires_at_iso
-        }).eq("id", user_id).execute()
+        }).eq("user_id", user_id).execute()
 
         return {
             "success": True,
@@ -1806,7 +1801,8 @@ async def create_company_driver(request: CompanyCreateDriverRequest, user=Depend
         new_user_id = auth_response.user.id
 
         # Wait briefly for database triggers to fire (users + drivers auto-created)
-        time.sleep(2)
+        import asyncio
+        await asyncio.sleep(2)
 
         # Update company_id in users
         supabase.table("users").update({
@@ -2210,11 +2206,15 @@ async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
+    if not STRIPE_WEBHOOK_SECRET:
+        print("[STRIPE WEBHOOK] STRIPE_WEBHOOK_SECRET not configured - rejecting")
+        raise HTTPException(status_code=500, detail="Webhook not configured")
+    if not sig_header:
+        print("[STRIPE WEBHOOK] Missing stripe-signature header - rejecting")
+        raise HTTPException(status_code=400, detail="Missing signature")
+
     try:
-        if STRIPE_WEBHOOK_SECRET and sig_header:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        else:
-            event = json.loads(payload)
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except stripe.SignatureVerificationError:
         print("[STRIPE WEBHOOK] Invalid signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
@@ -2222,17 +2222,17 @@ async def stripe_webhook(request: Request):
         print(f"[STRIPE WEBHOOK] Parse error: {e}")
         raise HTTPException(status_code=400, detail="Invalid payload")
 
-    event_type = event.get("type", "") if isinstance(event, dict) else event.type
+    event_type = event.type
     print(f"[STRIPE WEBHOOK] Received event: {event_type}")
 
     try:
-        data_obj = event["data"]["object"] if isinstance(event, dict) else event.data.object
+        data_obj = event.data.object
 
         if event_type == "checkout.session.completed":
-            user_id = data_obj.get("client_reference_id") if isinstance(data_obj, dict) else getattr(data_obj, "client_reference_id", None)
-            metadata = data_obj.get("metadata", {}) if isinstance(data_obj, dict) else getattr(data_obj, "metadata", {})
+            user_id = getattr(data_obj, "client_reference_id", None)
+            metadata = getattr(data_obj, "metadata", {})
             plan = metadata.get("plan", "pro") if isinstance(metadata, dict) else getattr(metadata, "plan", "pro")
-            customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else getattr(data_obj, "customer", None)
+            customer_id = getattr(data_obj, "customer", None)
 
             print(f"[STRIPE WEBHOOK] checkout.session.completed: user_id={user_id}, plan={plan}, customer={customer_id}")
 
@@ -2252,7 +2252,7 @@ async def stripe_webhook(request: Request):
                 print(f"[STRIPE WEBHOOK] Plan {plan} activated for user {user_id}")
 
         elif event_type == "customer.subscription.deleted":
-            customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else getattr(data_obj, "customer", None)
+            customer_id = getattr(data_obj, "customer", None)
             if customer_id:
                 user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
                 if user_result.data:
@@ -2268,8 +2268,8 @@ async def stripe_webhook(request: Request):
                     print(f"[STRIPE WEBHOOK] Subscription deleted for user {user_id}")
 
         elif event_type in ("invoice.payment_succeeded", "invoice.paid"):
-            customer_id = data_obj.get("customer") if isinstance(data_obj, dict) else getattr(data_obj, "customer", None)
-            billing_reason = data_obj.get("billing_reason") if isinstance(data_obj, dict) else getattr(data_obj, "billing_reason", None)
+            customer_id = getattr(data_obj, "customer", None)
+            billing_reason = getattr(data_obj, "billing_reason", None)
             if customer_id and billing_reason == "subscription_cycle":
                 user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
                 if user_result.data:
@@ -2288,8 +2288,7 @@ async def stripe_webhook(request: Request):
 
     except Exception as e:
         print(f"[STRIPE WEBHOOK] Error processing {event_type}: {type(e).__name__}: {e}")
-        # Return 200 anyway so Stripe doesn't retry indefinitely
-        return {"received": True, "error": str(e)}
+        raise HTTPException(status_code=500, detail="Internal webhook error")
 
     return {"received": True}
 
@@ -2324,7 +2323,7 @@ async def create_stripe_portal(user=Depends(get_current_user)):
 
 # === GOOGLE PLACES PROXY ===
 # Proxy to avoid API key restrictions on mobile clients
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyCa5qb-hGr-3_j00yxbPZ52Fd4JLq1cAcM")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 @app.get("/places/autocomplete")
 async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
