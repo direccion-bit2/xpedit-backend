@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import json
+import hashlib
 import httpx
 import jwt as pyjwt
 from jwt import PyJWKClient
@@ -357,6 +358,31 @@ async def root():
         "stripe_ok": bool(STRIPE_SECRET_KEY),
         "jwks_ok": _jwks_client is not None,
     }
+
+
+APK_DOWNLOAD_URL = "https://github.com/direccion-bit2/xpedit-releases/releases/download/v1.1.3/xpedit-latest.apk"
+
+
+@app.get("/download/apk")
+async def download_apk(request: Request):
+    """Track APK download (unique device fingerprint) and redirect to GitHub"""
+    from fastapi.responses import RedirectResponse
+
+    try:
+        ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+        ua = request.headers.get("user-agent", "unknown")
+        fingerprint = hashlib.sha256(f"{ip}:{ua}".encode()).hexdigest()[:32]
+
+        supabase.table("app_downloads").insert({
+            "fingerprint": fingerprint,
+            "ip_address": ip,
+            "user_agent": ua[:500],
+            "source": "web",
+        }).execute()
+    except Exception as e:
+        print(f"[DOWNLOAD] Error tracking: {e}")
+
+    return RedirectResponse(url=APK_DOWNLOAD_URL, status_code=302)
 
 
 @app.post("/optimize")
