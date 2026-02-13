@@ -94,6 +94,10 @@ def optimize_route(
             "message": "Solo hay una parada, no hay nada que optimizar"
         }
 
+    # Validar depot_index
+    if depot_index < 0 or depot_index >= len(locations):
+        depot_index = 0
+
     # Crear matriz de distancias
     distance_matrix = create_distance_matrix(locations)
 
@@ -155,9 +159,9 @@ def optimize_route(
             tw_end = _parse_time_to_minutes(loc.get('time_window_end'))
 
             if i == depot_index:
-                # Depot: empezar ahora
+                # Depot: empezar ahora (con 5 min de margen)
                 time_dimension.CumulVar(index).SetRange(
-                    current_time_minutes, current_time_minutes
+                    current_time_minutes, current_time_minutes + 5
                 )
             elif tw_start is not None and tw_end is not None:
                 # Parada con ventana horaria
@@ -176,18 +180,25 @@ def optimize_route(
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    search_parameters.time_limit.seconds = 5  # Máximo 5 segundos de cálculo
+    # Tiempo adaptativo: 2s para <20 paradas, 5s para <50, 10s para más
+    if len(locations) < 20:
+        search_parameters.time_limit.seconds = 2
+    elif len(locations) < 50:
+        search_parameters.time_limit.seconds = 5
+    else:
+        search_parameters.time_limit.seconds = 10
 
     # Resolver
     solution = routing.SolveWithParameters(search_parameters)
 
     if not solution:
-        # Si falla con time windows, reintentar sin ellas
+        # Si falla con time windows, reintentar sin ellas (copia para no mutar input)
         if has_time_windows:
-            for loc in locations:
-                loc.pop('time_window_start', None)
-                loc.pop('time_window_end', None)
-            result = optimize_route(locations, depot_index, num_vehicles)
+            locations_copy = [
+                {k: v for k, v in loc.items() if k not in ('time_window_start', 'time_window_end')}
+                for loc in locations
+            ]
+            result = optimize_route(locations_copy, depot_index, num_vehicles)
             result['warning'] = 'No se pudo respetar todas las ventanas horarias. Ruta optimizada sin restricciones horarias.'
             return result
         return {
@@ -532,6 +543,10 @@ def optimize_multi_vehicle(
             "routes": [{"vehicle": 0, "route": locations, "distance_km": 0}],
             "total_distance_km": 0
         }
+
+    # Validar depot_index
+    if depot_index < 0 or depot_index >= len(locations):
+        depot_index = 0
 
     # Crear matriz de distancias
     distance_matrix = create_distance_matrix(locations)
