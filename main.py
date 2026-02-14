@@ -110,13 +110,8 @@ async def get_current_user(authorization: str = Header(default=None)):
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado - cierra sesion y vuelve a entrar")
     except pyjwt.InvalidTokenError as e:
-        try:
-            h = pyjwt.get_unverified_header(token)
-            alg_info = f" (alg={h.get('alg')}, typ={h.get('typ')})"
-        except Exception:
-            alg_info = " (header unreadable)"
-        print(f"[AUTH] InvalidTokenError: {e}{alg_info}")
-        raise HTTPException(status_code=401, detail=f"Token invalido: {str(e)[:80]}{alg_info}")
+        print(f"[AUTH] InvalidTokenError: {e}")
+        raise HTTPException(status_code=401, detail="Token invalido - cierra sesion y vuelve a entrar")
     except HTTPException:
         raise
     except Exception as e:
@@ -2765,6 +2760,7 @@ async def streetview_image(
     lat: float, lng: float,
     heading: float = 0, fov: float = 90, pitch: float = 5,
     size: str = "600x400",
+    user=Depends(get_current_user),
 ):
     """Proxy for Google Street View Static API - returns image"""
     from fastapi.responses import Response
