@@ -914,7 +914,8 @@ class PromoCodeUpdateRequest(BaseModel):
 
 class AdminGrantRequest(BaseModel):
     plan: str
-    days: int = Field(..., ge=1)
+    days: int = Field(0, ge=0)
+    permanent: bool = False
 
 
 # === PROMO CODE ENDPOINTS ===
@@ -1019,12 +1020,23 @@ async def check_promo_benefit(user_id: str, user=Depends(get_current_user)):
         promo_plan = driver.get("promo_plan")
         expires_at_str = driver.get("promo_plan_expires_at")
 
-        if not promo_plan or not expires_at_str:
+        if not promo_plan:
             return {
                 "has_promo": False,
                 "plan": None,
                 "expires_at": None,
-                "days_remaining": 0
+                "days_remaining": 0,
+                "permanent": False
+            }
+
+        # Permanent plan (no expiration date)
+        if not expires_at_str:
+            return {
+                "has_promo": True,
+                "plan": promo_plan,
+                "expires_at": None,
+                "days_remaining": -1,
+                "permanent": True
             }
 
         expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
@@ -1038,7 +1050,8 @@ async def check_promo_benefit(user_id: str, user=Depends(get_current_user)):
             "has_promo": has_promo,
             "plan": promo_plan if has_promo else None,
             "expires_at": expires_at_str if has_promo else None,
-            "days_remaining": days_remaining
+            "days_remaining": days_remaining,
+            "permanent": False
         }
 
     except HTTPException:
@@ -1149,17 +1162,30 @@ async def list_admin_users(user=Depends(require_admin)):
 
 
 @app.patch("/admin/users/{user_id}/grant")
-async def grant_free_days(user_id: str, request: AdminGrantRequest, user=Depends(require_admin)):
-    """Grant free days to a user (admin)"""
+async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(require_admin)):
+    """Grant plan to a user - permanent or temporary (admin)"""
     try:
-        now = datetime.now()
-        expires_at = now + timedelta(days=request.days)
-        expires_at_iso = expires_at.isoformat()
+        if request.plan == "free":
+            # Remove plan
+            update_data = {"promo_plan": None, "promo_plan_expires_at": None}
+            message = "Plan removed, set to free."
+            expires_at_iso = None
+        elif request.permanent:
+            # Permanent plan - no expiration
+            update_data = {"promo_plan": request.plan, "promo_plan_expires_at": None}
+            message = f"Granted permanent {request.plan} to user."
+            expires_at_iso = None
+        else:
+            # Temporary plan with days
+            if request.days <= 0:
+                raise HTTPException(status_code=400, detail="Days must be > 0 for temporary plans")
+            now = datetime.now()
+            expires_at = now + timedelta(days=request.days)
+            expires_at_iso = expires_at.isoformat()
+            update_data = {"promo_plan": request.plan, "promo_plan_expires_at": expires_at_iso}
+            message = f"Granted {request.days} days of {request.plan} to user."
 
-        result = supabase.table("drivers").update({
-            "promo_plan": request.plan,
-            "promo_plan_expires_at": expires_at_iso
-        }).eq("id", user_id).execute()
+        result = supabase.table("drivers").update(update_data).eq("id", user_id).execute()
 
         if not result.data:
             raise HTTPException(status_code=404, detail="User not found")
@@ -1168,9 +1194,226 @@ async def grant_free_days(user_id: str, request: AdminGrantRequest, user=Depends
             "success": True,
             "user_id": user_id,
             "plan": request.plan,
+            "permanent": request.permanent,
             "expires_at": expires_at_iso,
             "days": request.days,
-            "message": f"Granted {request.days} days of {request.plan} to user."
+            "message": message
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AdminResetPasswordRequest(BaseModel):
+    password: Optional[str] = None  # If None, generate random
+
+
+@app.post("/admin/users/{user_id}/reset-password")
+async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest, user=Depends(require_admin)):
+    """Reset a user's password (admin only)"""
+    try:
+        # Generate random password if not provided
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#"
+        new_password = request.password or "".join(random.choices(chars, k=12))
+
+        if len(new_password) < 6:
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+        # Update password via Supabase Admin API
+        result = supabase.auth.admin.update_user_by_id(user_id, {"password": new_password})
+
+        if not result:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "password": new_password,
+            "message": "Password reset successfully."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AdminCreateCompanyRequest(BaseModel):
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    payment_model: str = "driver_pays"
+
+
+@app.post("/admin/companies")
+async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(require_admin)):
+    """Create a company from admin panel"""
+    try:
+        result = supabase.table("companies").insert({
+            "name": request.name,
+            "email": request.email,
+            "phone": request.phone,
+            "payment_model": request.payment_model,
+            "active": True,
+        }).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create company")
+
+        company = result.data[0]
+
+        # Create trial subscription
+        supabase.table("company_subscriptions").insert({
+            "company_id": company["id"],
+            "plan": "free",
+            "max_drivers": 15,
+            "price_per_month": 0,
+            "status": "trialing",
+            "trial_ends_at": (datetime.now() + timedelta(days=14)).isoformat(),
+            "current_period_start": datetime.now().isoformat(),
+            "current_period_end": (datetime.now() + timedelta(days=14)).isoformat(),
+        }).execute()
+
+        return {"success": True, "company": company}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === REFERRAL SYSTEM ===
+
+class ReferralRedeemRequest(BaseModel):
+    referral_code: str
+
+
+@app.get("/referral/code")
+async def get_referral_code(user=Depends(get_current_user)):
+    """Get or generate the user's referral code"""
+    try:
+        driver_id = await get_user_driver_id(user)
+        if not driver_id:
+            raise HTTPException(status_code=404, detail="Driver not found")
+
+        result = supabase.table("drivers").select("referral_code").eq("id", driver_id).single().execute()
+
+        if result.data and result.data.get("referral_code"):
+            return {"code": result.data["referral_code"], "driver_id": driver_id}
+
+        # Generate unique code
+        for _ in range(10):
+            code = "XPD-" + "".join(random.choices(INVITE_CHARS, k=4))
+            existing = supabase.table("drivers").select("id").eq("referral_code", code).execute()
+            if not existing.data:
+                break
+
+        supabase.table("drivers").update({"referral_code": code}).eq("id", driver_id).execute()
+        return {"code": code, "driver_id": driver_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/referral/redeem")
+async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_current_user)):
+    """Redeem a referral code (new user gets 7 days Pro, referrer gets 7 days Pro)"""
+    try:
+        referred_driver_id = await get_user_driver_id(user)
+        if not referred_driver_id:
+            raise HTTPException(status_code=404, detail="Driver not found")
+
+        code = request.referral_code.strip().upper()
+
+        # Find referrer
+        referrer = supabase.table("drivers").select("id, referral_code").eq("referral_code", code).single().execute()
+        if not referrer.data:
+            raise HTTPException(status_code=404, detail="Codigo de referido no encontrado")
+
+        referrer_id = referrer.data["id"]
+
+        # No self-referral
+        if referrer_id == referred_driver_id:
+            raise HTTPException(status_code=400, detail="No puedes usar tu propio codigo")
+
+        # Check if already referred
+        existing = supabase.table("referrals").select("id").eq("referred_driver_id", referred_driver_id).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail="Ya has usado un codigo de referido")
+
+        REWARD_DAYS = 7
+        REWARD_PLAN = "pro"
+        now = datetime.now()
+        expires_at = (now + timedelta(days=REWARD_DAYS)).isoformat()
+
+        # Grant reward to referred (new user)
+        supabase.table("drivers").update({
+            "promo_plan": REWARD_PLAN,
+            "promo_plan_expires_at": expires_at,
+        }).eq("id", referred_driver_id).execute()
+
+        # Grant reward to referrer (extend or set)
+        referrer_data = supabase.table("drivers").select("promo_plan_expires_at").eq("id", referrer_id).single().execute()
+        ref_expires = referrer_data.data.get("promo_plan_expires_at") if referrer_data.data else None
+
+        if ref_expires:
+            try:
+                current_exp = datetime.fromisoformat(ref_expires.replace("Z", "+00:00"))
+                if current_exp.tzinfo:
+                    current_exp = current_exp.replace(tzinfo=None)
+                if current_exp > now:
+                    new_exp = (current_exp + timedelta(days=REWARD_DAYS)).isoformat()
+                else:
+                    new_exp = expires_at
+            except Exception:
+                new_exp = expires_at
+        else:
+            new_exp = expires_at
+
+        supabase.table("drivers").update({
+            "promo_plan": REWARD_PLAN,
+            "promo_plan_expires_at": new_exp,
+        }).eq("id", referrer_id).execute()
+
+        # Record referral
+        supabase.table("referrals").insert({
+            "referrer_driver_id": referrer_id,
+            "referred_driver_id": referred_driver_id,
+            "referral_code": code,
+            "reward_given": True,
+        }).execute()
+
+        return {
+            "success": True,
+            "reward_days": REWARD_DAYS,
+            "reward_plan": REWARD_PLAN,
+            "message": f"Codigo canjeado. {REWARD_DAYS} dias de {REWARD_PLAN} para ti y para quien te invito."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/referral/stats")
+async def get_referral_stats(user=Depends(get_current_user)):
+    """Get referral stats for the current user"""
+    try:
+        driver_id = await get_user_driver_id(user)
+        if not driver_id:
+            raise HTTPException(status_code=404, detail="Driver not found")
+
+        result = supabase.table("referrals").select("*").eq("referrer_driver_id", driver_id).execute()
+
+        return {
+            "total_referrals": len(result.data) if result.data else 0,
+            "total_reward_days": len(result.data) * 7 if result.data else 0,
+            "referrals": result.data or [],
         }
 
     except HTTPException:
