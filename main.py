@@ -2683,6 +2683,43 @@ async def places_directions(
     return resp.json()
 
 
+# === STREET VIEW PROXY ===
+
+@app.get("/streetview/metadata")
+async def streetview_metadata(lat: float, lng: float, user=Depends(get_current_user)):
+    """Proxy for Google Street View Metadata API - checks availability"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/streetview/metadata",
+            params={"location": f"{lat},{lng}", "key": GOOGLE_API_KEY}
+        )
+    return resp.json()
+
+
+@app.get("/streetview/image")
+async def streetview_image(
+    lat: float, lng: float,
+    heading: float = 0, fov: float = 90, pitch: float = 5,
+    size: str = "600x400",
+):
+    """Proxy for Google Street View Static API - returns image"""
+    from fastapi.responses import Response
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/streetview",
+            params={
+                "size": size, "location": f"{lat},{lng}",
+                "fov": fov, "heading": heading, "pitch": pitch,
+                "key": GOOGLE_API_KEY
+            }
+        )
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "public, max-age=86400"}
+    )
+
+
 # === ACCOUNT DELETION ===
 
 @app.delete("/auth/delete-account")
