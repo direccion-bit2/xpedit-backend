@@ -1001,15 +1001,19 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/promo/check/{user_id}")
-async def check_promo_benefit(user_id: str, user=Depends(get_current_user)):
-    """Check if a user has an active promo benefit - only own data or admin"""
-    if user["role"] != "admin" and user["id"] != user_id:
+@app.get("/promo/check/{driver_id}")
+async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
+    """Check if a driver has an active promo benefit - only own data or admin"""
+    # Verify ownership: look up driver and check user_id matches authenticated user
+    driver_check = supabase.table("drivers").select("user_id").eq("id", driver_id).single().execute()
+    if not driver_check.data:
+        raise HTTPException(status_code=404, detail="Driver no encontrado")
+    if user["role"] != "admin" and user["id"] != driver_check.data["user_id"]:
         raise HTTPException(status_code=403, detail="No tienes acceso a estos datos")
     try:
         result = supabase.table("drivers")\
             .select("promo_plan, promo_plan_expires_at")\
-            .eq("id", user_id)\
+            .eq("id", driver_id)\
             .single()\
             .execute()
 
@@ -1492,6 +1496,9 @@ def _generate_invite_code() -> str:
 @app.post("/company/register")
 async def register_company(request: CompanyRegisterRequest, user=Depends(get_current_user)):
     """Register a new company and set up owner"""
+    # SECURITY: owner_user_id must be the authenticated user (prevent privilege escalation)
+    if request.owner_user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Solo puedes registrar una empresa para tu propia cuenta")
     try:
         # Create company
         company_data = {
@@ -1499,7 +1506,7 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
             "email": request.email,
             "phone": request.phone,
             "address": request.address,
-            "owner_id": request.owner_user_id,
+            "owner_id": user["id"],
             "payment_model": "driver_pays",
             "active": True,
         }
@@ -1515,12 +1522,12 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
         supabase.table("users").update({
             "role": "admin",
             "company_id": company_id,
-        }).eq("id", request.owner_user_id).execute()
+        }).eq("id", user["id"]).execute()
 
         # Update owner's company_id in drivers table
         supabase.table("drivers").update({
             "company_id": company_id,
-        }).eq("user_id", request.owner_user_id).execute()
+        }).eq("user_id", user["id"]).execute()
 
         # Create subscription with 14-day trial
         now = datetime.now()
@@ -1545,18 +1552,23 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 15. GET /company/check-access/{user_id}
+# 15. GET /company/check-access/{driver_id}
 # NOTE: Defined before /company/{company_id} to avoid route shadowing
-@app.get("/company/check-access/{user_id}")
-async def check_company_access(user_id: str, user=Depends(get_current_user)):
+@app.get("/company/check-access/{driver_id}")
+async def check_company_access(driver_id: str, user=Depends(get_current_user)):
     """Check if a driver has company-paid access - only own data or admin"""
-    if user["role"] != "admin" and user["id"] != user_id:
+    # Verify ownership: look up driver and check user_id matches authenticated user
+    driver_check = supabase.table("drivers").select("user_id").eq("id", driver_id).single().execute()
+    if not driver_check.data:
+        raise HTTPException(status_code=404, detail="Driver no encontrado")
+    owner_user_id = driver_check.data["user_id"]
+    if user["role"] != "admin" and user["id"] != owner_user_id:
         raise HTTPException(status_code=403, detail="No tienes acceso a estos datos")
     try:
-        # Look up active company_driver_links for this user
+        # Look up active company_driver_links for this driver's user
         link_result = supabase.table("company_driver_links")\
             .select("*")\
-            .eq("user_id", user_id)\
+            .eq("user_id", owner_user_id)\
             .eq("active", True)\
             .limit(1)\
             .execute()
@@ -2675,29 +2687,78 @@ async def places_directions(
 
 @app.delete("/auth/delete-account")
 async def delete_account(user=Depends(get_current_user)):
-    """Delete user account and all associated data (Apple requirement)"""
+    """Delete user account and all associated data (Apple/GDPR requirement)"""
     user_id = user["id"]
     try:
-        # Delete user data from all tables (order matters for foreign keys)
-        tables_to_clean = [
-            ("location_history", "driver_id"),
-            ("stops", "driver_id"),
-            ("routes", "driver_id"),
-            ("recurring_places", "driver_id"),
-            ("promo_redemptions", "user_id"),
+        # First, find the driver_id for this user
+        driver_result = supabase.table("drivers").select("id").eq("user_id", user_id).execute()
+        driver_id = driver_result.data[0]["id"] if driver_result.data else None
+
+        if driver_id:
+            # Get all route IDs for this driver (needed for stops and delivery_proofs)
+            routes_result = supabase.table("routes").select("id").eq("driver_id", driver_id).execute()
+            route_ids = [r["id"] for r in (routes_result.data or [])]
+
+            if route_ids:
+                # Delete stops for all driver's routes
+                for route_id in route_ids:
+                    try:
+                        # Delete delivery_proofs for stops in this route
+                        stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
+                        stop_ids = [s["id"] for s in (stops_result.data or [])]
+                        if stop_ids:
+                            for stop_id in stop_ids:
+                                try:
+                                    supabase.table("delivery_proofs").delete().eq("stop_id", stop_id).execute()
+                                except Exception:
+                                    pass
+                        # Delete tracking_links for this route
+                        try:
+                            supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
+                        except Exception:
+                            pass
+                        # Delete stops
+                        supabase.table("stops").delete().eq("route_id", route_id).execute()
+                    except Exception:
+                        pass
+
+                # Delete all routes
+                try:
+                    supabase.table("routes").delete().eq("driver_id", driver_id).execute()
+                except Exception:
+                    pass
+
+            # Delete other driver-specific data
+            tables_driver = [
+                ("location_history", "driver_id"),
+                ("recurring_places", "driver_id"),
+                ("daily_usage", "driver_id"),
+                ("referrals", "referrer_driver_id"),
+                ("referrals", "referred_driver_id"),
+            ]
+            for table, column in tables_driver:
+                try:
+                    supabase.table(table).delete().eq(column, driver_id).execute()
+                except Exception:
+                    pass
+
+            # Delete the driver record
+            try:
+                supabase.table("drivers").delete().eq("id", driver_id).execute()
+            except Exception:
+                pass
+
+        # Delete user-level data
+        tables_user = [
+            ("code_redemptions", "user_id"),
+            ("company_driver_links", "user_id"),
             ("company_invites", "user_id"),
         ]
-        for table, column in tables_to_clean:
+        for table, column in tables_user:
             try:
                 supabase.table(table).delete().eq(column, user_id).execute()
             except Exception:
-                pass  # Table might not exist or no rows
-
-        # Remove from company if member
-        try:
-            supabase.table("company_drivers").delete().eq("user_id", user_id).execute()
-        except Exception:
-            pass
+                pass
 
         # Delete user profile
         try:
