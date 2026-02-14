@@ -215,6 +215,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Rate limiting (in-memory, single instance)
+from collections import defaultdict
+_rate_limits: dict = defaultdict(list)
+
+def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60):
+    """Simple in-memory rate limiter. Raises 429 if exceeded."""
+    now = time.time()
+    _rate_limits[key] = [t for t in _rate_limits[key] if t > now - window_seconds]
+    if len(_rate_limits[key]) >= max_requests:
+        raise HTTPException(status_code=429, detail="Demasiadas solicitudes. Inténtalo en unos minutos.")
+    _rate_limits[key].append(now)
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Apply rate limiting to sensitive endpoints"""
+    path = request.url.path
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        if path.startswith("/admin"):
+            check_rate_limit(f"admin:{client_ip}", max_requests=60, window_seconds=60)
+        elif path.startswith("/auth") or path == "/promo/redeem":
+            check_rate_limit(f"auth:{client_ip}", max_requests=20, window_seconds=60)
+        elif path == "/optimize":
+            check_rate_limit(f"optimize:{client_ip}", max_requests=10, window_seconds=60)
+    except HTTPException as e:
+        from starlette.responses import JSONResponse
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    return await call_next(request)
+
 
 # === MODELOS ===
 
@@ -968,11 +997,8 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
         benefit_expires_at = now + timedelta(days=promo["benefit_value"])
         benefit_expires_at_iso = benefit_expires_at.isoformat()
 
-        # 7. Increment current_uses on promo code
-        supabase.table("promo_codes")\
-            .update({"current_uses": (promo.get("current_uses", 0) + 1)})\
-            .eq("id", promo["id"])\
-            .execute()
+        # 7. Atomically increment current_uses (prevents race condition)
+        supabase.rpc("atomic_increment_uses", {"p_table": "promo_codes", "p_id": promo["id"]}).execute()
 
         # 8. Create code_redemption record
         supabase.table("code_redemptions").insert({
@@ -1988,9 +2014,8 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
         supabase.table("company_driver_links").insert(link_data).execute()
 
         # Increment current_uses
-        supabase.table("company_invites").update({
-            "current_uses": invite.get("current_uses", 0) + 1,
-        }).eq("id", invite["id"]).execute()
+        # Atomically increment current_uses (prevents race condition)
+        supabase.rpc("atomic_increment_uses", {"p_table": "company_invites", "p_id": invite["id"]}).execute()
 
         # Record in company_invite_uses
         supabase.table("company_invite_uses").insert({
