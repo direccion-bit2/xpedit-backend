@@ -444,7 +444,8 @@ async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
                 "display_name": data[0]["display_name"]
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            print(f"[GEOCODE] Error: {e}")
+            raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === ENDPOINTS AVANZADOS DE OPTIMIZACIÓN ===
@@ -544,6 +545,8 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
     try:
         # Obtener rutas filtradas por permisos
         query = supabase.table("routes").select("*, stops(*)")
+        # Filter by today's date
+        query = query.gte("created_at", f"{today}T00:00:00")
         if user["role"] == "admin":
             if company_id:
                 query = query.eq("company_id", company_id)
@@ -600,7 +603,8 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[STATS] Error: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === ENDPOINTS SUPABASE ===
@@ -750,9 +754,8 @@ async def delete_route(route_id: str, user=Depends(get_current_user)):
     stop_ids = [s["id"] for s in (stops_result.data or [])]
 
     if stop_ids:
-        # Delete delivery proofs linked to these stops
-        for sid in stop_ids:
-            supabase.table("delivery_proofs").delete().eq("stop_id", sid).execute()
+        # Delete delivery proofs linked to these stops (batch)
+        supabase.table("delivery_proofs").delete().in_("stop_id", stop_ids).execute()
 
         # Delete tracking links for this route
         supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
@@ -1024,7 +1027,8 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.get("/promo/check/{driver_id}")
@@ -1087,7 +1091,8 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === ADMIN ENDPOINTS ===
@@ -1104,7 +1109,8 @@ async def list_promo_codes(user=Depends(require_admin)):
         return {"success": True, "promo_codes": result.data}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.post("/admin/promo-codes")
@@ -1139,7 +1145,8 @@ async def create_promo_code(request: PromoCodeCreateRequest, user=Depends(requir
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.patch("/admin/promo-codes/{code_id}")
@@ -1173,7 +1180,8 @@ async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest, user=
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.get("/admin/users")
@@ -1188,7 +1196,8 @@ async def list_admin_users(user=Depends(require_admin)):
         return {"success": True, "users": result.data}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.patch("/admin/users/{user_id}/grant")
@@ -1233,7 +1242,8 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 class AdminResetPasswordRequest(BaseModel):
@@ -1267,7 +1277,8 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 class AdminCreateCompanyRequest(BaseModel):
@@ -1311,10 +1322,14 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === REFERRAL SYSTEM ===
+
+INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
 
 class ReferralRedeemRequest(BaseModel):
     referral_code: str
@@ -1346,7 +1361,8 @@ async def get_referral_code(user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.post("/referral/redeem")
@@ -1427,7 +1443,8 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 @app.get("/referral/stats")
@@ -1449,12 +1466,11 @@ async def get_referral_stats(user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === COMPANY / FLEET MANAGEMENT MODELS ===
-
-INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 DRIVER_PLAN_PRICES = {
     "free": 0,
@@ -1525,6 +1541,9 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
     # SECURITY: owner_user_id must be the authenticated user (prevent privilege escalation)
     if request.owner_user_id != user["id"]:
         raise HTTPException(status_code=403, detail="Solo puedes registrar una empresa para tu propia cuenta")
+    # Validate email format
+    if not request.email or "@" not in request.email or "." not in request.email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Email no valido")
     try:
         # Create company
         company_data = {
@@ -1575,7 +1594,8 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 15. GET /company/check-access/{driver_id}
@@ -1624,7 +1644,8 @@ async def check_company_access(driver_id: str, user=Depends(get_current_user)):
         return {"has_access": False}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 2. GET /company/{company_id}
@@ -1663,7 +1684,8 @@ async def get_company(company_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 3. PATCH /company/{company_id}
@@ -1707,7 +1729,8 @@ async def update_company(company_id: str, request: CompanyUpdateRequest, user=De
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 4. GET /company/{company_id}/drivers
@@ -1766,7 +1789,8 @@ async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
         return {"success": True, "drivers": drivers_list, "total": len(drivers_list), "active_count": active_count}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 5. GET /company/{company_id}/stats
@@ -1838,7 +1862,8 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 6. POST /company/invites
@@ -1881,7 +1906,8 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 7. GET /company/{company_id}/invites
@@ -1902,7 +1928,8 @@ async def get_company_invites(company_id: str, user=Depends(get_current_user)):
         return {"success": True, "invites": result.data or []}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 8. DELETE /company/invites/{invite_id}
@@ -1927,7 +1954,8 @@ async def deactivate_company_invite(invite_id: str, user=Depends(get_current_use
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 9. POST /company/join
@@ -2032,7 +2060,8 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 10. POST /company/leave
@@ -2084,7 +2113,8 @@ async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_u
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 11. POST /company/drivers
@@ -2152,7 +2182,8 @@ async def create_company_driver(request: CompanyCreateDriverRequest, user=Depend
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 12. DELETE /company/drivers/{user_id}
@@ -2202,7 +2233,8 @@ async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 13b. PATCH /company/drivers/{user_id}/active - toggle driver active/inactive
@@ -2263,7 +2295,8 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 13. PATCH /company/drivers/{user_id}/mode
@@ -2355,7 +2388,8 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # 14. GET /company/{company_id}/subscription
@@ -2382,7 +2416,8 @@ async def get_company_subscription(company_id: str, user=Depends(get_current_use
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === OCR PROXY ===
@@ -2462,7 +2497,8 @@ CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === STRIPE CHECKOUT ===
@@ -2503,7 +2539,8 @@ async def create_stripe_checkout(request: StripeCheckoutRequest, user=Depends(ge
         return {"success": True, "url": session.url}
 
     except stripe.StripeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[STRIPE] Error: {e}")
+        raise HTTPException(status_code=500, detail="Error en el servicio de pago")
 
 
 @app.post("/stripe/webhook")
@@ -2620,11 +2657,13 @@ async def create_stripe_portal(user=Depends(get_current_user)):
         return {"success": True, "url": session.url}
 
     except stripe.StripeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[STRIPE] Error: {e}")
+        raise HTTPException(status_code=500, detail="Error en el servicio de pago")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
 # === GOOGLE PLACES PROXY ===
