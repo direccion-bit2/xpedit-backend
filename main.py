@@ -234,6 +234,8 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"auth:{client_ip}", max_requests=20, window_seconds=60)
         elif path == "/optimize":
             check_rate_limit(f"optimize:{client_ip}", max_requests=10, window_seconds=60)
+        elif path.startswith("/streetview"):
+            check_rate_limit(f"streetview:{client_ip}", max_requests=30, window_seconds=60)
     except HTTPException as e:
         from starlette.responses import JSONResponse
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
@@ -2760,7 +2762,6 @@ async def streetview_image(
     lat: float, lng: float,
     heading: float = 0, fov: float = 90, pitch: float = 5,
     size: str = "600x400",
-    user=Depends(get_current_user),
 ):
     """Proxy for Google Street View Static API - returns image"""
     from fastapi.responses import Response
@@ -2825,10 +2826,15 @@ async def delete_account(user=Depends(get_current_user)):
                 except Exception:
                     pass
 
+            # Delete recurring_places by user_id (created_by stores auth.uid())
+            try:
+                supabase.table("recurring_places").delete().eq("created_by", user_id).execute()
+            except Exception:
+                pass
+
             # Delete other driver-specific data
             tables_driver = [
                 ("location_history", "driver_id"),
-                ("recurring_places", "driver_id"),
                 ("daily_usage", "driver_id"),
                 ("referrals", "referrer_driver_id"),
                 ("referrals", "referred_driver_id"),
