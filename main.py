@@ -2428,6 +2428,52 @@ async def places_directions(
     return resp.json()
 
 
+# === ACCOUNT DELETION ===
+
+@app.delete("/auth/delete-account")
+async def delete_account(user=Depends(get_current_user)):
+    """Delete user account and all associated data (Apple requirement)"""
+    user_id = user["id"]
+    try:
+        # Delete user data from all tables (order matters for foreign keys)
+        tables_to_clean = [
+            ("location_history", "driver_id"),
+            ("stops", "driver_id"),
+            ("routes", "driver_id"),
+            ("recurring_places", "driver_id"),
+            ("promo_redemptions", "user_id"),
+            ("company_invites", "user_id"),
+        ]
+        for table, column in tables_to_clean:
+            try:
+                supabase.table(table).delete().eq(column, user_id).execute()
+            except Exception:
+                pass  # Table might not exist or no rows
+
+        # Remove from company if member
+        try:
+            supabase.table("company_drivers").delete().eq("user_id", user_id).execute()
+        except Exception:
+            pass
+
+        # Delete user profile
+        try:
+            supabase.table("users").delete().eq("id", user_id).execute()
+        except Exception:
+            pass
+
+        # Delete auth user via Supabase Admin API
+        try:
+            supabase.auth.admin.delete_user(user_id)
+        except Exception:
+            pass
+
+        return {"status": "deleted", "message": "Cuenta eliminada correctamente"}
+    except Exception as e:
+        print(f"[DELETE_ACCOUNT] Error: {e}")
+        raise HTTPException(status_code=500, detail="Error al eliminar la cuenta")
+
+
 # === MAIN ===
 if __name__ == "__main__":
     import uvicorn
