@@ -2677,7 +2677,7 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
     }
     if lat and lng:
         params["location"] = f"{lat},{lng}"
-        params["radius"] = "50000"
+        params["radius"] = "30000"  # 30km - sesgo fuerte hacia zona de paradas
 
     async with httpx.AsyncClient() as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
