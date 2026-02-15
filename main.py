@@ -234,8 +234,6 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"auth:{client_ip}", max_requests=20, window_seconds=60)
         elif path == "/optimize":
             check_rate_limit(f"optimize:{client_ip}", max_requests=10, window_seconds=60)
-        elif path.startswith("/streetview"):
-            check_rate_limit(f"streetview:{client_ip}", max_requests=30, window_seconds=60)
     except HTTPException as e:
         from starlette.responses import JSONResponse
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
@@ -2744,41 +2742,7 @@ async def places_directions(
     return resp.json()
 
 
-# === STREET VIEW PROXY ===
-
-@app.get("/streetview/metadata")
-async def streetview_metadata(lat: float, lng: float, user=Depends(get_current_user)):
-    """Proxy for Google Street View Metadata API - checks availability"""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://maps.googleapis.com/maps/api/streetview/metadata",
-            params={"location": f"{lat},{lng}", "key": GOOGLE_API_KEY}
-        )
-    return resp.json()
-
-
-@app.get("/streetview/image")
-async def streetview_image(
-    lat: float, lng: float,
-    heading: float = 0, fov: float = 90, pitch: float = 5,
-    size: str = "600x400",
-):
-    """Proxy for Google Street View Static API - returns image"""
-    from fastapi.responses import Response
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://maps.googleapis.com/maps/api/streetview",
-            params={
-                "size": size, "location": f"{lat},{lng}",
-                "fov": fov, "heading": heading, "pitch": pitch,
-                "key": GOOGLE_API_KEY
-            }
-        )
-    return Response(
-        content=resp.content,
-        media_type=resp.headers.get("content-type", "image/jpeg"),
-        headers={"Cache-Control": "public, max-age=86400"}
-    )
+  # Street View proxy removed - app opens Google Maps directly (free, no API cost)
 
 
 # === ACCOUNT DELETION ===
