@@ -1321,6 +1321,31 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
+@app.patch("/admin/companies/{company_id}")
+async def admin_toggle_company(company_id: str, request: dict, user=Depends(require_admin)):
+    """Toggle company active status (admin)"""
+    try:
+        update_data = {}
+        if "active" in request:
+            update_data["active"] = bool(request["active"])
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        result = supabase.table("companies").update(update_data).eq("id", company_id).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+        return {"success": True, "company": result.data[0]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
+
+
 # === REFERRAL SYSTEM ===
 
 INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
