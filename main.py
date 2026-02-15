@@ -386,7 +386,7 @@ async def root():
     }
 
 
-APK_DOWNLOAD_URL = "https://github.com/direccion-bit2/xpedit-releases/releases/download/v1.1.3/xpedit-latest.apk"
+APK_DOWNLOAD_URL = "https://github.com/direccion-bit2/xpedit-releases/releases/download/v1.1.4/xpedit-latest.apk"
 
 
 @app.get("/download/apk")
