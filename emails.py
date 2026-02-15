@@ -4,13 +4,14 @@ Xpedit - Servicio de emails con Resend
 
 import os
 import resend
-from typing import Optional
+from typing import Optional, List
 
 # Configurar API key
 resend.api_key = os.getenv("RESEND_API_KEY")
 
 # Email de envío (dominio verificado)
-FROM_EMAIL = "Xpedit <notificaciones@xpedit.es>"
+FROM_EMAIL = "Xpedit <info@xpedit.es>"
+REPLY_TO = "info@xpedit.es"
 
 
 def get_base_template(content: str, title: str = "Xpedit") -> str:
@@ -350,9 +351,148 @@ def send_daily_summary_email(
         response = resend.Emails.send({
             "from": FROM_EMAIL,
             "to": [to_email],
-            "subject": f"📊 Resumen de entregas - {date}",
+            "reply_to": REPLY_TO,
+            "subject": f"Resumen de entregas - {date}",
             "html": get_base_template(content, f"Resumen {date}")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def send_plan_activated_email(to_email: str, user_name: str, plan_name: str, days: Optional[int] = None, permanent: bool = False) -> dict:
+    """Email cuando se activa un plan (por admin o por compra)"""
+    duration_text = "de forma permanente" if permanent else f"durante {days} dias"
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #eff6ff; border-radius: 50%; padding: 20px;">
+                <span style="font-size: 40px;">{"👑" if "Plus" in plan_name or "plus" in plan_name else "⭐"}</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            ¡Plan {plan_name} activado!
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola <strong>{user_name}</strong>,
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Tu plan <strong>{plan_name}</strong> ha sido activado {duration_text}. Ya puedes disfrutar de todas las ventajas.
+        </p>
+
+        <div style="background-color: #f0fdf4; border-radius: 12px; padding: 20px; margin: 25px 0;">
+            <h3 style="margin: 0 0 15px 0; color: #166534; font-size: 16px;">Tus beneficios:</h3>
+            <ul style="margin: 0; padding-left: 20px; color: #166534; font-size: 14px; line-height: 2;">
+                <li>Mas paradas diarias</li>
+                <li>Optimizacion de rutas avanzada</li>
+                <li>Soporte prioritario</li>
+            </ul>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://xpedit.es" style="display: inline-block; background-color: #3b82f6; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+                Abrir Xpedit
+            </a>
+        </div>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": f"Plan {plan_name} activado",
+            "html": get_base_template(content, f"Plan {plan_name}")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_referral_reward_email(to_email: str, user_name: str, referred_name: str, reward_days: int) -> dict:
+    """Email cuando un referido se registra y ambos reciben reward"""
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #fef3c7; border-radius: 50%; padding: 20px;">
+                <span style="font-size: 40px;">🎉</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            ¡Has ganado {reward_days} dias Pro gratis!
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola <strong>{user_name}</strong>,
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            <strong>{referred_name}</strong> se ha registrado con tu codigo de invitacion. Como agradecimiento, ambos recibis <strong>{reward_days} dias de Pro gratis</strong>.
+        </p>
+
+        <div style="background-color: #eff6ff; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center;">
+            <p style="margin: 0 0 5px 0; color: #1e40af; font-size: 14px;">Tu recompensa</p>
+            <p style="margin: 0; color: #1e40af; font-size: 28px; font-weight: 700;">{reward_days} dias Pro</p>
+        </div>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Sigue invitando amigos para acumular mas dias gratis.
+        </p>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://xpedit.es" style="display: inline-block; background-color: #f59e0b; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+                Invitar mas amigos
+            </a>
+        </div>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": f"🎉 Has ganado {reward_days} dias Pro gratis",
+            "html": get_base_template(content, "Recompensa referido")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
+    """Email personalizado desde admin"""
+    content = f"""
+        <div style="color: #4b5563; font-size: 16px; line-height: 1.6;">
+            {body_html}
+        </div>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": subject,
+            "html": get_base_template(content, subject)
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_broadcast_email(to_emails: List[str], subject: str, body_html: str) -> dict:
+    """Email masivo a multiples usuarios"""
+    results = {"sent": 0, "failed": 0, "errors": []}
+
+    for email in to_emails:
+        result = send_custom_email(email, subject, body_html)
+        if result["success"]:
+            results["sent"] += 1
+        else:
+            results["failed"] += 1
+            results["errors"].append({"email": email, "error": result.get("error", "unknown")})
+
+    return results

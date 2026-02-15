@@ -31,7 +31,11 @@ from emails import (
     send_delivery_started_email,
     send_delivery_completed_email,
     send_delivery_failed_email,
-    send_daily_summary_email
+    send_daily_summary_email,
+    send_plan_activated_email,
+    send_referral_reward_email,
+    send_custom_email,
+    send_broadcast_email,
 )
 
 # Cargar variables de entorno
@@ -369,6 +373,17 @@ class DailySummaryEmailRequest(BaseModel):
     total_stops: int
     completed_stops: int
     failed_stops: int
+
+
+class AdminSendEmailRequest(BaseModel):
+    subject: str
+    body: str  # HTML body
+
+
+class AdminBroadcastEmailRequest(BaseModel):
+    subject: str
+    body: str  # HTML body
+    target: str = "all"  # all, free, pro, pro_plus
 
 
 # === ENDPOINTS BÁSICOS ===
@@ -915,6 +930,60 @@ async def api_send_daily_summary_email(request: DailySummaryEmailRequest, user=D
     return result
 
 
+# --- Admin email endpoints ---
+
+@app.post("/admin/users/{user_id}/send-email")
+async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest, user=Depends(require_admin)):
+    """Enviar email personalizado a un usuario (admin)"""
+    try:
+        driver = supabase.table("drivers").select("email, name").eq("id", user_id).single().execute()
+        if not driver.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        result = send_custom_email(driver.data["email"], request.subject, request.body)
+        if not result["success"]:
+            raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
+
+        return {"success": True, "email": driver.data["email"], "message_id": result.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error enviando email")
+
+
+@app.post("/admin/broadcast-email")
+async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depends(require_admin)):
+    """Enviar email a todos los usuarios o filtrado por plan (admin)"""
+    try:
+        query = supabase.table("drivers").select("email, name, promo_plan")
+
+        if request.target == "free":
+            query = query.is_("promo_plan", "null")
+        elif request.target == "pro":
+            query = query.eq("promo_plan", "pro")
+        elif request.target == "pro_plus":
+            query = query.eq("promo_plan", "pro_plus")
+
+        drivers = query.execute()
+
+        if not drivers.data:
+            return {"success": True, "sent": 0, "failed": 0, "total": 0}
+
+        emails = [d["email"] for d in drivers.data if d.get("email")]
+        results = send_broadcast_email(emails, request.subject, request.body)
+
+        return {
+            "success": True,
+            "total": len(emails),
+            "sent": results["sent"],
+            "failed": results["failed"],
+        }
+    except Exception as e:
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error enviando broadcast")
+
+
 # === PROMO CODE MODELS ===
 
 class PromoRedeemRequest(BaseModel):
@@ -1224,6 +1293,21 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
         if not result.data:
             raise HTTPException(status_code=404, detail="User not found")
 
+        # Send email notification (fire and forget)
+        if request.plan != "free" and result.data[0].get("email"):
+            driver = result.data[0]
+            plan_label = "Pro+" if request.plan == "pro_plus" else "Pro"
+            try:
+                send_plan_activated_email(
+                    driver["email"],
+                    driver.get("name", "Usuario"),
+                    plan_label,
+                    days=request.days if not request.permanent else None,
+                    permanent=request.permanent
+                )
+            except Exception:
+                pass  # Don't fail the grant if email fails
+
         return {
             "success": True,
             "user_id": user_id,
@@ -1395,8 +1479,8 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
 
         code = request.referral_code.strip().upper()
 
-        # Find referrer
-        referrer = supabase.table("drivers").select("id, referral_code").eq("referral_code", code).single().execute()
+        # Find referrer (include email and name for notification)
+        referrer = supabase.table("drivers").select("id, referral_code, email, name").eq("referral_code", code).single().execute()
         if not referrer.data:
             raise HTTPException(status_code=404, detail="Codigo de referido no encontrado")
 
@@ -1452,6 +1536,21 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
             "referral_code": code,
             "reward_given": True,
         }).execute()
+
+        # Send email notifications (fire and forget)
+        try:
+            referrer_email = referrer.data.get("email")
+            referrer_name = referrer.data.get("name") or "Usuario"
+            referred = supabase.table("drivers").select("email, name").eq("id", referred_driver_id).single().execute()
+            referred_email = referred.data.get("email") if referred.data else None
+            referred_name = referred.data.get("name") if referred.data else "Usuario"
+
+            if referrer_email:
+                send_referral_reward_email(referrer_email, referrer_name, referred_name, REWARD_DAYS)
+            if referred_email:
+                send_plan_activated_email(referred_email, referred_name, "Pro", REWARD_DAYS, False)
+        except Exception:
+            pass  # Don't fail the referral if email fails
 
         return {
             "success": True,
