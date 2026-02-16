@@ -5,6 +5,7 @@ RutaMax API - Backend de optimización de rutas
 import os
 import random
 import time
+import logging
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,9 @@ import jwt as pyjwt
 from jwt import PyJWKClient
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger("xpedit")
 
 from optimizer import (
     optimize_route,
@@ -53,6 +57,15 @@ _raw_jwt = os.getenv("SUPABASE_JWT_SECRET", "")
 # Railway strips trailing '=' — restore base64 padding
 SUPABASE_JWT_SECRET = _raw_jwt + "=" * ((4 - len(_raw_jwt) % 4) % 4) if _raw_jwt else ""
 
+
+def safe_first(result) -> Optional[dict]:
+    """Safely get first result from Supabase query, returns None if empty"""
+    return result.data[0] if result.data else None
+
+
+# Webhook idempotency (in-memory, single instance)
+_processed_webhook_events: set = set()
+
 # Stripe
 import stripe
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
@@ -83,7 +96,7 @@ async def get_current_user(authorization: str = Header(default=None)):
         ALLOWED_ALGORITHMS = ["HS256", "ES256"]
         header = pyjwt.get_unverified_header(token)
         alg = header.get("alg", "HS256")
-        print(f"[AUTH] JWT alg={alg}, token_len={len(token)}")
+        logger.info(f"JWT alg={alg}, token_len={len(token)}")
 
         if alg not in ALLOWED_ALGORITHMS:
             raise HTTPException(status_code=401, detail=f"Algorithm {alg} not allowed")
@@ -115,12 +128,12 @@ async def get_current_user(authorization: str = Header(default=None)):
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado - cierra sesion y vuelve a entrar")
     except pyjwt.InvalidTokenError as e:
-        print(f"[AUTH] InvalidTokenError: {e}")
+        logger.warning(f"InvalidTokenError: {e}")
         raise HTTPException(status_code=401, detail="Token invalido - cierra sesion y vuelve a entrar")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[AUTH] Unexpected error: {type(e).__name__}: {e}")
+        logger.error(f"Auth unexpected error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=401, detail="Error de autenticacion")
 
 
@@ -214,6 +227,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
 
 # Rate limiting (in-memory, single instance)
 from collections import defaultdict
@@ -420,7 +445,7 @@ async def download_apk(request: Request):
             "source": "web",
         }).execute()
     except Exception as e:
-        print(f"[DOWNLOAD] Error tracking: {e}")
+        logger.error(f"Download tracking error: {e}")
 
     return RedirectResponse(url=APK_DOWNLOAD_URL, status_code=302)
 
@@ -455,7 +480,7 @@ async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
                 "display_name": data[0]["display_name"]
             }
         except Exception as e:
-            print(f"[GEOCODE] Error: {e}")
+            logger.error(f"Geocode error: {e}")
             raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -614,7 +639,7 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
         }
 
     except Exception as e:
-        print(f"[STATS] Error: {e}")
+        logger.error(f"Stats error: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -701,7 +726,10 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     }
 
     route_result = supabase.table("routes").insert(route_data).execute()
-    route_id = route_result.data[0]["id"]
+    route = safe_first(route_result)
+    if not route:
+        raise HTTPException(status_code=500, detail="Error al crear la ruta")
+    route_id = route["id"]
 
     # Crear las paradas
     stops_data = [
@@ -742,7 +770,10 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
         "status": "in_progress",
         "started_at": datetime.now().isoformat()
     }).eq("id", route_id).execute()
-    return {"success": True, "route": result.data[0]}
+    route = safe_first(result)
+    if not route:
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+    return {"success": True, "route": route}
 
 
 @app.patch("/routes/{route_id}/complete")
@@ -753,7 +784,10 @@ async def complete_route(route_id: str, user=Depends(get_current_user)):
         "status": "completed",
         "completed_at": datetime.now().isoformat()
     }).eq("id", route_id).execute()
-    return {"success": True, "route": result.data[0]}
+    route = safe_first(result)
+    if not route:
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+    return {"success": True, "route": route}
 
 
 @app.delete("/routes/{route_id}")
@@ -789,7 +823,10 @@ async def complete_stop(stop_id: str, user=Depends(get_current_user)):
         "status": "completed",
         "completed_at": datetime.now().isoformat()
     }).eq("id", stop_id).execute()
-    return {"success": True, "stop": result.data[0]}
+    stop = safe_first(result)
+    if not stop:
+        raise HTTPException(status_code=404, detail="Parada no encontrada")
+    return {"success": True, "stop": stop}
 
 
 @app.patch("/stops/{stop_id}/fail")
@@ -800,7 +837,10 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
         "status": "failed",
         "completed_at": datetime.now().isoformat()
     }).eq("id", stop_id).execute()
-    return {"success": True, "stop": result.data[0]}
+    stop = safe_first(result)
+    if not stop:
+        raise HTTPException(status_code=404, detail="Parada no encontrada")
+    return {"success": True, "stop": stop}
 
 
 # -- GPS Tracking --
@@ -824,7 +864,10 @@ async def update_location(location: LocationUpdate, user=Depends(get_current_use
     }
 
     result = supabase.table("location_history").insert(data).execute()
-    return {"success": True, "id": result.data[0]["id"]}
+    location = safe_first(result)
+    if not location:
+        raise HTTPException(status_code=500, detail="Error al registrar ubicación")
+    return {"success": True, "id": location["id"]}
 
 
 @app.get("/location/{driver_id}/latest")
@@ -962,7 +1005,7 @@ async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest,
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error enviando email")
 
 
@@ -1009,7 +1052,7 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
             "failed": results["failed"],
         }
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error enviando broadcast")
 
 
@@ -1120,7 +1163,7 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1184,7 +1227,7 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1202,7 +1245,7 @@ async def list_promo_codes(user=Depends(require_admin)):
         return {"success": True, "promo_codes": result.data}
 
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1232,13 +1275,16 @@ async def create_promo_code(request: PromoCodeCreateRequest, user=Depends(requir
         }
 
         result = supabase.table("promo_codes").insert(data).execute()
+        promo_code = safe_first(result)
+        if not promo_code:
+            raise HTTPException(status_code=500, detail="Error al crear promo code")
 
-        return {"success": True, "promo_code": result.data[0]}
+        return {"success": True, "promo_code": promo_code}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1268,12 +1314,12 @@ async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest, user=
         if not result.data:
             raise HTTPException(status_code=404, detail="Promo code not found")
 
-        return {"success": True, "promo_code": result.data[0]}
+        return {"success": True, "promo_code": safe_first(result)}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1289,7 +1335,7 @@ async def list_admin_users(user=Depends(require_admin)):
         return {"success": True, "users": result.data}
 
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1353,7 +1399,7 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
                         except Exception:
                             pass
             except Exception as e:
-                print(f"[WARN] Could not send plan email: {e}")
+                logger.warning(f"Could not send plan email: {e}")
 
         return {
             "success": True,
@@ -1368,7 +1414,7 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1384,8 +1430,12 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
         chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#"
         new_password = request.password or "".join(random.choices(chars, k=12))
 
-        if len(new_password) < 6:
-            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        if len(new_password) < 8:
+            raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+        if not any(c.isupper() for c in new_password):
+            raise HTTPException(status_code=400, detail="La contraseña debe incluir al menos una mayúscula")
+        if not any(c.isdigit() for c in new_password):
+            raise HTTPException(status_code=400, detail="La contraseña debe incluir al menos un número")
 
         # Update password via Supabase Admin API
         result = supabase.auth.admin.update_user_by_id(user_id, {"password": new_password})
@@ -1408,7 +1458,7 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1431,10 +1481,9 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
             "active": True,
         }).execute()
 
-        if not result.data:
+        company = safe_first(result)
+        if not company:
             raise HTTPException(status_code=500, detail="Failed to create company")
-
-        company = result.data[0]
 
         # Create trial subscription
         supabase.table("company_subscriptions").insert({
@@ -1453,7 +1502,7 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1473,12 +1522,12 @@ async def admin_toggle_company(company_id: str, request: dict, user=Depends(requ
         if not result.data:
             raise HTTPException(status_code=404, detail="Company not found")
 
-        return {"success": True, "company": result.data[0]}
+        return {"success": True, "company": safe_first(result)}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1517,7 +1566,7 @@ async def get_referral_code(user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1614,7 +1663,7 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1637,7 +1686,7 @@ async def get_referral_stats(user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1728,10 +1777,10 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
         }
         company_result = supabase.table("companies").insert(company_data).execute()
 
-        if not company_result.data:
+        company = safe_first(company_result)
+        if not company:
             raise HTTPException(status_code=500, detail="Failed to create company")
 
-        company = company_result.data[0]
         company_id = company["id"]
 
         # Update owner's role to admin in users table
@@ -1765,7 +1814,7 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1790,10 +1839,10 @@ async def check_company_access(driver_id: str, user=Depends(get_current_user)):
             .limit(1)\
             .execute()
 
-        if not link_result.data:
+        link = safe_first(link_result)
+        if not link:
             return {"has_access": False}
 
-        link = link_result.data[0]
         mode = link.get("mode", "driver_pays")
 
         if mode in ("company_pays", "company_complete"):
@@ -1804,7 +1853,8 @@ async def check_company_access(driver_id: str, user=Depends(get_current_user)):
                 .limit(1)\
                 .execute()
 
-            company_name = company_result.data[0]["name"] if company_result.data else None
+            company_row = safe_first(company_result)
+            company_name = company_row["name"] if company_row else None
 
             return {
                 "has_access": True,
@@ -1815,7 +1865,7 @@ async def check_company_access(driver_id: str, user=Depends(get_current_user)):
         return {"has_access": False}
 
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1844,7 +1894,7 @@ async def get_company(company_id: str, user=Depends(get_current_user)):
             .limit(1)\
             .execute()
 
-        subscription = sub_result.data[0] if sub_result.data else None
+        subscription = safe_first(sub_result)
 
         return {
             "success": True,
@@ -1855,7 +1905,7 @@ async def get_company(company_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1895,12 +1945,12 @@ async def update_company(company_id: str, request: CompanyUpdateRequest, user=De
         if not result.data:
             raise HTTPException(status_code=404, detail="Company not found")
 
-        return {"success": True, "company": result.data[0]}
+        return {"success": True, "company": safe_first(result)}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -1937,8 +1987,8 @@ async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
                 .limit(1)\
                 .execute()
 
-            driver_data = driver_result.data[0] if driver_result.data else {}
-            user_data = user_result.data[0] if user_result.data else {}
+            driver_data = safe_first(driver_result) or {}
+            user_data = safe_first(user_result) or {}
 
             drivers_list.append({
                 "link_id": link["id"],
@@ -1960,7 +2010,7 @@ async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
         return {"success": True, "drivers": drivers_list, "total": len(drivers_list), "active_count": active_count}
 
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2033,7 +2083,7 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
         }
 
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2069,15 +2119,16 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
 
         result = supabase.table("company_invites").insert(invite_data).execute()
 
-        if not result.data:
+        invite = safe_first(result)
+        if not invite:
             raise HTTPException(status_code=500, detail="Failed to create invite")
 
-        return {"success": True, "invite": result.data[0]}
+        return {"success": True, "invite": invite}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2099,7 +2150,7 @@ async def get_company_invites(company_id: str, user=Depends(get_current_user)):
         return {"success": True, "invites": result.data or []}
 
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2110,22 +2161,24 @@ async def deactivate_company_invite(invite_id: str, user=Depends(get_current_use
     try:
         # Verify invite belongs to user's company
         invite_check = supabase.table("company_invites").select("company_id").eq("id", invite_id).limit(1).execute()
-        if invite_check.data:
-            await verify_company_management(user, invite_check.data[0]["company_id"])
+        invite_row = safe_first(invite_check)
+        if invite_row:
+            await verify_company_management(user, invite_row["company_id"])
         result = supabase.table("company_invites")\
             .update({"active": False})\
             .eq("id", invite_id)\
             .execute()
 
-        if not result.data:
+        invite = safe_first(result)
+        if not invite:
             raise HTTPException(status_code=404, detail="Invite not found")
 
-        return {"success": True, "invite": result.data[0]}
+        return {"success": True, "invite": invite}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2144,10 +2197,9 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
             .eq("code", code)\
             .execute()
 
-        if not invite_result.data:
+        invite = safe_first(invite_result)
+        if not invite:
             raise HTTPException(status_code=404, detail="Invite code not found")
-
-        invite = invite_result.data[0]
 
         # Validate: active
         if not invite.get("active", False):
@@ -2197,8 +2249,9 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
             .limit(1)\
             .execute()
 
-        driver_id = driver_result.data[0]["id"] if driver_result.data else None
-        driver_plan = driver_result.data[0].get("promo_plan") if driver_result.data else None
+        driver_row = safe_first(driver_result)
+        driver_id = driver_row["id"] if driver_row else None
+        driver_plan = driver_row.get("promo_plan") if driver_row else None
 
         # Create company_driver_links entry
         link_data = {
@@ -2231,7 +2284,7 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2251,10 +2304,10 @@ async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_u
             .limit(1)\
             .execute()
 
-        if not link_result.data:
+        link = safe_first(link_result)
+        if not link:
             raise HTTPException(status_code=404, detail="User is not linked to any company")
 
-        link = link_result.data[0]
         mode = link.get("mode", "driver_pays")
 
         # Remove company_id from users
@@ -2284,7 +2337,7 @@ async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_u
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2330,7 +2383,8 @@ async def create_company_driver(request: CompanyCreateDriverRequest, user=Depend
             .limit(1)\
             .execute()
 
-        driver_id = driver_result.data[0]["id"] if driver_result.data else None
+        driver_row = safe_first(driver_result)
+        driver_id = driver_row["id"] if driver_row else None
 
         # Create company_driver_links entry
         link_data = {
@@ -2353,7 +2407,7 @@ async def create_company_driver(request: CompanyCreateDriverRequest, user=Depend
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2370,10 +2424,10 @@ async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
             .limit(1)\
             .execute()
 
-        if not link_result.data:
+        link = safe_first(link_result)
+        if not link:
             raise HTTPException(status_code=404, detail="Driver is not linked to any company")
 
-        link = link_result.data[0]
         await verify_company_management(user, link["company_id"])
         mode = link.get("mode", "driver_pays")
 
@@ -2404,7 +2458,7 @@ async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2420,10 +2474,10 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
             .limit(1)\
             .execute()
 
-        if not link_result.data:
+        link = safe_first(link_result)
+        if not link:
             raise HTTPException(status_code=404, detail="Driver link not found")
 
-        link = link_result.data[0]
         await verify_company_management(user, link["company_id"])
         new_active = not link.get("active", True)
         mode = link.get("mode", "driver_pays")
@@ -2450,7 +2504,8 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
                 .order("created_at", desc=True)\
                 .limit(1)\
                 .execute()
-            period_end = sub_result.data[0].get("current_period_end") if sub_result.data else None
+            sub_row = safe_first(sub_result)
+            period_end = sub_row.get("current_period_end") if sub_row else None
 
             supabase.table("drivers").update({
                 "promo_plan": "pro_plus",
@@ -2466,7 +2521,7 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2486,10 +2541,10 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
             .limit(1)\
             .execute()
 
-        if not link_result.data:
+        link = safe_first(link_result)
+        if not link:
             raise HTTPException(status_code=404, detail="Driver is not linked to any company")
 
-        link = link_result.data[0]
         await verify_company_management(user, link["company_id"])
         company_id = link["company_id"]
 
@@ -2501,7 +2556,7 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
             .limit(1)\
             .execute()
 
-        subscription = sub_result.data[0] if sub_result.data else None
+        subscription = safe_first(sub_result)
         period_end = subscription.get("current_period_end") if subscription else None
 
         link_update = {"mode": request.mode}
@@ -2559,7 +2614,7 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2579,15 +2634,16 @@ async def get_company_subscription(company_id: str, user=Depends(get_current_use
             .limit(1)\
             .execute()
 
-        if not result.data:
+        subscription = safe_first(result)
+        if not subscription:
             raise HTTPException(status_code=404, detail="No subscription found for this company")
 
-        return {"success": True, "subscription": result.data[0]}
+        return {"success": True, "subscription": subscription}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2668,7 +2724,7 @@ CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2710,7 +2766,7 @@ async def create_stripe_checkout(request: StripeCheckoutRequest, user=Depends(ge
         return {"success": True, "url": session.url}
 
     except stripe.StripeError as e:
-        print(f"[STRIPE] Error: {e}")
+        logger.error(f"Stripe error: {e}")
         raise HTTPException(status_code=500, detail="Error en el servicio de pago")
 
 
@@ -2721,23 +2777,33 @@ async def stripe_webhook(request: Request):
     sig_header = request.headers.get("stripe-signature")
 
     if not STRIPE_WEBHOOK_SECRET:
-        print("[STRIPE WEBHOOK] STRIPE_WEBHOOK_SECRET not configured - rejecting")
+        logger.error("STRIPE_WEBHOOK_SECRET not configured - rejecting")
         raise HTTPException(status_code=500, detail="Webhook not configured")
     if not sig_header:
-        print("[STRIPE WEBHOOK] Missing stripe-signature header - rejecting")
+        logger.warning("Missing stripe-signature header - rejecting")
         raise HTTPException(status_code=400, detail="Missing signature")
 
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except stripe.SignatureVerificationError:
-        print("[STRIPE WEBHOOK] Invalid signature")
+        logger.warning("Stripe webhook invalid signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
-        print(f"[STRIPE WEBHOOK] Parse error: {e}")
+        logger.error(f"Stripe webhook parse error: {e}")
         raise HTTPException(status_code=400, detail="Invalid payload")
 
     event_type = event.type
-    print(f"[STRIPE WEBHOOK] Received event: {event_type}")
+    event_id = event.get("id") if isinstance(event, dict) else getattr(event, "id", None)
+    if event_id in _processed_webhook_events:
+        logger.info(f"Stripe webhook already processed event: {event_id}")
+        return {"received": True, "status": "already_processed"}
+    if event_id:
+        _processed_webhook_events.add(event_id)
+    # Limit set size to prevent memory leak
+    if len(_processed_webhook_events) > 10000:
+        _processed_webhook_events.clear()
+
+    logger.info(f"Stripe webhook received event: {event_type}")
 
     try:
         data_obj = event.data.object
@@ -2748,7 +2814,7 @@ async def stripe_webhook(request: Request):
             plan = metadata.get("plan", "pro") if isinstance(metadata, dict) else getattr(metadata, "plan", "pro")
             customer_id = getattr(data_obj, "customer", None)
 
-            print(f"[STRIPE WEBHOOK] checkout.session.completed: user_id={user_id}, plan={plan}, customer={customer_id}")
+            logger.info(f"Stripe checkout.session.completed: user_id={user_id}, plan={plan}, customer={customer_id}")
 
             if user_id:
                 expires_at = (datetime.now() + timedelta(days=30)).isoformat()
@@ -2763,7 +2829,7 @@ async def stripe_webhook(request: Request):
                     "promo_plan": plan,
                     "promo_plan_expires_at": expires_at,
                 }).eq("id", user_id).execute()
-                print(f"[STRIPE WEBHOOK] Plan {plan} activated for user {user_id}")
+                logger.info(f"Stripe plan {plan} activated for user {user_id}")
 
         elif event_type == "customer.subscription.deleted":
             customer_id = getattr(data_obj, "customer", None)
@@ -2779,7 +2845,7 @@ async def stripe_webhook(request: Request):
                         "promo_plan": None,
                         "promo_plan_expires_at": None,
                     }).eq("id", user_id).execute()
-                    print(f"[STRIPE WEBHOOK] Subscription deleted for user {user_id}")
+                    logger.info(f"Stripe subscription deleted for user {user_id}")
 
         elif event_type in ("invoice.payment_succeeded", "invoice.paid"):
             customer_id = getattr(data_obj, "customer", None)
@@ -2795,13 +2861,13 @@ async def stripe_webhook(request: Request):
                     supabase.table("users").update({
                         "promo_plan_expires_at": expires_at,
                     }).eq("id", user_id).execute()
-                    print(f"[STRIPE WEBHOOK] Renewal for user {user_id}")
+                    logger.info(f"Stripe renewal for user {user_id}")
 
         else:
-            print(f"[STRIPE WEBHOOK] Unhandled event type: {event_type} (ignored)")
+            logger.info(f"Stripe webhook unhandled event type: {event_type} (ignored)")
 
     except Exception as e:
-        print(f"[STRIPE WEBHOOK] Error processing {event_type}: {type(e).__name__}: {e}")
+        logger.error(f"Stripe webhook error processing {event_type}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Internal webhook error")
 
     return {"received": True}
@@ -2821,13 +2887,13 @@ async def resend_webhook(request: Request):
             wh = Webhook(RESEND_WEBHOOK_SECRET)
             wh.verify(payload_bytes, dict(request.headers))
         except WebhookVerificationError:
-            print("[RESEND WEBHOOK] Invalid signature - rejecting")
+            logger.warning("Resend webhook invalid signature - rejecting")
             raise HTTPException(status_code=400, detail="Invalid signature")
         except Exception as e:
-            print(f"[RESEND WEBHOOK] Verification error: {type(e).__name__}: {e}")
+            logger.error(f"Resend webhook verification error: {type(e).__name__}: {e}")
             raise HTTPException(status_code=400, detail="Verification failed")
     else:
-        print("[RESEND WEBHOOK] WARNING: No RESEND_WEBHOOK_SECRET configured, skipping verification")
+        logger.warning("No RESEND_WEBHOOK_SECRET configured, skipping verification")
 
     try:
         payload = json.loads(payload_bytes)
@@ -2841,7 +2907,7 @@ async def resend_webhook(request: Request):
     if not event_type or not email_id:
         return {"received": True, "skipped": True}
 
-    print(f"[RESEND WEBHOOK] Event: {event_type}, email_id: {email_id}")
+    logger.info(f"Resend webhook event: {event_type}, email_id: {email_id}")
 
     now = datetime.now().isoformat()
     update_data = {}
@@ -2857,15 +2923,15 @@ async def resend_webhook(request: Request):
     elif event_type == "email.complained":
         update_data = {"status": "complained"}
     else:
-        print(f"[RESEND WEBHOOK] Unhandled event: {event_type}")
+        logger.info(f"Resend webhook unhandled event: {event_type}")
         return {"received": True}
 
     try:
         result = supabase.table("email_log").update(update_data).eq("message_id", email_id).execute()
         updated = len(result.data) if result.data else 0
-        print(f"[RESEND WEBHOOK] Updated {updated} rows for {email_id} -> {event_type}")
+        logger.info(f"Resend webhook updated {updated} rows for {email_id} -> {event_type}")
     except Exception as e:
-        print(f"[RESEND WEBHOOK] DB error: {type(e).__name__}: {e}")
+        logger.error(f"Resend webhook DB error: {type(e).__name__}: {e}")
 
     return {"received": True}
 
@@ -2891,12 +2957,12 @@ async def create_stripe_portal(user=Depends(get_current_user)):
         return {"success": True, "url": session.url}
 
     except stripe.StripeError as e:
-        print(f"[STRIPE] Error: {e}")
+        logger.error(f"Stripe portal error: {e}")
         raise HTTPException(status_code=500, detail="Error en el servicio de pago")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
+        logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
@@ -2998,7 +3064,8 @@ async def delete_account(user=Depends(get_current_user)):
     try:
         # First, find the driver_id for this user
         driver_result = supabase.table("drivers").select("id").eq("user_id", user_id).execute()
-        driver_id = driver_result.data[0]["id"] if driver_result.data else None
+        driver_row = safe_first(driver_result)
+        driver_id = driver_row["id"] if driver_row else None
 
         if driver_id:
             # Get all route IDs for this driver (needed for stops and delivery_proofs)
@@ -3085,7 +3152,7 @@ async def delete_account(user=Depends(get_current_user)):
 
         return {"status": "deleted", "message": "Cuenta eliminada correctamente"}
     except Exception as e:
-        print(f"[DELETE_ACCOUNT] Error: {e}")
+        logger.error(f"Delete account error: {e}")
         raise HTTPException(status_code=500, detail="Error al eliminar la cuenta")
 
 
@@ -3155,7 +3222,7 @@ async def publish_to_twitter(content: str, image_urls: list = None) -> dict:
                         media_ids.append(media.media_id)
                         os.unlink(tmp_path)
             except Exception as e:
-                print(f"[SOCIAL] Error uploading media: {e}")
+                logger.error(f"Social media upload error: {e}")
 
     kwargs = {"text": content}
     if media_ids:
@@ -3244,10 +3311,10 @@ async def publish_post(post_id: str):
                 update["error_message"] = "; ".join(errors)
 
         supabase.table("social_posts").update(update).eq("id", post_id).execute()
-        print(f"[SOCIAL] Post {post_id} published: twitter={twitter_post_id}, linkedin={linkedin_post_id}")
+        logger.info(f"Social post {post_id} published: twitter={twitter_post_id}, linkedin={linkedin_post_id}")
 
     except Exception as e:
-        print(f"[SOCIAL] Error publishing post {post_id}: {e}")
+        logger.error(f"Social error publishing post {post_id}: {e}")
         try:
             supabase.table("social_posts").update({
                 "status": "failed",
@@ -3270,10 +3337,10 @@ async def check_scheduled_posts():
             .execute()
 
         for post in (result.data or []):
-            print(f"[SOCIAL] Publishing scheduled post: {post['id']}")
+            logger.info(f"Social publishing scheduled post: {post['id']}")
             await publish_post(post["id"])
     except Exception as e:
-        print(f"[SOCIAL] Scheduler error: {e}")
+        logger.error(f"Social scheduler error: {e}")
 
 
 # Initialize scheduler
@@ -3284,9 +3351,9 @@ async def start_social_scheduler():
     if TWITTER_CONSUMER_KEY:
         social_scheduler.add_job(check_scheduled_posts, "interval", seconds=60, id="social_checker", replace_existing=True)
         social_scheduler.start()
-        print("[SOCIAL] Scheduler started - checking every 60s")
+        logger.info("Social scheduler started - checking every 60s")
     else:
-        print("[SOCIAL] Twitter credentials not configured, scheduler not started")
+        logger.info("Social: Twitter credentials not configured, scheduler not started")
 
 
 # --- Social API Endpoints ---
@@ -3317,7 +3384,7 @@ async def create_social_post(post: SocialPostCreate, user=Depends(require_admin)
         data["status"] = "draft"
 
     result = supabase.table("social_posts").insert(data).execute()
-    return result.data[0] if result.data else {}
+    return safe_first(result) or {}
 
 
 @app.put("/social/posts/{post_id}")
@@ -3343,7 +3410,7 @@ async def update_social_post(post_id: str, update: SocialPostUpdate, user=Depend
         data["status"] = update.status
 
     result = supabase.table("social_posts").update(data).eq("id", post_id).execute()
-    return result.data[0] if result.data else {}
+    return safe_first(result) or {}
 
 
 @app.delete("/social/posts/{post_id}")
