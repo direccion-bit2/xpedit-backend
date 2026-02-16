@@ -57,6 +57,7 @@ SUPABASE_JWT_SECRET = _raw_jwt + "=" * ((4 - len(_raw_jwt) % 4) % 4) if _raw_jwt
 import stripe
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
 stripe.api_key = STRIPE_SECRET_KEY
 
 STRIPE_PLANS = {
@@ -2788,8 +2789,25 @@ async def stripe_webhook(request: Request):
 @app.post("/webhooks/resend")
 async def resend_webhook(request: Request):
     """Handle Resend webhook events for email tracking (delivered, opened, clicked, bounced)"""
+    payload_bytes = await request.body()
+
+    # Verify signature if secret is configured
+    if RESEND_WEBHOOK_SECRET:
+        try:
+            from svix.webhooks import Webhook, WebhookVerificationError
+            wh = Webhook(RESEND_WEBHOOK_SECRET)
+            wh.verify(payload_bytes, dict(request.headers))
+        except WebhookVerificationError:
+            print("[RESEND WEBHOOK] Invalid signature - rejecting")
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        except Exception as e:
+            print(f"[RESEND WEBHOOK] Verification error: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=400, detail="Verification failed")
+    else:
+        print("[RESEND WEBHOOK] WARNING: No RESEND_WEBHOOK_SECRET configured, skipping verification")
+
     try:
-        payload = await request.json()
+        payload = json.loads(payload_bytes)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
