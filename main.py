@@ -3499,7 +3499,12 @@ Desarrollada en España por TAES PACK S.L. Pensada para repartidores autónomos 
 - NO uses hashtags genéricos vacíos, solo relevantes del sector logístico
 - Los hashtags van INCLUIDOS dentro del texto (al final), NO por separado
 - Varía el estilo: a veces pregunta, a veces dato, a veces historia, a veces consejo
-- Haz que el contenido sea COMPARTIBLE y genere engagement"""
+- Haz que el contenido sea COMPARTIBLE y genere engagement
+- IMPORTANTE para image_prompt: NUNCA incluyas texto, letras, números, porcentajes ni palabras en la imagen.
+  Los modelos de IA generan texto con errores ortográficos. Describe solo elementos visuales (personas, objetos, escenas, colores).
+  Ejemplo MALO: "infographic showing 53% with text DEL COSTE TOTAL"
+  Ejemplo BUENO: "delivery driver smiling next to organized packages in a modern van, warm sunlight, urban setting"
+"""
 
 
 class GenerateTextRequest(BaseModel):
@@ -3540,10 +3545,10 @@ TONE_INSTRUCTIONS = {
 }
 
 STYLE_PROMPTS = {
-    "flat": "flat vector illustration, modern design, clean lines, blue and white color palette, delivery/logistics theme",
-    "realistic": "photorealistic, professional photography style, delivery driver using smartphone, warm lighting",
-    "infographic": "clean infographic style, data visualization, icons, blue and white, modern typography",
-    "minimal": "minimalist design, lots of white space, simple geometric shapes, blue accent color, elegant",
+    "flat": "flat vector illustration, modern design, clean lines, blue and white color palette, delivery/logistics theme. NO text, NO letters, NO numbers, NO words in the image.",
+    "realistic": "photorealistic, professional photography style, warm natural lighting. NO text, NO letters, NO numbers, NO words in the image.",
+    "infographic": "clean visual design with icons and simple shapes, blue and white palette. NO text, NO letters, NO numbers, NO words in the image.",
+    "minimal": "minimalist design, lots of white space, simple geometric shapes, blue accent color, elegant. NO text, NO letters, NO numbers, NO words in the image.",
 }
 
 
