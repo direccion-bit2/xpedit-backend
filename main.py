@@ -2791,11 +2791,15 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 @app.get("/places/autocomplete")
 async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
-    """Proxy for Google Places Autocomplete API"""
+    """Proxy for Google Places Autocomplete API - supports Spanish-speaking countries"""
+    # Detect country from coordinates to bias results, but don't restrict
+    # Spanish-speaking LATAM countries + Spain
+    SPANISH_COUNTRIES = "country:es|country:mx|country:co|country:ar|country:pe|country:cl|country:ec|country:gt|country:cu|country:bo|country:do|country:hn|country:py|country:sv|country:ni|country:cr|country:pa|country:uy|country:ve"
+
     params = {
         "input": input,
         "types": "address",
-        "components": "country:es",
+        "components": SPANISH_COUNTRIES,
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
@@ -2809,16 +2813,23 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
 
     if data.get("status") != "OK":
         # Fallback: Nominatim (OpenStreetMap) - free, no API key
+        nom_query = input if lat and lng else f"{input}"
+        nom_params = {
+            "q": nom_query,
+            "format": "json",
+            "addressdetails": "1",
+            "limit": "5",
+            "accept-language": "es",
+        }
+        # Bias Nominatim results to user's area if coordinates available
+        if lat and lng:
+            nom_params["viewbox"] = f"{lng-0.5},{lat+0.5},{lng+0.5},{lat-0.5}"
+            nom_params["bounded"] = "0"
+
         async with httpx.AsyncClient() as client:
             nom_resp = await client.get(
                 "https://nominatim.openstreetmap.org/search",
-                params={
-                    "q": f"{input}, España",
-                    "format": "json",
-                    "addressdetails": "1",
-                    "limit": "5",
-                    "accept-language": "es",
-                },
+                params=nom_params,
                 headers={"User-Agent": "Xpedit/1.1"}
             )
             nom_data = nom_resp.json()
