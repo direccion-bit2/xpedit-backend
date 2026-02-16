@@ -2783,6 +2783,52 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
+# === RESEND WEBHOOK (Email tracking) ===
+
+@app.post("/webhooks/resend")
+async def resend_webhook(request: Request):
+    """Handle Resend webhook events for email tracking (delivered, opened, clicked, bounced)"""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event_type = payload.get("type")
+    data = payload.get("data", {})
+    email_id = data.get("email_id")
+
+    if not event_type or not email_id:
+        return {"received": True, "skipped": True}
+
+    print(f"[RESEND WEBHOOK] Event: {event_type}, email_id: {email_id}")
+
+    now = datetime.now().isoformat()
+    update_data = {}
+
+    if event_type == "email.delivered":
+        update_data = {"status": "delivered", "delivered_at": now}
+    elif event_type == "email.opened":
+        update_data = {"status": "opened", "opened_at": now}
+    elif event_type == "email.clicked":
+        update_data = {"status": "clicked", "clicked_at": now}
+    elif event_type == "email.bounced":
+        update_data = {"status": "bounced", "bounced_at": now}
+    elif event_type == "email.complained":
+        update_data = {"status": "complained"}
+    else:
+        print(f"[RESEND WEBHOOK] Unhandled event: {event_type}")
+        return {"received": True}
+
+    try:
+        result = supabase.table("email_log").update(update_data).eq("message_id", email_id).execute()
+        updated = len(result.data) if result.data else 0
+        print(f"[RESEND WEBHOOK] Updated {updated} rows for {email_id} -> {event_type}")
+    except Exception as e:
+        print(f"[RESEND WEBHOOK] DB error: {type(e).__name__}: {e}")
+
+    return {"received": True}
+
+
 @app.post("/stripe/portal")
 async def create_stripe_portal(user=Depends(get_current_user)):
     """Create a Stripe Customer Portal session to manage subscription"""
