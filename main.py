@@ -3433,22 +3433,73 @@ def get_gemini_client():
         gemini_client = genai.Client(api_key=GOOGLE_AI_API_KEY)
     return gemini_client
 
-XPEDIT_CONTEXT = """Eres el community manager de Xpedit, una app española de optimización de rutas para repartidores.
-Datos clave:
-- Precio: gratis en Google Play, Pro desde 4.99€/mes, Pro+ 9.99€/mes
-- Features: optimización de rutas con IA, entrada por voz, avisos WhatsApp a clientes, funciona offline, prueba de entrega con foto
-- Competidores caros: OptimoRoute ($35/conductor), Circuit ($20-200/mes), Routific ($49-93/mes)
-- Web: xpedit.es | X: @Xpedit_es | Disponible en Google Play Store
-- Público: repartidores autónomos, empresas de mensajería, logística última milla en España y Latinoamérica
+XPEDIT_CONTEXT = """Eres el community manager experto de Xpedit, la app española de optimización de rutas para repartidores.
 
-Reglas:
-- Escribe en ESPAÑOL de España
-- Usa emojis con moderación (1-3 por post)
-- Para X/Twitter: máximo 250 caracteres (URLs cuentan 23 chars por t.co)
-- Para LinkedIn: 500-1000 caracteres, tono más profesional y detallado
-- Incluye siempre un CTA sutil (descargar, probar gratis, visitar web)
-- NO inventes features que no existan
-- NO uses hashtags genéricos vacíos, solo relevantes del sector"""
+=== SOBRE XPEDIT ===
+Xpedit es una app móvil (Android) que optimiza rutas de reparto usando inteligencia artificial.
+Desarrollada en España por TAES PACK S.L. Pensada para repartidores autónomos y pequeñas empresas de mensajería.
+
+=== FUNCIONALIDADES REALES (solo menciona estas) ===
+- Optimización de rutas con IA: calcula el orden óptimo de paradas para ahorrar tiempo y combustible
+- Entrada por voz: añade direcciones hablando, sin teclear mientras conduces
+- Avisos WhatsApp automáticos: notifica a cada cliente cuando estás de camino con ETA y enlace de seguimiento
+- Seguimiento en tiempo real: los clientes ven al repartidor en un mapa en vivo
+- Funciona offline: la ruta optimizada se mantiene sin conexión a internet
+- Prueba de entrega con foto: haz foto en cada parada como comprobante
+- Lugares recurrentes: guarda tus direcciones habituales para añadirlas rápido
+- Navegación integrada: abre cada parada en Google Maps, Waze o Apple Maps con un toque
+- Historial de rutas: consulta rutas anteriores completadas
+- Panel de empresa: las empresas pueden asignar rutas a sus repartidores desde la web
+- Sin límite de paradas: optimiza rutas con todas las paradas que necesites
+
+=== PRECIOS ===
+- Plan Gratis: funcional, disponible en Google Play
+- Plan Pro: 4,99€/mes - todas las funcionalidades premium
+- Plan Pro+: 9,99€/mes - para equipos y empresas
+- Sin compromiso, cancela cuando quieras
+
+=== COMPETENCIA (datos reales) ===
+- OptimoRoute: desde $35/conductor/mes (~32€) = 7x más caro que Xpedit Pro
+- Circuit: desde $20 a $200/mes = 4x a 40x más caro
+- Routific: desde $49 a $93/mes = 10x a 19x más caro
+- Todos los competidores están en inglés y pensados para grandes empresas
+- Xpedit es la ÚNICA alternativa asequible en español para autónomos
+
+=== PÚBLICO OBJETIVO ===
+- Repartidores autónomos de paquetería (Amazon Flex, MRW, SEUR, GLS, etc.)
+- Empresas pequeñas de mensajería y paquetería
+- Repartidores de comida y ecommerce
+- Técnicos de mantenimiento con rutas diarias
+- Comerciales con visitas planificadas
+- Cualquier profesional con múltiples paradas diarias
+- Mercado: España y Latinoamérica
+
+=== PRESENCIA ONLINE ===
+- Web: xpedit.es
+- X/Twitter: @Xpedit_es
+- Descarga: Google Play Store (buscar "Xpedit")
+- Email: info@xpedit.es
+
+=== DATOS DEL SECTOR (para posts informativos) ===
+- La última milla supone el 53% del coste total de envío
+- En España se entregan más de 2 millones de paquetes al día
+- El ecommerce en España creció un 25% en 2025
+- Un repartidor medio recorre 150-200km diarios
+- La optimización de rutas puede ahorrar un 20-30% en combustible
+- El 85% de los repartidores autónomos no usa software de optimización
+- Más de 100.000 repartidores autónomos operan en España
+
+=== REGLAS DE CONTENIDO ===
+- Escribe SIEMPRE en español de España
+- Usa emojis con moderación (1-3 por post, nunca excesivo)
+- Para X/Twitter: el texto completo CON hashtags debe tener MÁXIMO 230 caracteres (dejar margen para URLs t.co = 23 chars). NUNCA excedas 230 caracteres en total.
+- Para LinkedIn: 500-1500 caracteres, tono más profesional, detallado y con párrafos
+- Incluye siempre un CTA sutil y natural (descargar, probar gratis, visitar web)
+- NO inventes funcionalidades que no existan
+- NO uses hashtags genéricos vacíos, solo relevantes del sector logístico
+- Los hashtags van INCLUIDOS dentro del texto (al final), NO por separado
+- Varía el estilo: a veces pregunta, a veces dato, a veces historia, a veces consejo
+- Haz que el contenido sea COMPARTIBLE y genere engagement"""
 
 
 class GenerateTextRequest(BaseModel):
@@ -3517,17 +3568,23 @@ Genera un post para las plataformas: {platforms_str}.
 Tema: {topic_desc}
 Tono: {tone_desc}
 
+IMPORTANTE SOBRE X/TWITTER:
+- El campo twitter_text DEBE incluir los hashtags al final
+- El texto COMPLETO (mensaje + hashtags) NO puede superar 230 caracteres
+- Cuenta cada carácter. Si te pasas, acorta el mensaje. NUNCA excedas 230.
+- Las URLs cuentan como 23 caracteres (t.co)
+
 Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura exacta:
 {{
-  "twitter_text": "texto para X/Twitter (max 250 chars)",
-  "linkedin_text": "texto para LinkedIn (500-1000 chars, más detallado y profesional)",
+  "twitter_text": "texto corto para X con hashtags incluidos (MÁXIMO 230 chars TOTAL)",
+  "linkedin_text": "texto largo para LinkedIn (500-1500 chars, profesional, con párrafos y hashtags al final)",
   "hashtags": ["hashtag1", "hashtag2", "hashtag3"],
-  "image_prompt": "descripción en inglés para generar una imagen relacionada con el post"
+  "image_prompt": "descripción detallada en inglés para generar una imagen profesional, atractiva y moderna relacionada con el post. Describe composición, colores, estilo y elementos visuales."
 }}"""
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             contents=prompt,
         )
         text = response.text.strip()
@@ -3562,7 +3619,7 @@ async def generate_social_image(req: GenerateImageRequest, user=Depends(require_
 
     try:
         response = client.models.generate_images(
-            model="imagen-4.0-fast-generate-001",
+            model="imagen-4.0-ultra-generate-001",
             prompt=full_prompt,
             config=types.GenerateImagesConfig(
                 number_of_images=1,
@@ -3609,19 +3666,22 @@ Plataformas: {", ".join(req.platforms)}
 Mezcla estos temas: {themes_str}
 Horarios sugeridos: 9:00-11:00 (mañana) o 17:00-19:00 (tarde), variando.
 
-IMPORTANTE: Varía los temas, no repitas el mismo tema dos días seguidos.
-Cada post de X/Twitter debe tener máximo 250 caracteres.
-Cada post de LinkedIn debe tener 500-1000 caracteres.
+IMPORTANTE:
+- Varía los temas, NO repitas el mismo tema dos días seguidos.
+- Cada twitter_text DEBE incluir hashtags y NO superar 230 caracteres en TOTAL.
+- Cada linkedin_text debe tener 500-1500 caracteres con hashtags al final.
+- Haz que cada post sea único, creativo y genere engagement.
+- Varía el formato: preguntas, datos, consejos, historias, comparativas.
 
 Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura exacta:
 {{
   "posts": [
     {{
-      "twitter_text": "texto para X (max 250 chars)",
-      "linkedin_text": "texto para LinkedIn (500-1000 chars)",
+      "twitter_text": "texto para X con hashtags (MÁXIMO 230 chars TOTAL)",
+      "linkedin_text": "texto para LinkedIn (500-1500 chars, profesional, con hashtags al final)",
       "suggested_date": "YYYY-MM-DD",
       "suggested_time": "HH:MM",
-      "image_prompt": "descripción en inglés para generar imagen",
+      "image_prompt": "descripción detallada en inglés para imagen profesional y atractiva",
       "theme": "nombre del tema usado",
       "hashtags": ["tag1", "tag2"]
     }}
@@ -3630,7 +3690,7 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             contents=prompt,
         )
         text = response.text.strip()
