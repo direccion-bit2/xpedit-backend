@@ -3195,15 +3195,14 @@ async def publish_post(post_id: str):
                 errors.append(f"Twitter: {str(e)}")
 
         if "linkedin" in post["platforms"]:
-            # LinkedIn: placeholder for Phase 2
             linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "")
-            linkedin_org = os.getenv("LINKEDIN_ORG_ID", "")
-            if linkedin_token and linkedin_org:
+            linkedin_member_sub = os.getenv("LINKEDIN_MEMBER_SUB", "")
+            if linkedin_token and linkedin_member_sub:
                 try:
                     async with httpx.AsyncClient() as http:
-                        headers = {"Authorization": f"Bearer {linkedin_token}", "X-Restli-Protocol-Version": "2.0.0"}
+                        headers = {"Authorization": f"Bearer {linkedin_token}", "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json"}
                         payload = {
-                            "author": f"urn:li:organization:{linkedin_org}",
+                            "author": f"urn:li:person:{linkedin_member_sub}",
                             "lifecycleState": "PUBLISHED",
                             "specificContent": {
                                 "com.linkedin.ugc.ShareContent": {
