@@ -3421,6 +3421,235 @@ async def delete_social_image(filename: str, user=Depends(require_admin)):
     return {"status": "deleted"}
 
 
+# === GEMINI AI FOR SOCIAL MEDIA ===
+
+GOOGLE_AI_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
+gemini_client = None
+
+def get_gemini_client():
+    global gemini_client
+    if gemini_client is None and GOOGLE_AI_API_KEY:
+        from google import genai
+        gemini_client = genai.Client(api_key=GOOGLE_AI_API_KEY)
+    return gemini_client
+
+XPEDIT_CONTEXT = """Eres el community manager de Xpedit, una app española de optimización de rutas para repartidores.
+Datos clave:
+- Precio: gratis en Google Play, Pro desde 4.99€/mes, Pro+ 9.99€/mes
+- Features: optimización de rutas con IA, entrada por voz, avisos WhatsApp a clientes, funciona offline, prueba de entrega con foto
+- Competidores caros: OptimoRoute ($35/conductor), Circuit ($20-200/mes), Routific ($49-93/mes)
+- Web: xpedit.es | X: @Xpedit_es | Disponible en Google Play Store
+- Público: repartidores autónomos, empresas de mensajería, logística última milla en España y Latinoamérica
+
+Reglas:
+- Escribe en ESPAÑOL de España
+- Usa emojis con moderación (1-3 por post)
+- Para X/Twitter: máximo 250 caracteres (URLs cuentan 23 chars por t.co)
+- Para LinkedIn: 500-1000 caracteres, tono más profesional y detallado
+- Incluye siempre un CTA sutil (descargar, probar gratis, visitar web)
+- NO inventes features que no existan
+- NO uses hashtags genéricos vacíos, solo relevantes del sector"""
+
+
+class GenerateTextRequest(BaseModel):
+    topic: str  # feature, tip, comparativa, oferta, dato, detras, custom
+    custom_topic: Optional[str] = None
+    platforms: List[str] = ["twitter", "linkedin"]
+    tone: str = "profesional"  # profesional, casual, inspirador, informativo
+
+
+class GenerateImageRequest(BaseModel):
+    prompt: str
+    aspect_ratio: str = "1:1"  # 1:1, 16:9, 9:16
+    style: str = "flat"  # flat, realistic, infographic, minimal
+
+
+class GenerateCalendarRequest(BaseModel):
+    days: int = 7
+    posts_per_day: int = 1
+    platforms: List[str] = ["twitter", "linkedin"]
+    themes: List[str] = ["feature", "tip", "comparativa", "oferta"]
+
+
+TOPIC_PROMPTS = {
+    "feature": "Destaca una funcionalidad de Xpedit (optimización, voz, WhatsApp, offline, foto entrega, lugares recurrentes)",
+    "tip": "Comparte un consejo práctico de reparto/logística que ayude a repartidores",
+    "comparativa": "Compara Xpedit con la competencia (OptimoRoute $35, Circuit $20-200, Routific $49-93) destacando la ventaja de precio",
+    "oferta": "Destaca que Xpedit es gratis en Google Play y el Pro es solo 4.99€/mes vs competencia de $35-93/mes",
+    "dato": "Comparte un dato curioso o estadística sobre logística, reparto o última milla en España/Latam",
+    "detras": "Muestra el lado humano: desarrollo de la app, equipo, mejoras recientes, feedback de usuarios",
+    "custom": "",
+}
+
+TONE_INSTRUCTIONS = {
+    "profesional": "Tono serio y profesional, enfocado en valor y datos.",
+    "casual": "Tono cercano y relajado, como hablando con un colega repartidor.",
+    "inspirador": "Tono motivacional, empoderando al repartidor autónomo.",
+    "informativo": "Tono educativo, compartiendo conocimiento útil del sector.",
+}
+
+STYLE_PROMPTS = {
+    "flat": "flat vector illustration, modern design, clean lines, blue and white color palette, delivery/logistics theme",
+    "realistic": "photorealistic, professional photography style, delivery driver using smartphone, warm lighting",
+    "infographic": "clean infographic style, data visualization, icons, blue and white, modern typography",
+    "minimal": "minimalist design, lots of white space, simple geometric shapes, blue accent color, elegant",
+}
+
+
+@app.post("/social/generate-text")
+async def generate_social_text(req: GenerateTextRequest, user=Depends(require_admin)):
+    """Generate social media post text using Gemini AI."""
+    client = get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini AI no configurado (falta GOOGLE_AI_API_KEY)")
+
+    topic_desc = TOPIC_PROMPTS.get(req.topic, "")
+    if req.topic == "custom" and req.custom_topic:
+        topic_desc = req.custom_topic
+
+    tone_desc = TONE_INSTRUCTIONS.get(req.tone, TONE_INSTRUCTIONS["profesional"])
+
+    platforms_str = " y ".join(p for p in req.platforms)
+
+    prompt = f"""{XPEDIT_CONTEXT}
+
+Genera un post para las plataformas: {platforms_str}.
+Tema: {topic_desc}
+Tono: {tone_desc}
+
+Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura exacta:
+{{
+  "twitter_text": "texto para X/Twitter (max 250 chars)",
+  "linkedin_text": "texto para LinkedIn (500-1000 chars, más detallado y profesional)",
+  "hashtags": ["hashtag1", "hashtag2", "hashtag3"],
+  "image_prompt": "descripción en inglés para generar una imagen relacionada con el post"
+}}"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        text = response.text.strip()
+        # Clean markdown code blocks if present
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+
+        result = json.loads(text)
+        return result
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail=f"Error parseando respuesta de Gemini: {text[:200]}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando texto: {str(e)[:200]}")
+
+
+@app.post("/social/generate-image")
+async def generate_social_image(req: GenerateImageRequest, user=Depends(require_admin)):
+    """Generate an image using Gemini Imagen and save to Supabase Storage."""
+    client = get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini AI no configurado")
+
+    from google.genai import types
+
+    style_suffix = STYLE_PROMPTS.get(req.style, STYLE_PROMPTS["flat"])
+    full_prompt = f"{req.prompt}. Style: {style_suffix}"
+
+    try:
+        response = client.models.generate_images(
+            model="imagen-4.0-fast-generate-001",
+            prompt=full_prompt,
+            config=types.GenerateImagesConfig(
+                number_of_images=1,
+                aspect_ratio=req.aspect_ratio,
+            ),
+        )
+
+        if not response.generated_images:
+            raise HTTPException(status_code=500, detail="No se generó ninguna imagen")
+
+        image_bytes = response.generated_images[0].image.image_bytes
+        filename = f"ai_{uuid_mod.uuid4().hex[:12]}.png"
+        path = f"posts/{filename}"
+
+        supabase.storage.from_("social-media").upload(
+            path, image_bytes, {"content-type": "image/png"}
+        )
+
+        public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/social-media/{path}"
+        return {"url": public_url, "prompt_used": full_prompt, "filename": filename}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando imagen: {str(e)[:200]}")
+
+
+@app.post("/social/generate-calendar")
+async def generate_social_calendar(req: GenerateCalendarRequest, user=Depends(require_admin)):
+    """Generate a content calendar using Gemini AI."""
+    client = get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini AI no configurado")
+
+    total_posts = req.days * req.posts_per_day
+    themes_str = ", ".join(req.themes)
+    start_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    prompt = f"""{XPEDIT_CONTEXT}
+
+Genera un calendario editorial de {total_posts} posts para redes sociales.
+Período: {req.days} días empezando desde {start_date}, {req.posts_per_day} post(s) por día.
+Plataformas: {", ".join(req.platforms)}
+Mezcla estos temas: {themes_str}
+Horarios sugeridos: 9:00-11:00 (mañana) o 17:00-19:00 (tarde), variando.
+
+IMPORTANTE: Varía los temas, no repitas el mismo tema dos días seguidos.
+Cada post de X/Twitter debe tener máximo 250 caracteres.
+Cada post de LinkedIn debe tener 500-1000 caracteres.
+
+Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura exacta:
+{{
+  "posts": [
+    {{
+      "twitter_text": "texto para X (max 250 chars)",
+      "linkedin_text": "texto para LinkedIn (500-1000 chars)",
+      "suggested_date": "YYYY-MM-DD",
+      "suggested_time": "HH:MM",
+      "image_prompt": "descripción en inglés para generar imagen",
+      "theme": "nombre del tema usado",
+      "hashtags": ["tag1", "tag2"]
+    }}
+  ]
+}}"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+
+        result = json.loads(text)
+        return result
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail=f"Error parseando calendario: {text[:200]}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando calendario: {str(e)[:200]}")
+
+
 # === MAIN ===
 if __name__ == "__main__":
     import uvicorn
