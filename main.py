@@ -944,6 +944,19 @@ async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest,
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
 
+        # Log email
+        try:
+            supabase.table("email_log").insert({
+                "recipient_email": driver.data["email"],
+                "recipient_name": driver.data.get("name"),
+                "subject": request.subject,
+                "body": request.body,
+                "message_id": result.get("id"),
+                "status": "sent",
+            }).execute()
+        except Exception:
+            pass
+
         return {"success": True, "email": driver.data["email"], "message_id": result.get("id")}
     except HTTPException:
         raise
@@ -972,6 +985,21 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
 
         emails = [d["email"] for d in drivers.data if d.get("email")]
         results = send_broadcast_email(emails, request.subject, request.body)
+
+        # Log each email in broadcast
+        try:
+            for d in drivers.data:
+                if d.get("email"):
+                    supabase.table("email_log").insert({
+                        "recipient_email": d["email"],
+                        "recipient_name": d.get("name"),
+                        "subject": request.subject,
+                        "body": request.body,
+                        "sent_by": f"broadcast:{request.target}",
+                        "status": "sent",
+                    }).execute()
+        except Exception:
+            pass
 
         return {
             "success": True,
