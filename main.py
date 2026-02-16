@@ -2791,15 +2791,9 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 @app.get("/places/autocomplete")
 async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
-    """Proxy for Google Places Autocomplete API - supports Spanish-speaking countries"""
-    # Detect country from coordinates to bias results, but don't restrict
-    # Spanish-speaking LATAM countries + Spain
-    SPANISH_COUNTRIES = "country:es|country:mx|country:co|country:ar|country:pe|country:cl|country:ec|country:gt|country:cu|country:bo|country:do|country:hn|country:py|country:sv|country:ni|country:cr|country:pa|country:uy|country:ve"
-
+    """Proxy for Google Places Autocomplete API - worldwide with location bias"""
     params = {
         "input": input,
-        "types": "geocode",
-        "components": SPANISH_COUNTRIES,
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
