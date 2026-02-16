@@ -2798,7 +2798,7 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
 
     params = {
         "input": input,
-        "types": "address",
+        "types": "geocode",
         "components": SPANISH_COUNTRIES,
         "language": "es",
         "key": GOOGLE_API_KEY,
