@@ -10,4 +10,5 @@ PyJWT[crypto]==2.9.0
 stripe==8.0.0
 svix==1.44.0
 tweepy==4.14.0
+python-multipart==0.0.9
 apscheduler==3.10.4
