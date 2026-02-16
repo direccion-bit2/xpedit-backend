@@ -6,7 +6,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -3087,6 +3087,339 @@ async def delete_account(user=Depends(get_current_user)):
     except Exception as e:
         print(f"[DELETE_ACCOUNT] Error: {e}")
         raise HTTPException(status_code=500, detail="Error al eliminar la cuenta")
+
+
+# === SOCIAL MEDIA MANAGEMENT ===
+
+import tweepy
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import uuid as uuid_mod
+import asyncio
+
+# Twitter/X credentials from env
+TWITTER_CONSUMER_KEY = os.getenv("TWITTER_CONSUMER_KEY", "")
+TWITTER_CONSUMER_SECRET = os.getenv("TWITTER_CONSUMER_SECRET", "")
+TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN", "")
+TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET", "")
+
+def get_twitter_client():
+    """Create tweepy client for X/Twitter API"""
+    return tweepy.Client(
+        consumer_key=TWITTER_CONSUMER_KEY,
+        consumer_secret=TWITTER_CONSUMER_SECRET,
+        access_token=TWITTER_ACCESS_TOKEN,
+        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET,
+    )
+
+def get_twitter_api_v1():
+    """Create tweepy v1 API for media uploads"""
+    auth = tweepy.OAuth1UserHandler(
+        TWITTER_CONSUMER_KEY, TWITTER_CONSUMER_SECRET,
+        TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET,
+    )
+    return tweepy.API(auth)
+
+
+class SocialPostCreate(BaseModel):
+    content: str
+    platforms: List[str]  # ['twitter', 'linkedin']
+    scheduled_at: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+
+class SocialPostUpdate(BaseModel):
+    content: Optional[str] = None
+    platforms: Optional[List[str]] = None
+    scheduled_at: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+    status: Optional[str] = None
+
+
+async def publish_to_twitter(content: str, image_urls: list = None) -> dict:
+    """Publish a post to X/Twitter. Returns dict with post_id and url."""
+    client = get_twitter_client()
+    media_ids = []
+
+    if image_urls:
+        api_v1 = get_twitter_api_v1()
+        for img_url in image_urls[:4]:  # X allows max 4 images
+            try:
+                async with httpx.AsyncClient() as http:
+                    resp = await http.get(img_url)
+                    if resp.status_code == 200:
+                        import tempfile
+                        ext = img_url.split(".")[-1].split("?")[0][:4]
+                        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+                            tmp.write(resp.content)
+                            tmp_path = tmp.name
+                        media = api_v1.media_upload(filename=tmp_path)
+                        media_ids.append(media.media_id)
+                        os.unlink(tmp_path)
+            except Exception as e:
+                print(f"[SOCIAL] Error uploading media: {e}")
+
+    kwargs = {"text": content}
+    if media_ids:
+        kwargs["media_ids"] = media_ids
+
+    response = client.create_tweet(**kwargs)
+    tweet_id = response.data["id"]
+    return {
+        "post_id": tweet_id,
+        "url": f"https://x.com/Xpedit_es/status/{tweet_id}",
+    }
+
+
+async def publish_post(post_id: str):
+    """Publish a social media post to all selected platforms."""
+    try:
+        result = supabase.table("social_posts").select("*").eq("id", post_id).single().execute()
+        post = result.data
+        if not post or post["status"] in ("published", "publishing"):
+            return
+
+        # Mark as publishing
+        supabase.table("social_posts").update({"status": "publishing"}).eq("id", post_id).execute()
+
+        twitter_post_id = None
+        twitter_url = None
+        linkedin_post_id = None
+        linkedin_url = None
+        errors = []
+
+        if "twitter" in post["platforms"]:
+            try:
+                result_tw = await publish_to_twitter(post["content"], post.get("image_urls"))
+                twitter_post_id = result_tw["post_id"]
+                twitter_url = result_tw["url"]
+            except Exception as e:
+                errors.append(f"Twitter: {str(e)}")
+
+        if "linkedin" in post["platforms"]:
+            # LinkedIn: placeholder for Phase 2
+            linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "")
+            linkedin_org = os.getenv("LINKEDIN_ORG_ID", "")
+            if linkedin_token and linkedin_org:
+                try:
+                    async with httpx.AsyncClient() as http:
+                        headers = {"Authorization": f"Bearer {linkedin_token}", "X-Restli-Protocol-Version": "2.0.0"}
+                        payload = {
+                            "author": f"urn:li:organization:{linkedin_org}",
+                            "lifecycleState": "PUBLISHED",
+                            "specificContent": {
+                                "com.linkedin.ugc.ShareContent": {
+                                    "shareCommentary": {"text": post["content"]},
+                                    "shareMediaCategory": "NONE",
+                                }
+                            },
+                            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+                        }
+                        resp = await http.post("https://api.linkedin.com/v2/ugcPosts", headers=headers, json=payload)
+                        if resp.status_code in (200, 201):
+                            li_id = resp.json().get("id", "")
+                            linkedin_post_id = li_id
+                            linkedin_url = f"https://www.linkedin.com/feed/update/{li_id}/"
+                        else:
+                            errors.append(f"LinkedIn: {resp.status_code} {resp.text[:200]}")
+                except Exception as e:
+                    errors.append(f"LinkedIn: {str(e)}")
+            else:
+                errors.append("LinkedIn: API no configurada")
+
+        # Update post with results
+        update = {"updated_at": datetime.utcnow().isoformat()}
+        if twitter_post_id:
+            update["twitter_post_id"] = twitter_post_id
+            update["twitter_url"] = twitter_url
+        if linkedin_post_id:
+            update["linkedin_post_id"] = linkedin_post_id
+            update["linkedin_url"] = linkedin_url
+
+        if errors and not twitter_post_id and not linkedin_post_id:
+            update["status"] = "failed"
+            update["error_message"] = "; ".join(errors)
+            update["retry_count"] = (post.get("retry_count") or 0) + 1
+        else:
+            update["status"] = "published"
+            update["published_at"] = datetime.utcnow().isoformat()
+            if errors:
+                update["error_message"] = "; ".join(errors)
+
+        supabase.table("social_posts").update(update).eq("id", post_id).execute()
+        print(f"[SOCIAL] Post {post_id} published: twitter={twitter_post_id}, linkedin={linkedin_post_id}")
+
+    except Exception as e:
+        print(f"[SOCIAL] Error publishing post {post_id}: {e}")
+        try:
+            supabase.table("social_posts").update({
+                "status": "failed",
+                "error_message": str(e),
+                "retry_count": (post.get("retry_count", 0) if "post" in dir() else 0) + 1,
+            }).eq("id", post_id).execute()
+        except Exception:
+            pass
+
+
+async def check_scheduled_posts():
+    """Check and publish scheduled posts that are due."""
+    try:
+        now = datetime.utcnow().isoformat()
+        result = supabase.table("social_posts")\
+            .select("id")\
+            .eq("status", "scheduled")\
+            .lte("scheduled_at", now)\
+            .lt("retry_count", 3)\
+            .execute()
+
+        for post in (result.data or []):
+            print(f"[SOCIAL] Publishing scheduled post: {post['id']}")
+            await publish_post(post["id"])
+    except Exception as e:
+        print(f"[SOCIAL] Scheduler error: {e}")
+
+
+# Initialize scheduler
+social_scheduler = AsyncIOScheduler()
+
+@app.on_event("startup")
+async def start_social_scheduler():
+    if TWITTER_CONSUMER_KEY:
+        social_scheduler.add_job(check_scheduled_posts, "interval", seconds=60, id="social_checker", replace_existing=True)
+        social_scheduler.start()
+        print("[SOCIAL] Scheduler started - checking every 60s")
+    else:
+        print("[SOCIAL] Twitter credentials not configured, scheduler not started")
+
+
+# --- Social API Endpoints ---
+
+@app.get("/social/posts")
+async def list_social_posts(status: Optional[str] = None, user=Depends(require_admin)):
+    """List all social posts, optionally filtered by status."""
+    query = supabase.table("social_posts").select("*").order("created_at", desc=True)
+    if status:
+        query = query.eq("status", status)
+    result = query.limit(200).execute()
+    return result.data or []
+
+
+@app.post("/social/posts")
+async def create_social_post(post: SocialPostCreate, user=Depends(require_admin)):
+    """Create a new social post (draft or scheduled)."""
+    data = {
+        "content": post.content,
+        "platforms": post.platforms,
+        "image_urls": post.image_urls or [],
+        "created_by": user.get("id"),
+    }
+    if post.scheduled_at:
+        data["scheduled_at"] = post.scheduled_at
+        data["status"] = "scheduled"
+    else:
+        data["status"] = "draft"
+
+    result = supabase.table("social_posts").insert(data).execute()
+    return result.data[0] if result.data else {}
+
+
+@app.put("/social/posts/{post_id}")
+async def update_social_post(post_id: str, update: SocialPostUpdate, user=Depends(require_admin)):
+    """Update a draft or scheduled post."""
+    existing = supabase.table("social_posts").select("status").eq("id", post_id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Post no encontrado")
+    if existing.data["status"] in ("published", "publishing"):
+        raise HTTPException(status_code=400, detail="No se puede editar un post ya publicado")
+
+    data = {"updated_at": datetime.utcnow().isoformat()}
+    if update.content is not None:
+        data["content"] = update.content
+    if update.platforms is not None:
+        data["platforms"] = update.platforms
+    if update.image_urls is not None:
+        data["image_urls"] = update.image_urls
+    if update.scheduled_at is not None:
+        data["scheduled_at"] = update.scheduled_at
+        data["status"] = "scheduled"
+    if update.status is not None:
+        data["status"] = update.status
+
+    result = supabase.table("social_posts").update(data).eq("id", post_id).execute()
+    return result.data[0] if result.data else {}
+
+
+@app.delete("/social/posts/{post_id}")
+async def delete_social_post(post_id: str, user=Depends(require_admin)):
+    """Delete a draft or scheduled post."""
+    existing = supabase.table("social_posts").select("status, image_urls").eq("id", post_id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Post no encontrado")
+    if existing.data["status"] in ("published", "publishing"):
+        raise HTTPException(status_code=400, detail="No se puede eliminar un post ya publicado")
+
+    # Clean up images from storage
+    for img_url in (existing.data.get("image_urls") or []):
+        try:
+            path = img_url.split("/social-media/")[1] if "/social-media/" in img_url else None
+            if path:
+                supabase.storage.from_("social-media").remove([path])
+        except Exception:
+            pass
+
+    supabase.table("social_posts").delete().eq("id", post_id).execute()
+    return {"status": "deleted"}
+
+
+@app.post("/social/posts/{post_id}/publish")
+async def publish_social_post_now(post_id: str, user=Depends(require_admin)):
+    """Publish a post immediately."""
+    existing = supabase.table("social_posts").select("status").eq("id", post_id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Post no encontrado")
+    if existing.data["status"] == "published":
+        raise HTTPException(status_code=400, detail="Post ya publicado")
+
+    await publish_post(post_id)
+
+    updated = supabase.table("social_posts").select("*").eq("id", post_id).single().execute()
+    return updated.data
+
+
+@app.get("/social/accounts")
+async def list_social_accounts(user=Depends(require_admin)):
+    """List connected social media accounts."""
+    result = supabase.table("social_accounts").select("*").execute()
+    return result.data or []
+
+
+@app.post("/social/upload-image")
+async def upload_social_image(file: UploadFile = File(...), user=Depends(require_admin)):
+    """Upload an image to Supabase Storage for social media posts."""
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Solo se permiten imágenes")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Imagen demasiado grande (máx 10MB)")
+
+    ext = file.filename.split(".")[-1] if file.filename else "jpg"
+    filename = f"{uuid_mod.uuid4().hex[:12]}.{ext}"
+    path = f"posts/{filename}"
+
+    supabase.storage.from_("social-media").upload(path, content, {"content-type": file.content_type})
+
+    public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/social-media/{path}"
+    return {"url": public_url, "path": path, "filename": filename}
+
+
+@app.delete("/social/images/{filename}")
+async def delete_social_image(filename: str, user=Depends(require_admin)):
+    """Delete an image from storage."""
+    path = f"posts/{filename}"
+    try:
+        supabase.storage.from_("social-media").remove([path])
+    except Exception:
+        pass
+    return {"status": "deleted"}
 
 
 # === MAIN ===

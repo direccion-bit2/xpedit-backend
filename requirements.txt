@@ -9,3 +9,5 @@ resend==2.0.0
 PyJWT[crypto]==2.9.0
 stripe==8.0.0
 svix==1.44.0
+tweepy==4.14.0
+apscheduler==3.10.4
