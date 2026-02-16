@@ -1323,19 +1323,37 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
             raise HTTPException(status_code=404, detail="User not found")
 
         # Send email notification (fire and forget)
-        if request.plan != "free" and result.data[0].get("email"):
-            driver = result.data[0]
-            plan_label = "Pro+" if request.plan == "pro_plus" else "Pro"
+        if request.plan != "free":
             try:
-                send_plan_activated_email(
-                    driver["email"],
-                    driver.get("name", "Usuario"),
-                    plan_label,
-                    days=request.days if not request.permanent else None,
-                    permanent=request.permanent
-                )
-            except Exception:
-                pass  # Don't fail the grant if email fails
+                # Fetch driver email/name (update result may not include them)
+                driver_data = supabase.table("drivers").select("email, name").eq("id", user_id).single().execute()
+                driver_email = driver_data.data.get("email") if driver_data.data else None
+                driver_name = driver_data.data.get("name", "Usuario") if driver_data.data else "Usuario"
+
+                if driver_email:
+                    plan_label = "Pro+" if request.plan == "pro_plus" else "Pro"
+                    email_result = send_plan_activated_email(
+                        driver_email,
+                        driver_name,
+                        plan_label,
+                        days=request.days if not request.permanent else None,
+                        permanent=request.permanent
+                    )
+                    # Log email
+                    if email_result.get("success"):
+                        try:
+                            supabase.table("email_log").insert({
+                                "recipient_email": driver_email,
+                                "recipient_name": driver_name,
+                                "subject": f"Plan {plan_label} activado",
+                                "body": f"Plan {plan_label} {'permanente' if request.permanent else f'{request.days} dias'}",
+                                "message_id": email_result.get("id"),
+                                "status": "sent",
+                            }).execute()
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[WARN] Could not send plan email: {e}")
 
         return {
             "success": True,
