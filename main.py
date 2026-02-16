@@ -1375,6 +1375,11 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
         if not result:
             raise HTTPException(status_code=404, detail="User not found")
 
+        # Mark user to force password change on next login
+        driver = supabase.table("drivers").select("id").eq("user_id", user_id).execute()
+        if driver.data:
+            supabase.table("drivers").update({"must_change_password": True}).eq("id", driver.data[0]["id"]).execute()
+
         return {
             "success": True,
             "user_id": user_id,
