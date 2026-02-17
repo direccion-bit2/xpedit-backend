@@ -3364,10 +3364,13 @@ social_scheduler = AsyncIOScheduler()
 async def start_social_scheduler():
     if TWITTER_CONSUMER_KEY:
         social_scheduler.add_job(check_scheduled_posts, "interval", seconds=60, id="social_checker", replace_existing=True)
-        social_scheduler.start()
-        logger.info("Social scheduler started - checking every 60s")
+        logger.info("Social scheduler: checking every 60s")
     else:
-        logger.info("Social: Twitter credentials not configured, scheduler not started")
+        logger.info("Social: Twitter credentials not configured, social posts not scheduled")
+    # Siempre arrancar el scheduler (tambien para backups y retention)
+    if not social_scheduler.running:
+        social_scheduler.start()
+        logger.info("Scheduler started")
 
 
 # --- Social API Endpoints ---
@@ -3794,6 +3797,192 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
         raise HTTPException(status_code=500, detail=f"Error parseando calendario: {text[:200]}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generando calendario: {str(e)[:200]}")
+
+
+# === HEALTH CHECK & MONITORING ===
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint - verifica DB y servicios."""
+    checks = {}
+    healthy = True
+
+    # Check Supabase DB
+    try:
+        result = supabase.table("drivers").select("id", count="exact").limit(1).execute()
+        checks["database"] = {"status": "ok", "drivers_count": result.count}
+    except Exception as e:
+        checks["database"] = {"status": "error", "detail": str(e)[:100]}
+        healthy = False
+
+    # Check Sentry
+    checks["sentry"] = {"status": "ok" if SENTRY_DSN else "not_configured"}
+
+    # Check scheduler
+    try:
+        scheduler_running = social_scheduler.running if social_scheduler else False
+        checks["scheduler"] = {"status": "ok" if scheduler_running else "stopped"}
+    except Exception:
+        checks["scheduler"] = {"status": "unknown"}
+
+    # Uptime
+    checks["uptime_seconds"] = int((datetime.utcnow() - _server_start_time).total_seconds())
+    checks["version"] = "1.1.3"
+    checks["environment"] = os.getenv("SENTRY_ENVIRONMENT", "production")
+
+    status_code = 200 if healthy else 503
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "healthy" if healthy else "degraded", "checks": checks}
+    )
+
+
+# === AUTOMATIC BACKUPS ===
+
+async def backup_critical_tables():
+    """Backup de tablas criticas a Supabase Storage (diario)."""
+    try:
+        # Sentry cron check-in
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(
+                monitor_slug="daily-backup",
+                status="in_progress",
+            )
+
+        tables = ["drivers", "users", "routes", "stops", "referrals", "promo_codes"]
+        backup_date = datetime.utcnow().strftime("%Y-%m-%d")
+        backup_data = {}
+
+        for table in tables:
+            try:
+                result = supabase.table(table).select("*").execute()
+                backup_data[table] = {
+                    "count": len(result.data),
+                    "data": result.data,
+                    "backed_up_at": datetime.utcnow().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"Backup error for table {table}: {e}")
+                backup_data[table] = {"error": str(e)}
+
+        # Guardar en Supabase Storage
+        backup_json = json.dumps(backup_data, default=str, ensure_ascii=False)
+        backup_path = f"backups/{backup_date}/backup_{backup_date}.json"
+
+        try:
+            supabase.storage.from_("social-media").upload(
+                backup_path,
+                backup_json.encode("utf-8"),
+                {"content-type": "application/json"}
+            )
+            logger.info(f"Backup completed: {backup_path} ({len(backup_json)} bytes, {len(tables)} tables)")
+        except Exception as e:
+            # Si ya existe, intentar con timestamp
+            if "Duplicate" in str(e) or "already exists" in str(e):
+                ts = datetime.utcnow().strftime("%H%M%S")
+                backup_path = f"backups/{backup_date}/backup_{backup_date}_{ts}.json"
+                supabase.storage.from_("social-media").upload(
+                    backup_path,
+                    backup_json.encode("utf-8"),
+                    {"content-type": "application/json"}
+                )
+                logger.info(f"Backup completed (retry): {backup_path}")
+            else:
+                raise
+
+        # Sentry cron OK
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(
+                monitor_slug="daily-backup",
+                status="ok",
+            )
+
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(
+                monitor_slug="daily-backup",
+                status="error",
+            )
+            sentry_sdk.capture_exception(e)
+
+
+async def run_retention_cleanup():
+    """Ejecutar limpieza de datos antiguos (semanal)."""
+    try:
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(
+                monitor_slug="weekly-retention-cleanup",
+                status="in_progress",
+            )
+
+        # Llamar a las funciones SQL de retencion creadas en la migracion
+        import httpx as httpx_client
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+        }
+        base_url = os.getenv("SUPABASE_URL")
+
+        async with httpx_client.AsyncClient() as client:
+            # Clean location_history > 90 days
+            r1 = await client.post(
+                f"{base_url}/rest/v1/rpc/clean_old_location_history",
+                headers=headers,
+                json={}
+            )
+            # Clean email_log > 180 days
+            r2 = await client.post(
+                f"{base_url}/rest/v1/rpc/clean_old_email_logs",
+                headers=headers,
+                json={}
+            )
+            logger.info(f"Retention cleanup: location_history={r1.status_code}, email_log={r2.status_code}")
+
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(
+                monitor_slug="weekly-retention-cleanup",
+                status="ok",
+            )
+    except Exception as e:
+        logger.error(f"Retention cleanup failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(
+                monitor_slug="weekly-retention-cleanup",
+                status="error",
+            )
+            sentry_sdk.capture_exception(e)
+
+
+# Track server start time for uptime
+_server_start_time = datetime.utcnow()
+
+
+@app.on_event("startup")
+async def start_monitoring_jobs():
+    """Iniciar jobs de backup y limpieza."""
+    # Backup diario a las 3:00 AM UTC
+    social_scheduler.add_job(
+        backup_critical_tables,
+        "cron",
+        hour=3,
+        minute=0,
+        id="daily_backup",
+        replace_existing=True,
+    )
+    # Limpieza semanal (domingos 4:00 AM UTC)
+    social_scheduler.add_job(
+        run_retention_cleanup,
+        "cron",
+        day_of_week="sun",
+        hour=4,
+        minute=0,
+        id="weekly_retention",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC)")
 
 
 # === MAIN ===
