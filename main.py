@@ -440,6 +440,7 @@ class StopCreate(BaseModel):
     phone: Optional[str] = None
     time_window_start: Optional[str] = None
     time_window_end: Optional[str] = None
+    packages: Optional[int] = None
 
 
 class RouteCreate(BaseModel):
@@ -850,6 +851,7 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
             "phone": stop.phone,
             "time_window_start": stop.time_window_start,
             "time_window_end": stop.time_window_end,
+            "packages": stop.packages,
         }
         for stop in route.stops
     ]
