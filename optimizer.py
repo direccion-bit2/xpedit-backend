@@ -1,5 +1,5 @@
 """
-RutaMax - Motor de Optimización de Rutas
+Xpedit - Motor de Optimización de Rutas
 Usa Google OR-Tools para resolver el Vehicle Routing Problem (VRP)
 Incluye: ETA, clustering por zonas, asignación inteligente, multi-vehicle
 """

@@ -1,5 +1,5 @@
 """
-RutaMax API - Backend de optimización de rutas
+Xpedit API - Backend de optimización de rutas
 """
 
 import os
@@ -214,7 +214,7 @@ async def verify_company_management(user: dict, company_id: str = None):
 
 
 app = FastAPI(
-    title="RutaMax API",
+    title="Xpedit API",
     description="API de optimización de rutas para entregas de última milla",
     version="0.2.0"
 )
@@ -467,7 +467,7 @@ async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
             response = await client.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={"q": request.address, "format": "json", "limit": 1},
-                headers={"User-Agent": "RutaMax/0.2"},
+                headers={"User-Agent": "Xpedit/1.0"},
                 timeout=10.0
             )
             data = response.json()
