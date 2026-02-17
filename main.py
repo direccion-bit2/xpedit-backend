@@ -3982,7 +3982,36 @@ async def start_monitoring_jobs():
         id="weekly_retention",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC)")
+    # Health check cada 5 minutos (reporta a Sentry Crons)
+    social_scheduler.add_job(
+        periodic_health_check,
+        "interval",
+        minutes=5,
+        id="health_check",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC)")
+
+
+async def periodic_health_check():
+    """Health check periodico que reporta a Sentry Crons."""
+    try:
+        result = supabase.table("drivers").select("id", count="exact").limit(1).execute()
+        db_ok = result.count is not None
+        scheduler_ok = social_scheduler.running if social_scheduler else False
+
+        if db_ok and scheduler_ok:
+            if SENTRY_DSN:
+                sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="ok")
+        else:
+            logger.warning(f"Health check degraded: db={db_ok}, scheduler={scheduler_ok}")
+            if SENTRY_DSN:
+                sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
+            sentry_sdk.capture_exception(e)
 
 
 # === MAIN ===
