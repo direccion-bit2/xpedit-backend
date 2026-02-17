@@ -556,6 +556,23 @@ async def download_apk(request: Request):
     return RedirectResponse(url=APK_DOWNLOAD_URL, status_code=302)
 
 
+async def get_road_distance_matrix(locations: list) -> list | None:
+    """Obtiene matriz de distancias reales por carretera usando OSRM (gratis)."""
+    if len(locations) < 2 or len(locations) > 100:
+        return None
+    try:
+        coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+        url = f"http://router.project-osrm.org/table/v1/driving/{coords}?annotations=distance"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=15.0)
+            data = resp.json()
+            if data.get("code") == "Ok" and data.get("distances"):
+                return [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
+    except Exception:
+        pass
+    return None
+
+
 @app.post("/optimize", tags=["optimize"], summary="Optimizar ruta")
 async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
     """Calcula el orden óptimo de paradas para minimizar distancia/tiempo. Máximo 100 paradas."""
@@ -563,7 +580,19 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Máximo 100 paradas")
 
     locations_data = [loc.model_dump() for loc in request.locations]
-    result = optimize_route(locations=locations_data, depot_index=request.start_index or 0)
+
+    # Intentar obtener distancias reales por carretera (OSRM)
+    road_matrix = await get_road_distance_matrix(locations_data)
+
+    result = optimize_route(
+        locations=locations_data,
+        depot_index=request.start_index or 0,
+        distance_matrix=road_matrix,
+    )
+    if road_matrix:
+        result["distance_source"] = "road"
+    else:
+        result["distance_source"] = "haversine"
     return result
 
 

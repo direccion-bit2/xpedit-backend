@@ -68,7 +68,8 @@ def optimize_route(
     depot_index: int = 0,
     num_vehicles: int = 1,
     avg_speed_kmh: float = 30.0,
-    stop_time_minutes: float = 5.0
+    stop_time_minutes: float = 5.0,
+    distance_matrix: Optional[List[List[int]]] = None
 ) -> Dict[str, Any]:
     """
     Optimiza la ruta para visitar todas las ubicaciones.
@@ -98,8 +99,9 @@ def optimize_route(
     if depot_index < 0 or depot_index >= len(locations):
         depot_index = 0
 
-    # Crear matriz de distancias
-    distance_matrix = create_distance_matrix(locations)
+    # Usar matriz proporcionada (distancias reales) o crear con Haversine (fallback)
+    if distance_matrix is None:
+        distance_matrix = create_distance_matrix(locations)
 
     # Comprobar si hay ventanas horarias
     has_time_windows = any(
