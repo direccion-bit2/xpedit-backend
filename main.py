@@ -216,7 +216,7 @@ async def verify_company_management(user: dict, company_id: str = None):
 app = FastAPI(
     title="Xpedit API",
     description="API de optimización de rutas para entregas de última milla",
-    version="0.2.0"
+    version="1.1.3"
 )
 
 # CORS
