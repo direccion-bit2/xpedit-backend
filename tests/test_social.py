@@ -11,8 +11,9 @@ Tests for social media management endpoints:
   - POST /social/generate-calendar
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
 
 
 class TestSocialAccessControl:

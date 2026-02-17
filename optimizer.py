@@ -4,12 +4,12 @@ Usa Google OR-Tools para resolver el Vehicle Routing Problem (VRP)
 Incluye: ETA, clustering por zonas, asignación inteligente, multi-vehicle
 """
 
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
 import math
-from typing import List, Tuple, Dict, Any, Optional
-from datetime import datetime, timedelta
 from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 
 def haversine_distance(coord1: Tuple[float, float], coord2: Tuple[float, float]) -> int:

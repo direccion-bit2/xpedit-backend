@@ -7,7 +7,7 @@ so tests can run without any env vars or real connections.
 
 import os
 import sys
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -117,11 +117,11 @@ sys.modules.setdefault("sentry_sdk", _fake_sentry)
 
 # Mock PyJWKClient which may not exist in older jwt versions
 import jwt as _jwt_mod
+
 if not hasattr(_jwt_mod, "PyJWKClient"):
     _jwt_mod.PyJWKClient = MagicMock()
 
-from main import app, get_current_user, require_admin, supabase as app_supabase
-
+from main import app, get_current_user, require_admin
 
 # ---------------------------------------------------------------------------
 # 4. Fixtures
@@ -167,7 +167,7 @@ async def client(fake_user):
     httpx.AsyncClient wired to the FastAPI app via ASGITransport.
     Auth is bypassed: get_current_user always returns fake_user.
     """
-    from httpx import AsyncClient, ASGITransport
+    from httpx import ASGITransport, AsyncClient
 
     async def _override_get_current_user():
         return fake_user
@@ -185,7 +185,7 @@ async def admin_client(fake_admin_user):
     httpx.AsyncClient where the user is an admin.
     Both get_current_user and require_admin are overridden.
     """
-    from httpx import AsyncClient, ASGITransport
+    from httpx import ASGITransport, AsyncClient
 
     async def _override_get_current_user():
         return fake_admin_user
@@ -206,7 +206,7 @@ async def unauth_client():
     """
     httpx.AsyncClient with NO auth overrides -- requests will fail auth.
     """
-    from httpx import AsyncClient, ASGITransport
+    from httpx import ASGITransport, AsyncClient
 
     # Clear any leftover overrides
     app.dependency_overrides.clear()

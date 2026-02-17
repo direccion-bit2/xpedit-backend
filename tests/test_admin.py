@@ -10,10 +10,11 @@ Tests for admin endpoints:
   - Admin-only access control
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
-from tests.conftest import FAKE_USER_ID, FAKE_ADMIN_USER_ID
+import pytest
+
+from tests.conftest import FAKE_USER_ID
 
 
 class TestAdminAccessControl:

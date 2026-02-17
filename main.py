@@ -2,23 +2,24 @@
 Xpedit API - Backend de optimización de rutas
 """
 
+import hashlib
+import json
+import logging
 import os
 import random
 import time
-import logging
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 from typing import List, Optional
-import json
-import hashlib
+
 import httpx
 import jwt as pyjwt
-from jwt import PyJWKClient
-from dotenv import load_dotenv
-from supabase import create_client, Client
 import sentry_sdk
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from jwt import PyJWKClient
+from pydantic import BaseModel, Field
+from supabase import Client, create_client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("xpedit")
@@ -31,29 +32,29 @@ if SENTRY_DSN:
         traces_sample_rate=0.1,
         profiles_sample_rate=0.1,
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
-        release=f"xpedit-backend@1.1.3",
+        release="xpedit-backend@1.1.3",
         send_default_pii=False,
     )
     logger.info("Sentry initialized for error monitoring")
 
+from emails import (
+    send_broadcast_email,
+    send_custom_email,
+    send_daily_summary_email,
+    send_delivery_completed_email,
+    send_delivery_failed_email,
+    send_delivery_started_email,
+    send_plan_activated_email,
+    send_referral_reward_email,
+    send_welcome_email,
+)
 from optimizer import (
-    optimize_route,
+    assign_drivers_to_zones,
     calculate_eta,
     calculate_route_etas,
     cluster_stops_by_zone,
-    assign_drivers_to_zones,
-    optimize_multi_vehicle
-)
-from emails import (
-    send_welcome_email,
-    send_delivery_started_email,
-    send_delivery_completed_email,
-    send_delivery_failed_email,
-    send_daily_summary_email,
-    send_plan_activated_email,
-    send_referral_reward_email,
-    send_custom_email,
-    send_broadcast_email,
+    optimize_multi_vehicle,
+    optimize_route,
 )
 
 # Cargar variables de entorno
@@ -82,6 +83,7 @@ _processed_webhook_events: set = set()
 
 # Stripe
 import stripe
+
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
@@ -334,6 +336,7 @@ async def add_security_headers(request: Request, call_next):
 
 # Rate limiting (in-memory, single instance)
 from collections import defaultdict
+
 _rate_limits: dict = defaultdict(list)
 
 def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60):
@@ -2134,7 +2137,7 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
             .eq("active", True)\
             .execute()
         total_drivers = len(links_result.data or [])
-        driver_user_ids = [l["user_id"] for l in (links_result.data or [])]
+        driver_user_ids = [link["user_id"] for link in (links_result.data or [])]
 
         # Get driver IDs from drivers table for these users
         active_today = 0
@@ -3260,10 +3263,10 @@ async def delete_account(user=Depends(get_current_user)):
 
 # === SOCIAL MEDIA MANAGEMENT ===
 
+import uuid as uuid_mod
+
 import tweepy
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import uuid as uuid_mod
-import asyncio
 
 # Twitter/X credentials from env
 TWITTER_CONSUMER_KEY = os.getenv("TWITTER_CONSUMER_KEY", "")

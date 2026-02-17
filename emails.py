@@ -3,8 +3,9 @@ Xpedit - Servicio de emails con Resend
 """
 
 import os
+from typing import List, Optional
+
 import resend
-from typing import Optional, List
 
 # Configurar API key
 resend.api_key = os.getenv("RESEND_API_KEY")

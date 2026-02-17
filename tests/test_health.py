@@ -2,9 +2,9 @@
 Tests for the /health and / (root) endpoints.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 # === Root Endpoint Tests ===
 

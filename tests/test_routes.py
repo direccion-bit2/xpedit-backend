@@ -12,10 +12,11 @@ Tests for route optimization and route CRUD endpoints:
   - POST /geocode
 """
 
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.conftest import FAKE_USER_ID, FAKE_DRIVER_ID
+import pytest
+
+from tests.conftest import FAKE_DRIVER_ID
 
 
 class AttrDict(dict):

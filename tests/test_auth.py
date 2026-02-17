@@ -4,10 +4,11 @@ Tests for auth-related endpoints:
   - Unauthenticated access (auth required endpoints return 401)
 """
 
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
-from tests.conftest import FAKE_USER_ID, FAKE_DRIVER_ID
+import pytest
+
+from tests.conftest import FAKE_DRIVER_ID
 
 
 class TestAuthRequired:

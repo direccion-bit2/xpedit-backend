@@ -3,7 +3,7 @@ Tests for the optimizer module.
 These tests verify core route optimization logic without external dependencies.
 """
 
-from optimizer import haversine_distance, calculate_eta, calculate_route_etas, optimize_route
+from optimizer import calculate_eta, calculate_route_etas, haversine_distance, optimize_route
 
 
 class TestHaversineDistance:
