@@ -18,9 +18,23 @@ import jwt as pyjwt
 from jwt import PyJWKClient
 from dotenv import load_dotenv
 from supabase import create_client, Client
+import sentry_sdk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("xpedit")
+
+# Sentry - Error monitoring
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=0.1,
+        profiles_sample_rate=0.1,
+        environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
+        release=f"xpedit-backend@1.1.3",
+        send_default_pii=False,
+    )
+    logger.info("Sentry initialized for error monitoring")
 
 from optimizer import (
     optimize_route,
