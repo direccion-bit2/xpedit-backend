@@ -357,6 +357,8 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"admin:{client_ip}", max_requests=60, window_seconds=60)
         elif path.startswith("/auth") or path == "/promo/redeem":
             check_rate_limit(f"auth:{client_ip}", max_requests=20, window_seconds=60)
+        elif path.startswith("/places"):
+            check_rate_limit(f"places:{client_ip}", max_requests=30, window_seconds=60)
         elif path == "/optimize":
             check_rate_limit(f"optimize:{client_ip}", max_requests=10, window_seconds=60)
     except HTTPException as e:
@@ -3782,7 +3784,8 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail=f"Error parseando respuesta de Gemini: {text[:200]}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generando texto: {str(e)[:200]}")
+        logger.error(f"Error generating text: {e}")
+        raise HTTPException(status_code=500, detail="Error generando texto. Inténtalo de nuevo.")
 
 
 @app.post("/social/generate-image", tags=["social"], summary="Generar imagen con IA")
@@ -3824,7 +3827,8 @@ async def generate_social_image(req: GenerateImageRequest, user=Depends(require_
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generando imagen: {str(e)[:200]}")
+        logger.error(f"Error generating image: {e}")
+        raise HTTPException(status_code=500, detail="Error generando imagen. Inténtalo de nuevo.")
 
 
 @app.post("/social/generate-calendar", tags=["social"], summary="Generar calendario editorial")
@@ -3887,7 +3891,8 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail=f"Error parseando calendario: {text[:200]}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generando calendario: {str(e)[:200]}")
+        logger.error(f"Error generating calendar: {e}")
+        raise HTTPException(status_code=500, detail="Error generando calendario. Inténtalo de nuevo.")
 
 
 # === HEALTH CHECK & MONITORING ===
