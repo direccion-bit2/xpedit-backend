@@ -227,10 +227,88 @@ async def verify_company_management(user: dict, company_id: str = None):
     raise HTTPException(status_code=403, detail="No tienes permisos para gestionar esta empresa")
 
 
+tags_metadata = [
+    {
+        "name": "health",
+        "description": "Estado del sistema, health checks y monitorización.",
+    },
+    {
+        "name": "auth",
+        "description": "Autenticación y gestión de cuentas de usuario.",
+    },
+    {
+        "name": "optimize",
+        "description": "Optimización de rutas, ETAs, clustering y asignación de conductores.",
+    },
+    {
+        "name": "routes",
+        "description": "Gestión de rutas: crear, listar, iniciar, completar y eliminar.",
+    },
+    {
+        "name": "stops",
+        "description": "Gestión de paradas dentro de las rutas.",
+    },
+    {
+        "name": "drivers",
+        "description": "Gestión de conductores y perfiles.",
+    },
+    {
+        "name": "tracking",
+        "description": "Seguimiento GPS en tiempo real de conductores.",
+    },
+    {
+        "name": "company",
+        "description": "Gestión de empresas, flotas, invitaciones y suscripciones.",
+    },
+    {
+        "name": "promo",
+        "description": "Códigos promocionales: canjear, verificar y administrar.",
+    },
+    {
+        "name": "referral",
+        "description": "Sistema de referidos entre usuarios.",
+    },
+    {
+        "name": "email",
+        "description": "Envío de emails transaccionales y notificaciones.",
+    },
+    {
+        "name": "social",
+        "description": "Gestión de redes sociales: publicaciones, calendario e IA generativa.",
+    },
+    {
+        "name": "admin",
+        "description": "Endpoints de administración (requiere rol admin).",
+    },
+    {
+        "name": "download",
+        "description": "Descarga de la APK y tracking de descargas.",
+    },
+    {
+        "name": "stripe",
+        "description": "Pagos con Stripe: checkout, webhooks y portal de cliente.",
+    },
+    {
+        "name": "places",
+        "description": "Proxy de Google Places: autocompletado, detalles y direcciones.",
+    },
+    {
+        "name": "ocr",
+        "description": "Reconocimiento óptico de etiquetas de envío (OCR).",
+    },
+    {
+        "name": "webhooks",
+        "description": "Webhooks entrantes de servicios externos (Stripe, Resend).",
+    },
+]
+
 app = FastAPI(
     title="Xpedit API",
-    description="API de optimización de rutas para entregas de última milla",
-    version="1.1.3"
+    description="API para la app de optimización de rutas Xpedit",
+    version="1.1.3",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_tags=tags_metadata,
 )
 
 # CORS
@@ -426,10 +504,18 @@ class AdminBroadcastEmailRequest(BaseModel):
     target: str = "all"  # all, free, pro, pro_plus
 
 
+# -- Modelos de respuesta --
+
+class HealthCheckResponse(BaseModel):
+    status: str = Field(..., description="Estado general: 'healthy' o 'degraded'")
+    checks: dict = Field(..., description="Detalle de cada servicio verificado")
+
+
 # === ENDPOINTS BÁSICOS ===
 
-@app.get("/")
+@app.get("/", tags=["health"], summary="Estado del servicio")
 async def root():
+    """Devuelve el estado general del servicio y la configuración activa."""
     return {
         "status": "ok",
         "service": "Xpedit API",
@@ -442,9 +528,9 @@ async def root():
 APK_DOWNLOAD_URL = "https://github.com/direccion-bit2/xpedit-releases/releases/download/v1.1.4/xpedit-latest.apk"
 
 
-@app.get("/download/apk")
+@app.get("/download/apk", tags=["download"], summary="Descargar APK")
 async def download_apk(request: Request):
-    """Track APK download (unique device fingerprint) and redirect to GitHub"""
+    """Registra la descarga con un fingerprint único del dispositivo (IP+UA) y redirige al APK en GitHub Releases."""
     from fastapi.responses import RedirectResponse
 
     try:
@@ -464,8 +550,9 @@ async def download_apk(request: Request):
     return RedirectResponse(url=APK_DOWNLOAD_URL, status_code=302)
 
 
-@app.post("/optimize")
+@app.post("/optimize", tags=["optimize"], summary="Optimizar ruta")
 async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
+    """Calcula el orden óptimo de paradas para minimizar distancia/tiempo. Máximo 100 paradas."""
     if len(request.locations) > 100:
         raise HTTPException(status_code=400, detail="Máximo 100 paradas")
 
@@ -474,8 +561,9 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
     return result
 
 
-@app.post("/geocode")
+@app.post("/geocode", tags=["optimize"], summary="Geocodificar dirección")
 async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
+    """Convierte una dirección de texto en coordenadas (lat/lng) usando Nominatim."""
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
@@ -500,9 +588,9 @@ async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
 
 # === ENDPOINTS AVANZADOS DE OPTIMIZACIÓN ===
 
-@app.post("/optimize-multi")
+@app.post("/optimize-multi", tags=["optimize"], summary="Optimizar multi-vehículo")
 async def optimize_multi(request: MultiVehicleOptimizeRequest, user=Depends(get_current_user)):
-    """Optimiza rutas para múltiples vehículos (CVRP)"""
+    """Optimiza rutas para múltiples vehículos (CVRP). Máximo 200 paradas y 50 vehículos."""
     if len(request.locations) > 200:
         raise HTTPException(status_code=400, detail="Máximo 200 paradas para multi-vehicle")
 
@@ -521,9 +609,9 @@ async def optimize_multi(request: MultiVehicleOptimizeRequest, user=Depends(get_
     return result
 
 
-@app.post("/cluster-zones")
+@app.post("/cluster-zones", tags=["optimize"], summary="Agrupar paradas en zonas")
 async def cluster_zones(request: ClusterRequest, user=Depends(get_current_user)):
-    """Agrupa paradas en zonas geográficas"""
+    """Agrupa paradas en zonas geográficas mediante clustering. Máximo 500 paradas."""
     if len(request.stops) > 500:
         raise HTTPException(status_code=400, detail="Máximo 500 paradas para clustering")
 
@@ -537,9 +625,9 @@ async def cluster_zones(request: ClusterRequest, user=Depends(get_current_user))
     return result
 
 
-@app.post("/eta")
+@app.post("/eta", tags=["optimize"], summary="Calcular ETA")
 async def get_eta(request: ETARequest, user=Depends(get_current_user)):
-    """Calcula ETA entre dos puntos"""
+    """Calcula el tiempo estimado de llegada (ETA) entre dos coordenadas."""
     result = calculate_eta(
         current_location=(request.current_lat, request.current_lng),
         destination=(request.destination_lat, request.destination_lng),
@@ -549,9 +637,9 @@ async def get_eta(request: ETARequest, user=Depends(get_current_user)):
     return {"success": True, **result}
 
 
-@app.post("/route-etas")
+@app.post("/route-etas", tags=["optimize"], summary="ETAs de toda la ruta")
 async def get_route_etas(request: RouteETARequest, user=Depends(get_current_user)):
-    """Calcula ETAs para todas las paradas de una ruta"""
+    """Calcula ETAs acumuladas para todas las paradas de una ruta en orden."""
     route_data = [loc.model_dump() for loc in request.route]
 
     start_location = None
@@ -568,9 +656,9 @@ async def get_route_etas(request: RouteETARequest, user=Depends(get_current_user
     return {"success": True, "route": result, "num_stops": len(result)}
 
 
-@app.post("/assign-drivers")
+@app.post("/assign-drivers", tags=["optimize"], summary="Asignar conductores a zonas")
 async def assign_drivers(request: AssignDriversRequest, user=Depends(get_current_user)):
-    """Asigna conductores a zonas de forma inteligente"""
+    """Asigna conductores a zonas de forma inteligente basándose en ubicación y carga de trabajo."""
     drivers_data = [
         {
             "id": d.id,
@@ -587,9 +675,9 @@ async def assign_drivers(request: AssignDriversRequest, user=Depends(get_current
     return {"success": True, **result}
 
 
-@app.get("/stats/daily")
+@app.get("/stats/daily", tags=["routes"], summary="Estadísticas diarias")
 async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_current_user)):
-    """Obtiene estadísticas del día - filtradas por permisos del usuario"""
+    """Obtiene estadísticas del día (rutas, paradas, distancia). Filtradas por permisos del usuario."""
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
@@ -661,9 +749,9 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
 
 # -- Conductores --
 
-@app.get("/drivers")
+@app.get("/drivers", tags=["drivers"], summary="Listar conductores")
 async def get_drivers(user=Depends(get_current_user)):
-    """Lista conductores - admin ve todos, dispatcher ve su empresa, driver ve solo él"""
+    """Lista conductores activos. Admin ve todos, dispatcher ve su empresa, driver ve solo él."""
     query = supabase.table("drivers").select("*").eq("active", True)
     if user["role"] == "admin":
         pass  # Admin sees all
@@ -675,9 +763,9 @@ async def get_drivers(user=Depends(get_current_user)):
     return {"drivers": result.data}
 
 
-@app.get("/drivers/{driver_id}")
+@app.get("/drivers/{driver_id}", tags=["drivers"], summary="Obtener conductor")
 async def get_driver(driver_id: str, user=Depends(get_current_user)):
-    """Obtiene un conductor por ID - verificando acceso"""
+    """Obtiene los datos de un conductor por ID. Verifica permisos de acceso."""
     await verify_driver_access(driver_id, user)
     result = supabase.table("drivers").select("*").eq("id", driver_id).single().execute()
     return result.data
@@ -685,9 +773,9 @@ async def get_driver(driver_id: str, user=Depends(get_current_user)):
 
 # -- Rutas --
 
-@app.get("/routes")
+@app.get("/routes", tags=["routes"], summary="Listar rutas")
 async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None, user=Depends(get_current_user)):
-    """Lista rutas - filtradas por propiedad del usuario"""
+    """Lista rutas con sus paradas. Filtradas por propiedad del usuario y opcionalmente por conductor o fecha."""
     query = supabase.table("routes").select("*, stops(*)")
 
     if user["role"] == "admin":
@@ -722,9 +810,9 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
     return {"routes": result.data}
 
 
-@app.post("/routes")
+@app.post("/routes", tags=["routes"], summary="Crear ruta")
 async def create_route(route: RouteCreate, user=Depends(get_current_user)):
-    """Crea una nueva ruta con sus paradas"""
+    """Crea una nueva ruta con sus paradas. El conductor debe ser el usuario autenticado (salvo admin)."""
     # Verify user can create route for this driver
     if user["role"] != "admin":
         user_driver_id = await get_user_driver_id(user)
@@ -768,17 +856,17 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     return result.data
 
 
-@app.get("/routes/{route_id}")
+@app.get("/routes/{route_id}", tags=["routes"], summary="Obtener ruta")
 async def get_route(route_id: str, user=Depends(get_current_user)):
-    """Obtiene una ruta con sus paradas - verificando acceso"""
+    """Obtiene una ruta con todas sus paradas. Verifica permisos de acceso."""
     await verify_route_access(route_id, user)
     result = supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
     return result.data
 
 
-@app.patch("/routes/{route_id}/start")
+@app.patch("/routes/{route_id}/start", tags=["routes"], summary="Iniciar ruta")
 async def start_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como iniciada - verificando acceso"""
+    """Marca una ruta como 'in_progress' y registra la hora de inicio."""
     await verify_route_access(route_id, user)
     result = supabase.table("routes").update({
         "status": "in_progress",
@@ -790,9 +878,9 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
     return {"success": True, "route": route}
 
 
-@app.patch("/routes/{route_id}/complete")
+@app.patch("/routes/{route_id}/complete", tags=["routes"], summary="Completar ruta")
 async def complete_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como completada - verificando acceso"""
+    """Marca una ruta como 'completed' y registra la hora de finalización."""
     await verify_route_access(route_id, user)
     result = supabase.table("routes").update({
         "status": "completed",
@@ -804,9 +892,9 @@ async def complete_route(route_id: str, user=Depends(get_current_user)):
     return {"success": True, "route": route}
 
 
-@app.delete("/routes/{route_id}")
+@app.delete("/routes/{route_id}", tags=["routes"], summary="Eliminar ruta")
 async def delete_route(route_id: str, user=Depends(get_current_user)):
-    """Elimina una ruta y todas sus dependencias - verificando acceso"""
+    """Elimina una ruta y todas sus dependencias (paradas, tracking, pruebas de entrega)."""
     await verify_route_access(route_id, user)
     # Get stop IDs for this route
     stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
@@ -829,9 +917,9 @@ async def delete_route(route_id: str, user=Depends(get_current_user)):
 
 # -- Paradas --
 
-@app.patch("/stops/{stop_id}/complete")
+@app.patch("/stops/{stop_id}/complete", tags=["stops"], summary="Completar parada")
 async def complete_stop(stop_id: str, user=Depends(get_current_user)):
-    """Marca una parada como completada - verificando acceso"""
+    """Marca una parada como 'completed' y registra la hora."""
     await verify_stop_access(stop_id, user)
     result = supabase.table("stops").update({
         "status": "completed",
@@ -843,9 +931,9 @@ async def complete_stop(stop_id: str, user=Depends(get_current_user)):
     return {"success": True, "stop": stop}
 
 
-@app.patch("/stops/{stop_id}/fail")
+@app.patch("/stops/{stop_id}/fail", tags=["stops"], summary="Marcar parada fallida")
 async def fail_stop(stop_id: str, user=Depends(get_current_user)):
-    """Marca una parada como fallida - verificando acceso"""
+    """Marca una parada como 'failed' y registra la hora."""
     await verify_stop_access(stop_id, user)
     result = supabase.table("stops").update({
         "status": "failed",
@@ -859,9 +947,9 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
 
 # -- GPS Tracking --
 
-@app.post("/location")
+@app.post("/location", tags=["tracking"], summary="Registrar ubicación")
 async def update_location(location: LocationUpdate, user=Depends(get_current_user)):
-    """Registra la ubicación actual del conductor - fuerza driver_id del usuario"""
+    """Registra la ubicación GPS actual del conductor. Fuerza el driver_id del usuario autenticado."""
     # Force driver_id to be the authenticated user's driver
     user_driver_id = await get_user_driver_id(user)
     if not user_driver_id:
@@ -884,9 +972,9 @@ async def update_location(location: LocationUpdate, user=Depends(get_current_use
     return {"success": True, "id": location["id"]}
 
 
-@app.get("/location/{driver_id}/latest")
+@app.get("/location/{driver_id}/latest", tags=["tracking"], summary="Última ubicación")
 async def get_latest_location(driver_id: str, user=Depends(get_current_user)):
-    """Obtiene la última ubicación conocida de un conductor - verificando acceso"""
+    """Obtiene la última ubicación GPS conocida de un conductor."""
     await verify_driver_access(driver_id, user)
     result = supabase.table("location_history")\
         .select("*")\
@@ -901,9 +989,9 @@ async def get_latest_location(driver_id: str, user=Depends(get_current_user)):
     return {"success": True, "location": result.data[0]}
 
 
-@app.get("/location/{driver_id}/history")
+@app.get("/location/{driver_id}/history", tags=["tracking"], summary="Historial de ubicaciones")
 async def get_location_history(driver_id: str, route_id: Optional[str] = None, limit: int = 100, user=Depends(get_current_user)):
-    """Obtiene el historial de ubicaciones de un conductor - verificando acceso"""
+    """Obtiene el historial de ubicaciones GPS de un conductor. Se puede filtrar por ruta."""
     await verify_driver_access(driver_id, user)
     query = supabase.table("location_history")\
         .select("*")\
@@ -918,18 +1006,18 @@ async def get_location_history(driver_id: str, route_id: Optional[str] = None, l
 
 # === EMAILS ===
 
-@app.post("/email/welcome")
+@app.post("/email/welcome", tags=["email"], summary="Email de bienvenida")
 async def api_send_welcome_email(request: WelcomeEmailRequest, user=Depends(get_current_user)):
-    """Envía email de bienvenida a nuevo usuario"""
+    """Envía email de bienvenida a nuevo usuario."""
     result = send_welcome_email(request.to_email, request.user_name)
     if not result["success"]:
         raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
     return result
 
 
-@app.post("/email/delivery-started")
+@app.post("/email/delivery-started", tags=["email"], summary="Email entrega en camino")
 async def api_send_delivery_started_email(request: DeliveryStartedEmailRequest, user=Depends(get_current_user)):
-    """Envía email cuando el pedido está en camino"""
+    """Envía email al cliente notificando que su pedido está en camino."""
     result = send_delivery_started_email(
         request.to_email,
         request.client_name,
@@ -942,9 +1030,9 @@ async def api_send_delivery_started_email(request: DeliveryStartedEmailRequest, 
     return result
 
 
-@app.post("/email/delivery-completed")
+@app.post("/email/delivery-completed", tags=["email"], summary="Email entrega completada")
 async def api_send_delivery_completed_email(request: DeliveryCompletedEmailRequest, user=Depends(get_current_user)):
-    """Envía email de confirmación de entrega"""
+    """Envía email de confirmación de entrega exitosa al cliente."""
     result = send_delivery_completed_email(
         request.to_email,
         request.client_name,
@@ -957,9 +1045,9 @@ async def api_send_delivery_completed_email(request: DeliveryCompletedEmailReque
     return result
 
 
-@app.post("/email/delivery-failed")
+@app.post("/email/delivery-failed", tags=["email"], summary="Email entrega fallida")
 async def api_send_delivery_failed_email(request: DeliveryFailedEmailRequest, user=Depends(get_current_user)):
-    """Envía email cuando la entrega falla"""
+    """Envía email al cliente notificando que la entrega ha fallado."""
     result = send_delivery_failed_email(
         request.to_email,
         request.client_name,
@@ -971,9 +1059,9 @@ async def api_send_delivery_failed_email(request: DeliveryFailedEmailRequest, us
     return result
 
 
-@app.post("/email/daily-summary")
+@app.post("/email/daily-summary", tags=["email"], summary="Email resumen diario")
 async def api_send_daily_summary_email(request: DailySummaryEmailRequest, user=Depends(get_current_user)):
-    """Envía resumen diario al dispatcher"""
+    """Envía resumen diario de actividad al dispatcher."""
     result = send_daily_summary_email(
         request.to_email,
         request.dispatcher_name,
@@ -990,9 +1078,9 @@ async def api_send_daily_summary_email(request: DailySummaryEmailRequest, user=D
 
 # --- Admin email endpoints ---
 
-@app.post("/admin/users/{user_id}/send-email")
+@app.post("/admin/users/{user_id}/send-email", tags=["admin", "email"], summary="Enviar email a usuario")
 async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest, user=Depends(require_admin)):
-    """Enviar email personalizado a un usuario (admin)"""
+    """Envía un email personalizado a un usuario específico. Solo admin."""
     try:
         driver = supabase.table("drivers").select("email, name").eq("id", user_id).single().execute()
         if not driver.data:
@@ -1023,9 +1111,9 @@ async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest,
         raise HTTPException(status_code=500, detail="Error enviando email")
 
 
-@app.post("/admin/broadcast-email")
+@app.post("/admin/broadcast-email", tags=["admin", "email"], summary="Broadcast email")
 async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depends(require_admin)):
-    """Enviar email a todos los usuarios o filtrado por plan (admin)"""
+    """Envía un email masivo a todos los usuarios o filtrado por plan (free, pro, pro_plus). Solo admin."""
     try:
         query = supabase.table("drivers").select("email, name, promo_plan")
 
@@ -1102,9 +1190,9 @@ class AdminGrantRequest(BaseModel):
 
 # === PROMO CODE ENDPOINTS ===
 
-@app.post("/promo/redeem")
+@app.post("/promo/redeem", tags=["promo"], summary="Canjear código promo")
 async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_current_user)):
-    """Redeem a promo code for a user"""
+    """Canjea un código promocional. Valida expiración, usos máximos y que no se haya canjeado antes."""
     try:
         # Use authenticated user's ID instead of request body
         user_id = user["id"]
@@ -1181,9 +1269,9 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.get("/promo/check/{driver_id}")
+@app.get("/promo/check/{driver_id}", tags=["promo"], summary="Verificar beneficio promo")
 async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
-    """Check if a driver has an active promo benefit - only own data or admin"""
+    """Verifica si un conductor tiene un beneficio promo activo. Solo datos propios o admin."""
     # Verify ownership: look up driver and check user_id matches authenticated user
     driver_check = supabase.table("drivers").select("user_id").eq("id", driver_id).single().execute()
     if not driver_check.data:
@@ -1247,9 +1335,9 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
 
 # === ADMIN ENDPOINTS ===
 
-@app.get("/admin/promo-codes")
+@app.get("/admin/promo-codes", tags=["admin", "promo"], summary="Listar códigos promo")
 async def list_promo_codes(user=Depends(require_admin)):
-    """List all promo codes with their stats (admin)"""
+    """Lista todos los códigos promocionales con estadísticas de uso. Solo admin."""
     try:
         result = supabase.table("promo_codes")\
             .select("*")\
@@ -1263,9 +1351,9 @@ async def list_promo_codes(user=Depends(require_admin)):
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.post("/admin/promo-codes")
+@app.post("/admin/promo-codes", tags=["admin", "promo"], summary="Crear código promo")
 async def create_promo_code(request: PromoCodeCreateRequest, user=Depends(require_admin)):
-    """Create a new promo code (admin)"""
+    """Crea un nuevo código promocional con beneficio, usos máximos y expiración. Solo admin."""
     try:
         # Check if code already exists
         existing = supabase.table("promo_codes")\
@@ -1302,9 +1390,9 @@ async def create_promo_code(request: PromoCodeCreateRequest, user=Depends(requir
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.patch("/admin/promo-codes/{code_id}")
+@app.patch("/admin/promo-codes/{code_id}", tags=["admin", "promo"], summary="Actualizar código promo")
 async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest, user=Depends(require_admin)):
-    """Update a promo code (admin)"""
+    """Actualiza un código promocional existente (activo, usos máximos, descripción, expiración). Solo admin."""
     try:
         # Build update dict with only provided fields
         update_data = {}
@@ -1337,9 +1425,9 @@ async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest, user=
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.get("/admin/users")
+@app.get("/admin/users", tags=["admin"], summary="Listar usuarios")
 async def list_admin_users(user=Depends(require_admin)):
-    """List all users/drivers with promo status (admin)"""
+    """Lista todos los usuarios/conductores con su estado de plan promo. Solo admin."""
     try:
         result = supabase.table("drivers")\
             .select("*")\
@@ -1353,9 +1441,9 @@ async def list_admin_users(user=Depends(require_admin)):
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.patch("/admin/users/{user_id}/grant")
+@app.patch("/admin/users/{user_id}/grant", tags=["admin"], summary="Otorgar plan a usuario")
 async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(require_admin)):
-    """Grant plan to a user - permanent or temporary (admin)"""
+    """Otorga un plan (pro/pro_plus) a un usuario, temporal o permanente. Envía email de notificación. Solo admin."""
     try:
         if request.plan == "free":
             # Remove plan
@@ -1436,9 +1524,9 @@ class AdminResetPasswordRequest(BaseModel):
     password: Optional[str] = None  # If None, generate random
 
 
-@app.post("/admin/users/{user_id}/reset-password")
+@app.post("/admin/users/{user_id}/reset-password", tags=["admin"], summary="Resetear contraseña")
 async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest, user=Depends(require_admin)):
-    """Reset a user's password (admin only)"""
+    """Resetea la contraseña de un usuario. Genera una aleatoria si no se proporciona. Solo admin."""
     try:
         # Generate random password if not provided
         chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#"
@@ -1483,9 +1571,9 @@ class AdminCreateCompanyRequest(BaseModel):
     payment_model: str = "driver_pays"
 
 
-@app.post("/admin/companies")
+@app.post("/admin/companies", tags=["admin", "company"], summary="Crear empresa (admin)")
 async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(require_admin)):
-    """Create a company from admin panel"""
+    """Crea una empresa desde el panel de admin con suscripción trial de 14 días."""
     try:
         result = supabase.table("companies").insert({
             "name": request.name,
@@ -1520,9 +1608,9 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.patch("/admin/companies/{company_id}")
+@app.patch("/admin/companies/{company_id}", tags=["admin", "company"], summary="Activar/desactivar empresa")
 async def admin_toggle_company(company_id: str, request: dict, user=Depends(require_admin)):
-    """Toggle company active status (admin)"""
+    """Activa o desactiva una empresa. Solo admin."""
     try:
         update_data = {}
         if "active" in request:
@@ -1554,9 +1642,9 @@ class ReferralRedeemRequest(BaseModel):
     referral_code: str
 
 
-@app.get("/referral/code")
+@app.get("/referral/code", tags=["referral"], summary="Obtener código de referido")
 async def get_referral_code(user=Depends(get_current_user)):
-    """Get or generate the user's referral code"""
+    """Obtiene o genera el código de referido del usuario (formato XPD-XXXX)."""
     try:
         driver_id = await get_user_driver_id(user)
         if not driver_id:
@@ -1584,9 +1672,9 @@ async def get_referral_code(user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.post("/referral/redeem")
+@app.post("/referral/redeem", tags=["referral"], summary="Canjear código de referido")
 async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_current_user)):
-    """Redeem a referral code (new user gets 7 days Pro, referrer gets 7 days Pro)"""
+    """Canjea un código de referido. El nuevo usuario y el referidor reciben 7 días de Pro gratis."""
     try:
         referred_driver_id = await get_user_driver_id(user)
         if not referred_driver_id:
@@ -1681,9 +1769,9 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
-@app.get("/referral/stats")
+@app.get("/referral/stats", tags=["referral"], summary="Estadísticas de referidos")
 async def get_referral_stats(user=Depends(get_current_user)):
-    """Get referral stats for the current user"""
+    """Obtiene las estadísticas de referidos del usuario: total, días ganados y lista de referidos."""
     try:
         driver_id = await get_user_driver_id(user)
         if not driver_id:
@@ -1769,9 +1857,9 @@ def _generate_invite_code() -> str:
 
 
 # 1. POST /company/register
-@app.post("/company/register")
+@app.post("/company/register", tags=["company"], summary="Registrar empresa")
 async def register_company(request: CompanyRegisterRequest, user=Depends(get_current_user)):
-    """Register a new company and set up owner"""
+    """Registra una nueva empresa, configura al propietario como admin y crea suscripción trial de 14 días."""
     # SECURITY: owner_user_id must be the authenticated user (prevent privilege escalation)
     if request.owner_user_id != user["id"]:
         raise HTTPException(status_code=403, detail="Solo puedes registrar una empresa para tu propia cuenta")
@@ -1834,9 +1922,9 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
 
 # 15. GET /company/check-access/{driver_id}
 # NOTE: Defined before /company/{company_id} to avoid route shadowing
-@app.get("/company/check-access/{driver_id}")
+@app.get("/company/check-access/{driver_id}", tags=["company"], summary="Verificar acceso empresa")
 async def check_company_access(driver_id: str, user=Depends(get_current_user)):
-    """Check if a driver has company-paid access - only own data or admin"""
+    """Verifica si un conductor tiene acceso pagado por empresa (company_pays o company_complete)."""
     # Verify ownership: look up driver and check user_id matches authenticated user
     driver_check = supabase.table("drivers").select("user_id").eq("id", driver_id).single().execute()
     if not driver_check.data:
@@ -1884,9 +1972,9 @@ async def check_company_access(driver_id: str, user=Depends(get_current_user)):
 
 
 # 2. GET /company/{company_id}
-@app.get("/company/{company_id}")
+@app.get("/company/{company_id}", tags=["company"], summary="Obtener empresa")
 async def get_company(company_id: str, user=Depends(get_current_user)):
-    """Get company details with subscription info"""
+    """Obtiene los datos de una empresa con información de suscripción."""
     # Authorization: user must belong to this company or be admin
     if user["company_id"] != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
@@ -1924,9 +2012,9 @@ async def get_company(company_id: str, user=Depends(get_current_user)):
 
 
 # 3. PATCH /company/{company_id}
-@app.patch("/company/{company_id}")
+@app.patch("/company/{company_id}", tags=["company"], summary="Actualizar empresa")
 async def update_company(company_id: str, request: CompanyUpdateRequest, user=Depends(get_current_user)):
-    """Update company details"""
+    """Actualiza los datos de una empresa (nombre, email, teléfono, dirección, modelo de pago)."""
     # Authorization: user must belong to this company or be admin
     if user["company_id"] != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
@@ -1969,9 +2057,9 @@ async def update_company(company_id: str, request: CompanyUpdateRequest, user=De
 
 
 # 4. GET /company/{company_id}/drivers
-@app.get("/company/{company_id}/drivers")
+@app.get("/company/{company_id}/drivers", tags=["company"], summary="Conductores de empresa")
 async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
-    """List drivers in a company with mode, cost, plan info"""
+    """Lista todos los conductores de una empresa con modo de pago, coste y plan."""
     # Authorization: user must belong to this company or be admin
     if user["company_id"] != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
@@ -2029,9 +2117,9 @@ async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
 
 
 # 5. GET /company/{company_id}/stats
-@app.get("/company/{company_id}/stats")
+@app.get("/company/{company_id}/stats", tags=["company"], summary="Estadísticas de flota")
 async def get_company_stats(company_id: str, user=Depends(get_current_user)):
-    """Get fleet stats: total drivers, active today, routes/stops/deliveries today"""
+    """Estadísticas de la flota: conductores totales, activos hoy, rutas/paradas/entregas del día."""
     # Authorization: user must belong to this company or be admin
     if user["company_id"] != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
@@ -2102,9 +2190,9 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
 
 
 # 6. POST /company/invites
-@app.post("/company/invites")
+@app.post("/company/invites", tags=["company"], summary="Crear invitación empresa")
 async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_current_user)):
-    """Generate an invite code for a company - admin/dispatcher only"""
+    """Genera un código de invitación para unirse a la empresa. Solo admin/dispatcher."""
     await verify_company_management(user, request.company_id)
     try:
         # Generate unique code
@@ -2147,9 +2235,9 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
 
 
 # 7. GET /company/{company_id}/invites
-@app.get("/company/{company_id}/invites")
+@app.get("/company/{company_id}/invites", tags=["company"], summary="Listar invitaciones")
 async def get_company_invites(company_id: str, user=Depends(get_current_user)):
-    """List invite codes for a company"""
+    """Lista los códigos de invitación de una empresa."""
     # Authorization: user must belong to this company or be admin
     if user["company_id"] != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
@@ -2169,9 +2257,9 @@ async def get_company_invites(company_id: str, user=Depends(get_current_user)):
 
 
 # 8. DELETE /company/invites/{invite_id}
-@app.delete("/company/invites/{invite_id}")
+@app.delete("/company/invites/{invite_id}", tags=["company"], summary="Desactivar invitación")
 async def deactivate_company_invite(invite_id: str, user=Depends(get_current_user)):
-    """Deactivate an invite code - verify ownership"""
+    """Desactiva un código de invitación. Verifica propiedad de la empresa."""
     try:
         # Verify invite belongs to user's company
         invite_check = supabase.table("company_invites").select("company_id").eq("id", invite_id).limit(1).execute()
@@ -2197,9 +2285,9 @@ async def deactivate_company_invite(invite_id: str, user=Depends(get_current_use
 
 
 # 9. POST /company/join
-@app.post("/company/join")
+@app.post("/company/join", tags=["company"], summary="Unirse a empresa")
 async def join_company(request: CompanyJoinRequest, user=Depends(get_current_user)):
-    """Driver joins a company via invite code"""
+    """Un conductor se une a una empresa usando un código de invitación."""
     try:
         # Use authenticated user's ID instead of request body
         user_id = user["id"]
@@ -2303,9 +2391,9 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
 
 
 # 10. POST /company/leave
-@app.post("/company/leave")
+@app.post("/company/leave", tags=["company"], summary="Salir de empresa")
 async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_user)):
-    """Driver leaves their company"""
+    """Un conductor abandona su empresa. Si tenía acceso pagado por la empresa, se revoca."""
     try:
         # Use authenticated user's ID instead of request body
         user_id = user["id"]
@@ -2356,9 +2444,9 @@ async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_u
 
 
 # 11. POST /company/drivers
-@app.post("/company/drivers")
+@app.post("/company/drivers", tags=["company"], summary="Crear conductor en empresa")
 async def create_company_driver(request: CompanyCreateDriverRequest, user=Depends(get_current_user)):
-    """Create a driver directly - admin/dispatcher of the company only"""
+    """Crea una cuenta de conductor directamente en la empresa. Solo admin/dispatcher."""
     await verify_company_management(user, request.company_id)
     try:
         # Use supabase admin auth to create a new user
@@ -2426,9 +2514,9 @@ async def create_company_driver(request: CompanyCreateDriverRequest, user=Depend
 
 
 # 12. DELETE /company/drivers/{user_id}
-@app.delete("/company/drivers/{user_id}")
+@app.delete("/company/drivers/{user_id}", tags=["company"], summary="Eliminar conductor de empresa")
 async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
-    """Remove a driver from the company - admin/dispatcher only"""
+    """Elimina un conductor de la empresa. Si tenía acceso pagado, se revoca. Solo admin/dispatcher."""
     try:
         # Get current driver link to check mode and verify company ownership
         link_result = supabase.table("company_driver_links")\
@@ -2477,9 +2565,9 @@ async def remove_company_driver(user_id: str, user=Depends(get_current_user)):
 
 
 # 13b. PATCH /company/drivers/{user_id}/active - toggle driver active/inactive
-@app.patch("/company/drivers/{user_id}/active")
+@app.patch("/company/drivers/{user_id}/active", tags=["company"], summary="Activar/desactivar conductor")
 async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
-    """Toggle a driver's active status - admin/dispatcher of company only"""
+    """Activa o desactiva un conductor en la empresa. Gestiona beneficios de plan automáticamente."""
     try:
         # Get current driver link
         link_result = supabase.table("company_driver_links")\
@@ -2540,9 +2628,9 @@ async def toggle_driver_active(user_id: str, user=Depends(get_current_user)):
 
 
 # 13. PATCH /company/drivers/{user_id}/mode
-@app.patch("/company/drivers/{user_id}/mode")
+@app.patch("/company/drivers/{user_id}/mode", tags=["company"], summary="Cambiar modo de pago conductor")
 async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, user=Depends(get_current_user)):
-    """Change a driver's payment mode - admin/dispatcher of company only"""
+    """Cambia el modo de pago de un conductor (driver_pays, company_pays, company_complete). Solo admin/dispatcher."""
     try:
         if request.mode not in ("driver_pays", "company_pays", "company_complete"):
             raise HTTPException(status_code=400, detail="Invalid mode. Must be driver_pays, company_pays, or company_complete")
@@ -2633,9 +2721,9 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
 
 
 # 14. GET /company/{company_id}/subscription
-@app.get("/company/{company_id}/subscription")
+@app.get("/company/{company_id}/subscription", tags=["company"], summary="Suscripción de empresa")
 async def get_company_subscription(company_id: str, user=Depends(get_current_user)):
-    """Get company subscription details"""
+    """Obtiene los detalles de la suscripción de una empresa."""
     # Authorization: user must belong to this company or be admin
     if user["company_id"] != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
@@ -2671,9 +2759,9 @@ class OCRLabelRequest(BaseModel):
     media_type: str = "image/jpeg"
 
 
-@app.post("/ocr/label")
+@app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
 async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
-    """Proxy OCR request to Anthropic API - keeps API key server-side"""
+    """Extrae datos de una etiqueta de envío (nombre, dirección, ciudad, CP, provincia) usando IA. La API key se mantiene en el servidor."""
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="OCR service not configured")
 
@@ -2749,9 +2837,9 @@ class StripeCheckoutRequest(BaseModel):
     plan: str  # "pro" or "pro_plus"
 
 
-@app.post("/stripe/create-checkout")
+@app.post("/stripe/create-checkout", tags=["stripe"], summary="Crear sesión de checkout")
 async def create_stripe_checkout(request: StripeCheckoutRequest, user=Depends(get_current_user)):
-    """Create a Stripe Checkout Session for subscription"""
+    """Crea una sesión de Stripe Checkout para suscripción a plan Pro o Pro+."""
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Stripe not configured")
 
@@ -2784,9 +2872,9 @@ async def create_stripe_checkout(request: StripeCheckoutRequest, user=Depends(ge
         raise HTTPException(status_code=500, detail="Error en el servicio de pago")
 
 
-@app.post("/stripe/webhook")
+@app.post("/stripe/webhook", tags=["webhooks"], summary="Webhook de Stripe")
 async def stripe_webhook(request: Request):
-    """Handle Stripe webhook events - no JWT auth, uses Stripe signature"""
+    """Procesa eventos de Stripe (checkout completado, suscripción cancelada, renovación). Verificación por firma."""
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
@@ -2889,9 +2977,9 @@ async def stripe_webhook(request: Request):
 
 # === RESEND WEBHOOK (Email tracking) ===
 
-@app.post("/webhooks/resend")
+@app.post("/webhooks/resend", tags=["webhooks"], summary="Webhook de Resend")
 async def resend_webhook(request: Request):
-    """Handle Resend webhook events for email tracking (delivered, opened, clicked, bounced)"""
+    """Procesa eventos de Resend para tracking de emails (delivered, opened, clicked, bounced). Verificación por Svix."""
     payload_bytes = await request.body()
 
     # Verify signature if secret is configured
@@ -2950,9 +3038,9 @@ async def resend_webhook(request: Request):
     return {"received": True}
 
 
-@app.post("/stripe/portal")
+@app.post("/stripe/portal", tags=["stripe"], summary="Portal de cliente Stripe")
 async def create_stripe_portal(user=Depends(get_current_user)):
-    """Create a Stripe Customer Portal session to manage subscription"""
+    """Crea una sesión del portal de cliente de Stripe para gestionar la suscripción."""
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Stripe not configured")
 
@@ -2984,9 +3072,9 @@ async def create_stripe_portal(user=Depends(get_current_user)):
 # Proxy to avoid API key restrictions on mobile clients
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
-@app.get("/places/autocomplete")
+@app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
 async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
-    """Proxy for Google Places Autocomplete API - worldwide with location bias"""
+    """Proxy de Google Places Autocomplete con sesgo de ubicación. Fallback a Nominatim si falla."""
     params = {
         "input": input,
         "language": "es",
@@ -3031,9 +3119,9 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
     return data
 
 
-@app.get("/places/details")
+@app.get("/places/details", tags=["places"], summary="Detalles de lugar")
 async def places_details(place_id: str, user=Depends(get_current_user)):
-    """Proxy for Google Places Details API"""
+    """Proxy de Google Places Details. Devuelve geometría, componentes de dirección y dirección formateada."""
     params = {
         "place_id": place_id,
         "fields": "geometry,address_components,formatted_address",
@@ -3045,14 +3133,14 @@ async def places_details(place_id: str, user=Depends(get_current_user)):
     return resp.json()
 
 
-@app.get("/places/directions")
+@app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
     destination: str,
     waypoints: Optional[str] = None,
     user=Depends(get_current_user)
 ):
-    """Proxy for Google Directions API"""
+    """Proxy de Google Directions API. Devuelve polylines y pasos de navegación."""
     params = {
         "origin": origin,
         "destination": destination,
@@ -3071,9 +3159,9 @@ async def places_directions(
 
 # === ACCOUNT DELETION ===
 
-@app.delete("/auth/delete-account")
+@app.delete("/auth/delete-account", tags=["auth"], summary="Eliminar cuenta")
 async def delete_account(user=Depends(get_current_user)):
-    """Delete user account and all associated data (Apple/GDPR requirement)"""
+    """Elimina la cuenta del usuario y todos sus datos asociados (rutas, paradas, ubicaciones, conductor, etc.). Requerido por Apple y GDPR."""
     user_id = user["id"]
     try:
         # First, find the driver_id for this user
@@ -3375,9 +3463,9 @@ async def start_social_scheduler():
 
 # --- Social API Endpoints ---
 
-@app.get("/social/posts")
+@app.get("/social/posts", tags=["social"], summary="Listar publicaciones")
 async def list_social_posts(status: Optional[str] = None, user=Depends(require_admin)):
-    """List all social posts, optionally filtered by status."""
+    """Lista todas las publicaciones de redes sociales, opcionalmente filtradas por estado. Solo admin."""
     query = supabase.table("social_posts").select("*").order("created_at", desc=True)
     if status:
         query = query.eq("status", status)
@@ -3385,9 +3473,9 @@ async def list_social_posts(status: Optional[str] = None, user=Depends(require_a
     return result.data or []
 
 
-@app.post("/social/posts")
+@app.post("/social/posts", tags=["social"], summary="Crear publicación")
 async def create_social_post(post: SocialPostCreate, user=Depends(require_admin)):
-    """Create a new social post (draft or scheduled)."""
+    """Crea una nueva publicación (borrador o programada) para redes sociales. Solo admin."""
     data = {
         "content": post.content,
         "platforms": post.platforms,
@@ -3404,9 +3492,9 @@ async def create_social_post(post: SocialPostCreate, user=Depends(require_admin)
     return safe_first(result) or {}
 
 
-@app.put("/social/posts/{post_id}")
+@app.put("/social/posts/{post_id}", tags=["social"], summary="Actualizar publicación")
 async def update_social_post(post_id: str, update: SocialPostUpdate, user=Depends(require_admin)):
-    """Update a draft or scheduled post."""
+    """Actualiza una publicación en borrador o programada. No se pueden editar posts publicados. Solo admin."""
     existing = supabase.table("social_posts").select("status").eq("id", post_id).single().execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Post no encontrado")
@@ -3430,9 +3518,9 @@ async def update_social_post(post_id: str, update: SocialPostUpdate, user=Depend
     return safe_first(result) or {}
 
 
-@app.delete("/social/posts/{post_id}")
+@app.delete("/social/posts/{post_id}", tags=["social"], summary="Eliminar publicación")
 async def delete_social_post(post_id: str, user=Depends(require_admin)):
-    """Delete a draft or scheduled post."""
+    """Elimina una publicación en borrador o programada. Limpia imágenes del storage. Solo admin."""
     existing = supabase.table("social_posts").select("status, image_urls").eq("id", post_id).single().execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Post no encontrado")
@@ -3452,9 +3540,9 @@ async def delete_social_post(post_id: str, user=Depends(require_admin)):
     return {"status": "deleted"}
 
 
-@app.post("/social/posts/{post_id}/publish")
+@app.post("/social/posts/{post_id}/publish", tags=["social"], summary="Publicar ahora")
 async def publish_social_post_now(post_id: str, user=Depends(require_admin)):
-    """Publish a post immediately."""
+    """Publica un post inmediatamente en las plataformas seleccionadas. Solo admin."""
     existing = supabase.table("social_posts").select("status").eq("id", post_id).single().execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Post no encontrado")
@@ -3467,16 +3555,16 @@ async def publish_social_post_now(post_id: str, user=Depends(require_admin)):
     return updated.data
 
 
-@app.get("/social/accounts")
+@app.get("/social/accounts", tags=["social"], summary="Cuentas conectadas")
 async def list_social_accounts(user=Depends(require_admin)):
-    """List connected social media accounts."""
+    """Lista las cuentas de redes sociales conectadas. Solo admin."""
     result = supabase.table("social_accounts").select("*").execute()
     return result.data or []
 
 
-@app.post("/social/upload-image")
+@app.post("/social/upload-image", tags=["social"], summary="Subir imagen")
 async def upload_social_image(file: UploadFile = File(...), user=Depends(require_admin)):
-    """Upload an image to Supabase Storage for social media posts."""
+    """Sube una imagen a Supabase Storage para publicaciones de redes sociales. Máximo 10MB. Solo admin."""
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Solo se permiten imágenes")
 
@@ -3494,9 +3582,9 @@ async def upload_social_image(file: UploadFile = File(...), user=Depends(require
     return {"url": public_url, "path": path, "filename": filename}
 
 
-@app.delete("/social/images/{filename}")
+@app.delete("/social/images/{filename}", tags=["social"], summary="Eliminar imagen")
 async def delete_social_image(filename: str, user=Depends(require_admin)):
-    """Delete an image from storage."""
+    """Elimina una imagen del storage de redes sociales. Solo admin."""
     path = f"posts/{filename}"
     try:
         supabase.storage.from_("social-media").remove([path])
@@ -3636,9 +3724,9 @@ STYLE_PROMPTS = {
 }
 
 
-@app.post("/social/generate-text")
+@app.post("/social/generate-text", tags=["social"], summary="Generar texto con IA")
 async def generate_social_text(req: GenerateTextRequest, user=Depends(require_admin)):
-    """Generate social media post text using Gemini AI."""
+    """Genera texto para publicaciones de redes sociales usando Gemini AI. Solo admin."""
     client = get_gemini_client()
     if not client:
         raise HTTPException(status_code=500, detail="Gemini AI no configurado (falta GOOGLE_AI_API_KEY)")
@@ -3694,9 +3782,9 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
         raise HTTPException(status_code=500, detail=f"Error generando texto: {str(e)[:200]}")
 
 
-@app.post("/social/generate-image")
+@app.post("/social/generate-image", tags=["social"], summary="Generar imagen con IA")
 async def generate_social_image(req: GenerateImageRequest, user=Depends(require_admin)):
-    """Generate an image using Gemini Imagen and save to Supabase Storage."""
+    """Genera una imagen con Gemini Imagen y la guarda en Supabase Storage. Solo admin."""
     client = get_gemini_client()
     if not client:
         raise HTTPException(status_code=500, detail="Gemini AI no configurado")
@@ -3736,9 +3824,9 @@ async def generate_social_image(req: GenerateImageRequest, user=Depends(require_
         raise HTTPException(status_code=500, detail=f"Error generando imagen: {str(e)[:200]}")
 
 
-@app.post("/social/generate-calendar")
+@app.post("/social/generate-calendar", tags=["social"], summary="Generar calendario editorial")
 async def generate_social_calendar(req: GenerateCalendarRequest, user=Depends(require_admin)):
-    """Generate a content calendar using Gemini AI."""
+    """Genera un calendario editorial de contenido para redes sociales usando Gemini AI. Solo admin."""
     client = get_gemini_client()
     if not client:
         raise HTTPException(status_code=500, detail="Gemini AI no configurado")
@@ -3801,9 +3889,9 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
 
 # === HEALTH CHECK & MONITORING ===
 
-@app.get("/health")
+@app.get("/health", tags=["health"], summary="Health check", response_model=HealthCheckResponse)
 async def health_check():
-    """Health check endpoint - verifica DB y servicios."""
+    """Verifica el estado de la base de datos, Sentry, scheduler y uptime del servidor. Devuelve 503 si hay problemas."""
     checks = {}
     healthy = True
 

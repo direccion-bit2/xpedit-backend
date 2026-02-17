@@ -1,0 +1,41 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff
+      - run: ruff check . --config ruff.toml
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      SUPABASE_URL: "https://fake.supabase.co"
+      SUPABASE_KEY: "fake-key"
+      SUPABASE_SERVICE_KEY: "fake-service-key"
+      SUPABASE_JWT_SECRET: "fake-jwt-secret"
+      GOOGLE_API_KEY: "fake-key"
+      STRIPE_SECRET_KEY: "fake-key"
+      STRIPE_WEBHOOK_SECRET: "fake-secret"
+      RESEND_API_KEY: "fake-key"
+      RESEND_WEBHOOK_SECRET: "fake-secret"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - run: pip install pytest pytest-asyncio httpx
+      - run: pytest tests/ -v --tb=short
