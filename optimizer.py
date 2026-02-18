@@ -1,6 +1,6 @@
 """
 Xpedit - Motor de Optimización de Rutas
-Usa Google OR-Tools para resolver el Vehicle Routing Problem (VRP)
+Solvers: PyVRP (principal, 0.22% gap) > VROOM (fallback rápido) > OR-Tools (fallback final)
 Incluye: ETA, clustering por zonas, asignación inteligente, multi-vehicle
 """
 
@@ -456,13 +456,13 @@ def hybrid_optimize_route(
     stop_time_minutes: float = 5.0,
 ) -> Dict[str, Any]:
     """
-    Optimizador híbrido: selecciona el mejor solver según el tamaño del problema.
+    Optimizador híbrido: SIEMPRE usa el mejor solver disponible (PyVRP).
 
-    - N <= 25: VROOM (instantáneo, <500ms)
-    - 25 < N <= 500: PyVRP (5-30s, calidad 0.22% gap)
-    - Fallback: OR-Tools (función optimize_route original)
+    Prioridad: PyVRP (mejor calidad, 0.22% gap) > VROOM > OR-Tools
+    El usuario espera unos segundos más a cambio de la mejor ruta posible.
 
-    Siempre retorna un resultado válido gracias al fallback.
+    Fallback chain: PyVRP → VROOM → OR-Tools
+    Siempre retorna un resultado válido.
     """
     n = len(locations)
 
@@ -482,32 +482,22 @@ def hybrid_optimize_route(
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
 
-    # Select solver based on problem size
-    if n <= 25 and HAS_VROOM:
+    # === PRIORITY 1: PyVRP (best quality) ===
+    if HAS_PYVRP:
         try:
-            logger.info(f"Hybrid optimizer: using VROOM for {n} stops")
-            result = solve_with_vroom(
-                locations=locations,
-                depot_index=depot_index,
-                distance_matrix=distance_matrix,
-            )
-            if result.get("success"):
-                return result
-            logger.warning(f"VROOM failed: {result.get('error')}, falling back")
-        except Exception as e:
-            logger.error(f"VROOM crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
-
-    if n > 25 and HAS_PYVRP:
-        try:
-            # Adaptive time limit based on problem size
-            if n <= 50:
+            # Generous time limits - quality over speed
+            if n <= 15:
                 time_limit = 5
+            elif n <= 30:
+                time_limit = 8
+            elif n <= 50:
+                time_limit = 12
             elif n <= 100:
-                time_limit = 10
-            elif n <= 200:
                 time_limit = 20
-            else:
+            elif n <= 200:
                 time_limit = 30
+            else:
+                time_limit = 45
 
             logger.info(f"Hybrid optimizer: using PyVRP for {n} stops (time_limit={time_limit}s)")
             result = solve_with_pyvrp(
@@ -518,27 +508,26 @@ def hybrid_optimize_route(
             )
             if result.get("success"):
                 return result
-            logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+            logger.warning(f"PyVRP failed: {result.get('error')}, falling back to VROOM")
         except Exception as e:
-            logger.error(f"PyVRP crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
+            logger.error(f"PyVRP crashed: {type(e).__name__}: {e}, falling back to VROOM")
 
-    # Also try PyVRP for small problems if VROOM is not available
-    if n <= 25 and not HAS_VROOM and HAS_PYVRP:
+    # === PRIORITY 2: VROOM (fast fallback) ===
+    if HAS_VROOM:
         try:
-            logger.info(f"Hybrid optimizer: VROOM unavailable, using PyVRP for {n} stops")
-            result = solve_with_pyvrp(
+            logger.info(f"Hybrid optimizer: using VROOM fallback for {n} stops")
+            result = solve_with_vroom(
                 locations=locations,
                 depot_index=depot_index,
                 distance_matrix=distance_matrix,
-                time_limit_s=3,
             )
             if result.get("success"):
                 return result
-            logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+            logger.warning(f"VROOM failed: {result.get('error')}, falling back to OR-Tools")
         except Exception as e:
-            logger.error(f"PyVRP crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
+            logger.error(f"VROOM crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
 
-    # Fallback: OR-Tools (always available)
+    # === PRIORITY 3: OR-Tools (always available) ===
     logger.info(f"Hybrid optimizer: using OR-Tools fallback for {n} stops")
     result = optimize_route(
         locations=locations,
