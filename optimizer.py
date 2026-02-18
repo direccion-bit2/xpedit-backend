@@ -319,7 +319,7 @@ def solve_with_vroom(
     # solution.routes is a pandas DataFrame with columns: vehicle_id, type, id, location_index, etc.
     routes_df = solution.routes
     job_rows = routes_df[routes_df["type"] == "job"]
-    optimized_route = []
+    optimized_route = [locations[depot_index]]  # Start with depot for consistency with OR-Tools
     for _, row in job_rows.iterrows():
         job_id = int(row["id"])
         optimized_route.append(locations[job_id])
@@ -421,7 +421,7 @@ def solve_with_pyvrp(
 
     # Extract route
     # route.visits() returns indices into model.locations
-    optimized_route = []
+    optimized_route = [locations[depot_index]]  # Start with depot for consistency with OR-Tools
     for route in result.best.routes():
         for loc_idx in route.visits():
             orig_idx = pyvrp_to_orig[loc_idx]
