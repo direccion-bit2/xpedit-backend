@@ -499,50 +499,59 @@ def hybrid_optimize_route(
 
     # Select solver based on problem size
     if n <= 25 and HAS_VROOM:
-        logger.info(f"Hybrid optimizer: using VROOM for {n} stops")
-        result = solve_with_vroom(
-            locations=locations,
-            depot_index=depot_index,
-            distance_matrix=distance_matrix,
-        )
-        if result.get("success"):
-            return result
-        logger.warning(f"VROOM failed: {result.get('error')}, falling back")
+        try:
+            logger.info(f"Hybrid optimizer: using VROOM for {n} stops")
+            result = solve_with_vroom(
+                locations=locations,
+                depot_index=depot_index,
+                distance_matrix=distance_matrix,
+            )
+            if result.get("success"):
+                return result
+            logger.warning(f"VROOM failed: {result.get('error')}, falling back")
+        except Exception as e:
+            logger.error(f"VROOM crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
 
     if n > 25 and HAS_PYVRP:
-        # Adaptive time limit based on problem size
-        if n <= 50:
-            time_limit = 5
-        elif n <= 100:
-            time_limit = 10
-        elif n <= 200:
-            time_limit = 20
-        else:
-            time_limit = 30
+        try:
+            # Adaptive time limit based on problem size
+            if n <= 50:
+                time_limit = 5
+            elif n <= 100:
+                time_limit = 10
+            elif n <= 200:
+                time_limit = 20
+            else:
+                time_limit = 30
 
-        logger.info(f"Hybrid optimizer: using PyVRP for {n} stops (time_limit={time_limit}s)")
-        result = solve_with_pyvrp(
-            locations=locations,
-            depot_index=depot_index,
-            distance_matrix=distance_matrix,
-            time_limit_s=time_limit,
-        )
-        if result.get("success"):
-            return result
-        logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+            logger.info(f"Hybrid optimizer: using PyVRP for {n} stops (time_limit={time_limit}s)")
+            result = solve_with_pyvrp(
+                locations=locations,
+                depot_index=depot_index,
+                distance_matrix=distance_matrix,
+                time_limit_s=time_limit,
+            )
+            if result.get("success"):
+                return result
+            logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+        except Exception as e:
+            logger.error(f"PyVRP crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
 
     # Also try PyVRP for small problems if VROOM is not available
     if n <= 25 and not HAS_VROOM and HAS_PYVRP:
-        logger.info(f"Hybrid optimizer: VROOM unavailable, using PyVRP for {n} stops")
-        result = solve_with_pyvrp(
-            locations=locations,
-            depot_index=depot_index,
-            distance_matrix=distance_matrix,
-            time_limit_s=3,
-        )
-        if result.get("success"):
-            return result
-        logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+        try:
+            logger.info(f"Hybrid optimizer: VROOM unavailable, using PyVRP for {n} stops")
+            result = solve_with_pyvrp(
+                locations=locations,
+                depot_index=depot_index,
+                distance_matrix=distance_matrix,
+                time_limit_s=3,
+            )
+            if result.get("success"):
+                return result
+            logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+        except Exception as e:
+            logger.error(f"PyVRP crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
 
     # Fallback: OR-Tools (always available)
     logger.info(f"Hybrid optimizer: using OR-Tools fallback for {n} stops")
