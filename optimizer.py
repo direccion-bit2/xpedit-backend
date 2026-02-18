@@ -286,51 +286,45 @@ def solve_with_vroom(
     # Create VROOM problem instance
     problem = vroom.Input()
 
-    # Add matrix (VROOM expects it as-is)
-    matrix = vroom.Matrix(n)
-    for i in range(n):
-        for j in range(n):
-            matrix[i][j] = distance_matrix[i][j]
-    problem.set_durations_matrix(profile="car", matrix=matrix)
-    problem.set_costs_matrix(profile="car", matrix=matrix)
+    # Set matrices (pyvroom accepts list-of-lists directly)
+    problem.set_durations_matrix(profile="car", matrix_input=distance_matrix)
+    problem.set_distances_matrix(profile="car", matrix_input=distance_matrix)
 
     # Add vehicle starting and ending at depot
-    problem.add_vehicle(
-        vroom.Vehicle(
-            id=0,
-            start=depot_index,
-            end=depot_index,
-            profile="car",
-        )
-    )
+    problem.add_vehicle([
+        vroom.Vehicle(id=0, start=depot_index, end=depot_index, profile="car")
+    ])
 
     # Add jobs (all stops except depot)
+    jobs = []
     for i in range(n):
         if i == depot_index:
             continue
-        job_kwargs = {"id": i, "location": i}
-        # Time windows if present
         tw_start = _parse_time_to_minutes(locations[i].get('time_window_start'))
         tw_end = _parse_time_to_minutes(locations[i].get('time_window_end'))
         if tw_start is not None and tw_end is not None:
-            # VROOM uses seconds for time windows
-            job_kwargs["time_windows"] = [vroom.TimeWindow(tw_start * 60, tw_end * 60)]
-        problem.add_job(vroom.Job(**job_kwargs))
+            jobs.append(vroom.Job(id=i, location=i,
+                                  time_windows=[vroom.TimeWindow(tw_start * 60, tw_end * 60)]))
+        else:
+            jobs.append(vroom.Job(id=i, location=i))
+    problem.add_job(jobs)
 
     # Solve
     solution = problem.solve(exploration_level=5, nb_threads=4)
 
-    if solution.routes is None or len(solution.routes) == 0:
-        return {"success": False, "error": "VROOM no encontró solución"}
+    if solution.summary.unassigned > 0:
+        return {"success": False, "error": f"VROOM: {solution.summary.unassigned} paradas sin asignar"}
 
-    # Extract route order
-    route_steps = solution.routes[0].steps
+    # Extract route order from DataFrame
+    # solution.routes is a pandas DataFrame with columns: vehicle_id, type, id, location_index, etc.
+    routes_df = solution.routes
+    job_rows = routes_df[routes_df["type"] == "job"]
     optimized_route = []
-    for step in route_steps:
-        if step.step_type == vroom.STEP_TYPE.JOB:
-            optimized_route.append(locations[step.id])
+    for _, row in job_rows.iterrows():
+        job_id = int(row["id"])
+        optimized_route.append(locations[job_id])
 
-    total_distance = solution.summary.cost
+    total_distance = int(solution.summary.distance)
 
     return {
         "success": True,
@@ -379,50 +373,53 @@ def solve_with_pyvrp(
     # Build PyVRP model
     model = PyVRPModel()
 
-    # Add depot
+    # Add depot (x,y are arbitrary when using custom matrix, but required)
     depot_loc = locations[depot_index]
-    model.add_depot(
+    depot = model.add_depot(
         x=int(depot_loc['lng'] * 100000),
         y=int(depot_loc['lat'] * 100000),
     )
 
     # Add clients (all stops except depot)
-    client_indices = []  # maps PyVRP client index -> original location index
+    # Track: pyvrp_client_refs[i] -> (client_obj, original_location_index)
+    client_refs = []
     for i in range(n):
         if i == depot_index:
             continue
         loc = locations[i]
-        client_kwargs = {
+        kwargs = {
             "x": int(loc['lng'] * 100000),
             "y": int(loc['lat'] * 100000),
-            "delivery": [1],  # unit demand
+            "delivery": 1,
         }
-        # Time windows if present (PyVRP uses integer time)
         tw_start = _parse_time_to_minutes(loc.get('time_window_start'))
         tw_end = _parse_time_to_minutes(loc.get('time_window_end'))
         if tw_start is not None and tw_end is not None:
-            client_kwargs["tw_early"] = tw_start
-            client_kwargs["tw_late"] = tw_end
-        model.add_client(**client_kwargs)
-        client_indices.append(i)
+            kwargs["tw_early"] = tw_start
+            kwargs["tw_late"] = tw_end
+        client = model.add_client(**kwargs)
+        client_refs.append((client, i))
 
-    # Add vehicle type
-    model.add_vehicle_type(
-        num_available=1,
-        capacity=[n],  # enough capacity for all stops
-    )
+    # Add vehicle type (single vehicle, enough capacity)
+    model.add_vehicle_type(num_available=1, capacity=n)
 
-    # Add distance/duration matrix edges
-    # PyVRP expects: index 0 = depot, 1..n-1 = clients (in order added)
-    # Build mapping: pyvrp_idx -> original_idx
-    pyvrp_to_orig = [depot_index] + client_indices
+    # Add edges between ALL location pairs using model.locations
+    # model.locations = [depot, client0, client1, ...] in order added
+    # We need to map each model location back to our original distance_matrix index
+    all_locations = list(model.locations)
 
-    for i in range(len(pyvrp_to_orig)):
-        for j in range(len(pyvrp_to_orig)):
-            orig_i = pyvrp_to_orig[i]
-            orig_j = pyvrp_to_orig[j]
+    # Build mapping: model_location -> original_index
+    loc_to_orig = {}
+    loc_to_orig[id(depot)] = depot_index
+    for client_obj, orig_idx in client_refs:
+        loc_to_orig[id(client_obj)] = orig_idx
+
+    for frm in all_locations:
+        for to in all_locations:
+            orig_i = loc_to_orig[id(frm)]
+            orig_j = loc_to_orig[id(to)]
             dist = distance_matrix[orig_i][orig_j]
-            model.add_edge(i, j, distance=dist, duration=dist)
+            model.add_edge(frm, to, distance=dist, duration=dist)
 
     # Solve
     result = model.solve(stop=MaxRuntime(time_limit_s), display=False)
@@ -431,18 +428,16 @@ def solve_with_pyvrp(
         return {"success": False, "error": "PyVRP no encontró solución factible"}
 
     # Extract route
+    # route.visits() returns indices into model.locations (depot=0, clients=1..n-1)
     optimized_route = []
-    total_distance = 0
-
     for route in result.best.routes():
-        visits = route.visits()
-        for visit_idx in visits:
-            # visit_idx is 0-based client index (not including depot)
-            orig_idx = client_indices[visit_idx]
+        for loc_idx in route.visits():
+            # loc_idx indexes into all_locations; skip depot (idx 0)
+            model_loc = all_locations[loc_idx]
+            orig_idx = loc_to_orig[id(model_loc)]
             optimized_route.append(locations[orig_idx])
 
-    # Calculate total distance from the solution
-    total_distance = int(result.best.distance())
+    total_distance = result.best.distance
 
     return {
         "success": True,
