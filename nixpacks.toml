@@ -1,0 +1,8 @@
+[phases.setup]
+aptPkgs = ["cmake", "g++"]
+
+[phases.install]
+cmds = [
+    "pip install -r requirements.txt",
+    "pip install pyvrp>=0.9.0 pyvroom>=0.8.0 || echo 'Optional solvers (pyvrp/pyvroom) not available, using OR-Tools fallback'"
+]

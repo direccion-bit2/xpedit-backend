@@ -18,18 +18,20 @@ logger = logging.getLogger("xpedit")
 try:
     import vroom
     HAS_VROOM = True
-except ImportError:
+    logger.info("VROOM solver loaded successfully")
+except Exception as e:
     HAS_VROOM = False
-    logger.warning("pyvroom not installed - VROOM solver unavailable")
+    logger.warning(f"VROOM solver unavailable: {e}")
 
 try:
     import pyvrp
     from pyvrp import Model as PyVRPModel
     from pyvrp.stop import MaxRuntime
     HAS_PYVRP = True
-except ImportError:
+    logger.info("PyVRP solver loaded successfully")
+except Exception as e:
     HAS_PYVRP = False
-    logger.warning("pyvrp not installed - PyVRP solver unavailable")
+    logger.warning(f"PyVRP solver unavailable: {e}")
 
 
 def haversine_distance(coord1: Tuple[float, float], coord2: Tuple[float, float]) -> int:

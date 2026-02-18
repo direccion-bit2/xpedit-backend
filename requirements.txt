@@ -14,8 +14,6 @@ python-multipart==0.0.9
 apscheduler==3.10.4
 google-genai>=1.0.0
 sentry-sdk[fastapi]>=2.0.0
-pyvrp>=0.9.0
-pyvroom>=0.8.0
 
 # Test dependencies
 pytest>=8.0.0
