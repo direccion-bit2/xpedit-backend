@@ -373,16 +373,18 @@ def solve_with_pyvrp(
     # Build PyVRP model
     model = PyVRPModel()
 
-    # Add depot (x,y are arbitrary when using custom matrix, but required)
+    # Position-based mapping: pyvrp_to_orig[pyvrp_idx] -> original location index
+    # PyVRP locations order: [depot, client0, client1, ...] = order added
+    pyvrp_to_orig = [depot_index]
+
+    # Add depot
     depot_loc = locations[depot_index]
-    depot = model.add_depot(
+    model.add_depot(
         x=int(depot_loc['lng'] * 100000),
         y=int(depot_loc['lat'] * 100000),
     )
 
     # Add clients (all stops except depot)
-    # Track: pyvrp_client_refs[i] -> (client_obj, original_location_index)
-    client_refs = []
     for i in range(n):
         if i == depot_index:
             continue
@@ -397,28 +399,18 @@ def solve_with_pyvrp(
         if tw_start is not None and tw_end is not None:
             kwargs["tw_early"] = tw_start
             kwargs["tw_late"] = tw_end
-        client = model.add_client(**kwargs)
-        client_refs.append((client, i))
+        model.add_client(**kwargs)
+        pyvrp_to_orig.append(i)
 
     # Add vehicle type (single vehicle, enough capacity)
     model.add_vehicle_type(num_available=1, capacity=n)
 
-    # Add edges between ALL location pairs using model.locations
-    # model.locations = [depot, client0, client1, ...] in order added
-    # We need to map each model location back to our original distance_matrix index
-    all_locations = list(model.locations)
-
-    # Build mapping: model_location -> original_index
-    loc_to_orig = {}
-    loc_to_orig[id(depot)] = depot_index
-    for client_obj, orig_idx in client_refs:
-        loc_to_orig[id(client_obj)] = orig_idx
-
-    for frm in all_locations:
-        for to in all_locations:
-            orig_i = loc_to_orig[id(frm)]
-            orig_j = loc_to_orig[id(to)]
-            dist = distance_matrix[orig_i][orig_j]
+    # Add edges between ALL location pairs
+    # Use model.locations (returns objects in order: depot, then clients)
+    all_locs = list(model.locations)
+    for i, frm in enumerate(all_locs):
+        for j, to in enumerate(all_locs):
+            dist = distance_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
             model.add_edge(frm, to, distance=dist, duration=dist)
 
     # Solve
@@ -428,13 +420,11 @@ def solve_with_pyvrp(
         return {"success": False, "error": "PyVRP no encontró solución factible"}
 
     # Extract route
-    # route.visits() returns indices into model.locations (depot=0, clients=1..n-1)
+    # route.visits() returns indices into model.locations
     optimized_route = []
     for route in result.best.routes():
         for loc_idx in route.visits():
-            # loc_idx indexes into all_locations; skip depot (idx 0)
-            model_loc = all_locations[loc_idx]
-            orig_idx = loc_to_orig[id(model_loc)]
+            orig_idx = pyvrp_to_orig[loc_idx]
             optimized_route.append(locations[orig_idx])
 
     total_distance = result.best.distance
