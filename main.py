@@ -4182,6 +4182,38 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
 
 # === HEALTH CHECK & MONITORING ===
 
+@app.get("/debug-solvers", tags=["health"], summary="Test solvers")
+async def debug_solvers():
+    """Temporary endpoint to diagnose solver issues."""
+    from optimizer import HAS_VROOM, HAS_PYVRP, solve_with_vroom, solve_with_pyvrp
+    results = {"vroom_available": HAS_VROOM, "pyvrp_available": HAS_PYVRP}
+    test_locs = [
+        {"lat": 40.4168, "lng": -3.7038, "address": "A"},
+        {"lat": 40.4155, "lng": -3.7074, "address": "B"},
+        {"lat": 40.4153, "lng": -3.6845, "address": "C"},
+        {"lat": 40.4203, "lng": -3.7016, "address": "D"},
+    ]
+    test_matrix = [
+        [0, 500, 2000, 300],
+        [500, 0, 2500, 800],
+        [2000, 2500, 0, 1700],
+        [300, 800, 1700, 0],
+    ]
+    if HAS_VROOM:
+        try:
+            r = solve_with_vroom(test_locs, depot_index=0, distance_matrix=test_matrix)
+            results["vroom"] = {"success": r.get("success"), "solver": r.get("solver"), "error": r.get("error")}
+        except Exception as e:
+            results["vroom"] = {"error": f"{type(e).__name__}: {e}"}
+    if HAS_PYVRP:
+        try:
+            r = solve_with_pyvrp(test_locs, depot_index=0, distance_matrix=test_matrix, time_limit_s=2)
+            results["pyvrp"] = {"success": r.get("success"), "solver": r.get("solver"), "error": r.get("error")}
+        except Exception as e:
+            results["pyvrp"] = {"error": f"{type(e).__name__}: {e}"}
+    return results
+
+
 @app.get("/health", tags=["health"], summary="Health check", response_model=HealthCheckResponse)
 async def health_check():
     """Verifica el estado de la base de datos, Sentry, scheduler y uptime del servidor. Devuelve 503 si hay problemas."""
