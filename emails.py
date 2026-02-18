@@ -463,6 +463,65 @@ def send_referral_reward_email(to_email: str, user_name: str, referred_name: str
         return {"success": False, "error": str(e)}
 
 
+def send_upcoming_email(
+    to_email: str,
+    client_name: str,
+    driver_name: str,
+    stops_away: int,
+    tracking_url: Optional[str] = None
+) -> dict:
+    """Email cuando el repartidor está a X paradas del cliente"""
+
+    tracking_button = ""
+    if tracking_url:
+        tracking_button = f"""
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="{tracking_url}" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+                Seguir mi pedido en vivo
+            </a>
+        </div>
+        """
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #eff6ff; border-radius: 50%; padding: 20px;">
+                <span style="font-size: 40px;">📦</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            Tu pedido llega pronto
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{f' <strong>{client_name}</strong>' if client_name else ''},
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Tu repartidor <strong>{driver_name}</strong> esta a <strong>{stops_away} paradas</strong> de llegar a tu direccion.
+        </p>
+
+        {tracking_button}
+
+        <div style="background-color: #f0fdf4; border-radius: 8px; padding: 15px; margin-top: 20px;">
+            <p style="margin: 0; color: #166534; font-size: 14px;">
+                <strong>Consejo:</strong> Asegurate de estar disponible para recibir tu pedido.
+            </p>
+        </div>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"📦 Tu pedido esta a {stops_away} paradas",
+            "html": get_base_template(content, "Pedido en camino")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
     """Email personalizado desde admin"""
     content = f"""

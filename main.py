@@ -46,6 +46,7 @@ from emails import (
     send_delivery_started_email,
     send_plan_activated_email,
     send_referral_reward_email,
+    send_upcoming_email,
     send_welcome_email,
 )
 from optimizer import (
@@ -438,6 +439,7 @@ class StopCreate(BaseModel):
     position: int
     notes: Optional[str] = None
     phone: Optional[str] = None
+    email: Optional[str] = None
     time_window_start: Optional[str] = None
     time_window_end: Optional[str] = None
     packages: Optional[int] = None
@@ -508,6 +510,21 @@ class AdminBroadcastEmailRequest(BaseModel):
     subject: str
     body: str  # HTML body
     target: str = "all"  # all, free, pro, pro_plus
+
+
+class CustomerNotificationRequest(BaseModel):
+    stop_id: Optional[str] = None
+    route_id: Optional[str] = None
+    alert_type: str  # upcoming, en_camino, entregado, failed
+    customer_phone: Optional[str] = None
+    customer_email: Optional[str] = None
+    customer_name: Optional[str] = None
+    driver_name: str
+    stop_address: str
+    tracking_url: Optional[str] = None
+    eta_minutes: Optional[int] = None
+    stops_away: Optional[int] = None
+    photo_url: Optional[str] = None
 
 
 # -- Modelos de respuesta --
@@ -878,6 +895,7 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
             "position": stop.position,
             "notes": stop.notes,
             "phone": stop.phone,
+            "email": stop.email,
             "time_window_start": stop.time_window_start,
             "time_window_end": stop.time_window_end,
             "packages": stop.packages,
@@ -1093,6 +1111,64 @@ async def api_send_delivery_failed_email(request: DeliveryFailedEmailRequest, us
     if not result["success"]:
         raise HTTPException(status_code=500, detail=result.get("error", "Error enviando email"))
     return result
+
+
+@app.post("/notifications/customer/send", tags=["notifications"], summary="Enviar notificacion al cliente")
+async def api_send_customer_notification(request: CustomerNotificationRequest, user=Depends(get_current_user)):
+    """Envía notificación automática al cliente (email). Registra en customer_notifications."""
+    sent_via = []
+
+    # Enviar email si hay email del cliente
+    if request.customer_email:
+        try:
+            client_name = request.customer_name or ""
+            if request.alert_type == "upcoming":
+                result = send_upcoming_email(
+                    request.customer_email, client_name, request.driver_name,
+                    request.stops_away or 3, request.tracking_url
+                )
+            elif request.alert_type == "en_camino":
+                eta_text = f"~{request.eta_minutes} minutos" if request.eta_minutes else None
+                result = send_delivery_started_email(
+                    request.customer_email, client_name, request.driver_name,
+                    eta_text, request.tracking_url
+                )
+            elif request.alert_type == "entregado":
+                from datetime import datetime
+                result = send_delivery_completed_email(
+                    request.customer_email, client_name,
+                    datetime.now().strftime("%d/%m/%Y %H:%M")
+                )
+            elif request.alert_type == "failed":
+                result = send_delivery_failed_email(
+                    request.customer_email, client_name
+                )
+            else:
+                result = {"success": False, "error": f"Unknown alert_type: {request.alert_type}"}
+
+            if result.get("success"):
+                sent_via.append("email")
+        except Exception as e:
+            logger.warning(f"Failed to send customer email: {e}")
+
+    # Registrar en customer_notifications
+    notification_id = None
+    if request.stop_id:
+        try:
+            notif = supabase.table("customer_notifications").insert({
+                "stop_id": request.stop_id,
+                "route_id": request.route_id,
+                "driver_id": user["id"],
+                "alert_type": request.alert_type,
+                "phone": request.customer_phone or "",
+                "message": f"[{request.alert_type}] {request.stop_address}",
+            }).execute()
+            if notif.data:
+                notification_id = notif.data[0].get("id")
+        except Exception as e:
+            logger.warning(f"Failed to log customer notification: {e}")
+
+    return {"sent_via": sent_via, "notification_id": notification_id}
 
 
 @app.post("/email/daily-summary", tags=["email"], summary="Email resumen diario")
