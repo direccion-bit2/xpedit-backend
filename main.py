@@ -5,9 +5,12 @@ Xpedit API - Backend de optimización de rutas
 import hashlib
 import json
 import logging
+import math
 import os
 import random
+import re
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -77,6 +80,78 @@ SUPABASE_JWT_SECRET = _raw_jwt + "=" * ((4 - len(_raw_jwt) % 4) % 4) if _raw_jwt
 def safe_first(result) -> Optional[dict]:
     """Safely get first result from Supabase query, returns None if empty"""
     return result.data[0] if result.data else None
+
+
+# ========== ADDRESS NORMALIZATION ==========
+_STREET_PREFIXES = {
+    "c/": "calle", "cl": "calle", "cl.": "calle",
+    "av": "avenida", "av.": "avenida", "avda": "avenida", "avda.": "avenida",
+    "pz": "plaza", "pza": "plaza", "pza.": "plaza", "pl": "plaza", "pl.": "plaza",
+    "ps": "paseo", "ps.": "paseo", "pso": "paseo", "pso.": "paseo",
+    "ctra": "carretera", "ctra.": "carretera", "crta": "carretera",
+    "rda": "ronda", "rda.": "ronda",
+    "urb": "urbanizacion", "urb.": "urbanizacion",
+    "pol": "poligono", "pol.": "poligono",
+}
+
+
+def normalize_address(address: str) -> str:
+    """Normalize a Spanish address for matching."""
+    text = unicodedata.normalize("NFD", address.lower())
+    text = re.sub(r"[\u0300-\u036f]", "", text)
+    text = re.sub(r"[,.\-/]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()
+    if words and words[0] in _STREET_PREFIXES:
+        words[0] = _STREET_PREFIXES[words[0]]
+    text = " ".join(words)
+    text = re.sub(r"\b(de|del|la|las|los|el)\b", "", text)
+    text = re.sub(r"\b\d{5}\b", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Distance in km between two lat/lng points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def enrich_stops_from_directory(company_id: str, stops: list[dict]) -> tuple[list[dict], int]:
+    """Enrich stops with customer data from company directory. Returns (stops, match_count)."""
+    if not company_id:
+        return stops, 0
+    directory = supabase.table("customer_directory").select(
+        "normalized_address, lat, lng, phone, email, customer_name"
+    ).eq("company_id", company_id).execute()
+    if not directory.data:
+        return stops, 0
+    addr_lookup = {}
+    geo_entries = []
+    for entry in directory.data:
+        addr_lookup[entry["normalized_address"]] = entry
+        if entry.get("lat") and entry.get("lng"):
+            geo_entries.append(entry)
+    match_count = 0
+    for stop in stops:
+        if stop.get("phone") and stop.get("email"):
+            continue
+        norm = normalize_address(stop.get("address", ""))
+        match = addr_lookup.get(norm)
+        if not match and stop.get("lat") and stop.get("lng"):
+            for entry in geo_entries:
+                if _haversine_km(stop["lat"], stop["lng"], entry["lat"], entry["lng"]) <= 0.05:
+                    match = entry
+                    break
+        if match:
+            if not stop.get("phone") and match.get("phone"):
+                stop["phone"] = match["phone"]
+            if not stop.get("email") and match.get("email"):
+                stop["email"] = match["email"]
+            match_count += 1
+    return stops, match_count
 
 
 # Webhook idempotency (in-memory, single instance)
@@ -865,25 +940,26 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
 @app.post("/routes", tags=["routes"], summary="Crear ruta")
 async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     """Crea una nueva ruta con sus paradas. El conductor debe ser el usuario autenticado (salvo admin)."""
+    route_request = route  # Save original request before reassignment
     # Verify user can create route for this driver
     if user["role"] != "admin":
         user_driver_id = await get_user_driver_id(user)
-        if route.driver_id != user_driver_id:
+        if route_request.driver_id != user_driver_id:
             raise HTTPException(status_code=403, detail="No puedes crear rutas para otro conductor")
     # Crear la ruta
     route_data = {
-        "driver_id": route.driver_id,
-        "name": route.name or f"Ruta {datetime.now().strftime('%d/%m %H:%M')}",
-        "total_distance_km": route.total_distance_km,
-        "total_stops": len(route.stops),
+        "driver_id": route_request.driver_id,
+        "name": route_request.name or f"Ruta {datetime.now().strftime('%d/%m %H:%M')}",
+        "total_distance_km": route_request.total_distance_km,
+        "total_stops": len(route_request.stops),
         "status": "pending"
     }
 
     route_result = supabase.table("routes").insert(route_data).execute()
-    route = safe_first(route_result)
-    if not route:
+    route_row = safe_first(route_result)
+    if not route_row:
         raise HTTPException(status_code=500, detail="Error al crear la ruta")
-    route_id = route["id"]
+    route_id = route_row["id"]
 
     # Crear las paradas
     stops_data = [
@@ -900,8 +976,19 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
             "time_window_end": stop.time_window_end,
             "packages": stop.packages,
         }
-        for stop in route.stops
+        for stop in route_request.stops
     ]
+
+    # Enriquecer stops desde el directorio de clientes de la empresa
+    try:
+        driver_q = supabase.table("drivers").select("company_id").eq("id", route_request.driver_id).limit(1).execute()
+        company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+        if company_id:
+            stops_data, enriched = enrich_stops_from_directory(company_id, stops_data)
+            if enriched:
+                logger.info(f"Enriched {enriched} stops from customer directory")
+    except Exception as e:
+        logger.warning(f"Stop enrichment failed: {e}")
 
     supabase.table("stops").insert(stops_data).execute()
 
@@ -1169,6 +1256,40 @@ async def api_send_customer_notification(request: CustomerNotificationRequest, u
             logger.warning(f"Failed to log customer notification: {e}")
 
     return {"sent_via": sent_via, "notification_id": notification_id}
+
+
+class EnrichExistingRequest(BaseModel):
+    company_id: str
+
+
+@app.post("/customer-directory/enrich-existing", tags=["directory"], summary="Enriquecer paradas existentes")
+async def enrich_existing_stops(request: EnrichExistingRequest, user=Depends(get_current_user)):
+    """Enriquece paradas de hoy con datos del directorio de clientes de la empresa."""
+    if user["role"] not in ("admin", "dispatcher"):
+        raise HTTPException(status_code=403, detail="Solo admin o dispatcher")
+    today = datetime.now().strftime("%Y-%m-%d")
+    drivers = supabase.table("drivers").select("id").eq("company_id", request.company_id).execute()
+    driver_ids = [d["id"] for d in (drivers.data or [])]
+    if not driver_ids:
+        return {"enriched": 0}
+    routes = supabase.table("routes").select("id").in_("driver_id", driver_ids).gte("created_at", today).execute()
+    route_ids = [r["id"] for r in (routes.data or [])]
+    if not route_ids:
+        return {"enriched": 0}
+    stops = supabase.table("stops").select("id, address, lat, lng, phone, email").in_("route_id", route_ids).execute()
+    stops_data = stops.data or []
+    enriched_stops, match_count = enrich_stops_from_directory(request.company_id, stops_data)
+    updated = 0
+    for stop in enriched_stops:
+        fields = {}
+        if stop.get("phone"):
+            fields["phone"] = stop["phone"]
+        if stop.get("email"):
+            fields["email"] = stop["email"]
+        if fields and stop.get("id"):
+            supabase.table("stops").update(fields).eq("id", stop["id"]).execute()
+            updated += 1
+    return {"enriched": updated}
 
 
 @app.post("/email/daily-summary", tags=["email"], summary="Email resumen diario")
