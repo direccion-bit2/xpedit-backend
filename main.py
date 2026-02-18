@@ -461,6 +461,7 @@ class Location(BaseModel):
 class OptimizeRequest(BaseModel):
     locations: List[Location] = Field(..., min_length=1)
     start_index: Optional[int] = Field(default=0)
+    solver: Optional[str] = Field(default=None, description="Force solver: vroom, pyvrp, ortools")
 
 
 class MultiVehicleOptimizeRequest(BaseModel):
@@ -725,11 +726,22 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
     # Intentar obtener distancias reales por carretera (OSRM)
     road_matrix = await get_road_distance_matrix(locations_data)
 
-    result = hybrid_optimize_route(
-        locations=locations_data,
-        depot_index=request.start_index or 0,
-        distance_matrix=road_matrix,
-    )
+    # Allow forcing a specific solver for testing/comparison
+    if request.solver == "vroom":
+        from optimizer import solve_with_vroom
+        result = solve_with_vroom(locations_data, request.start_index or 0, road_matrix)
+    elif request.solver == "pyvrp":
+        from optimizer import solve_with_pyvrp
+        result = solve_with_pyvrp(locations_data, request.start_index or 0, road_matrix)
+    elif request.solver == "ortools":
+        result = optimize_route(locations_data, request.start_index or 0, distance_matrix=road_matrix)
+        result["solver"] = "ortools"
+    else:
+        result = hybrid_optimize_route(
+            locations=locations_data,
+            depot_index=request.start_index or 0,
+            distance_matrix=road_matrix,
+        )
     if road_matrix:
         result["distance_source"] = "road"
     else:
