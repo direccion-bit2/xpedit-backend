@@ -461,7 +461,8 @@ class Location(BaseModel):
 class OptimizeRequest(BaseModel):
     locations: List[Location] = Field(..., min_length=1)
     start_index: Optional[int] = Field(default=0)
-    round_trip: bool = Field(default=False, description="If true, optimize return to start point")
+    round_trip: bool = Field(default=False, description="Deprecated: use strategy instead")
+    strategy: Optional[str] = Field(default=None, description="nearest_first, farthest_first, businesses_first, round_trip")
     solver: Optional[str] = Field(default=None, description="Force solver: vroom, pyvrp, ortools")
 
 
@@ -725,33 +726,96 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
     locations_data = [loc.model_dump() for loc in request.locations]
     depot_index = request.start_index or 0
 
+    # Determine strategy (new field takes precedence over deprecated round_trip)
+    strategy = request.strategy or ("round_trip" if request.round_trip else "nearest_first")
+
     # Intentar obtener distancias reales por carretera (OSRM)
     road_matrix = await get_road_distance_matrix(locations_data)
 
-    # Para ruta abierta (sin vuelta al inicio): poner distancias de vuelta al depot a 0
-    # Esto hace que el solver no considere el coste de volver, optimizando solo la ida
-    effective_matrix = road_matrix
-    if not request.round_trip and effective_matrix:
-        effective_matrix = [row[:] for row in road_matrix]  # Deep copy
-        for i in range(len(effective_matrix)):
-            effective_matrix[i][depot_index] = 0
+    # For businesses_first: split into business and non-business stops, optimize separately
+    if strategy == "businesses_first" and road_matrix:
+        business_indices = [i for i, loc in enumerate(locations_data) if i != depot_index and loc.get("isBusiness")]
+        non_business_indices = [i for i, loc in enumerate(locations_data) if i != depot_index and not loc.get("isBusiness")]
 
-    # Allow forcing a specific solver for testing/comparison
-    if request.solver == "vroom":
-        from optimizer import solve_with_vroom
-        result = solve_with_vroom(locations_data, depot_index, effective_matrix)
-    elif request.solver == "pyvrp":
-        from optimizer import solve_with_pyvrp
-        result = solve_with_pyvrp(locations_data, depot_index, effective_matrix)
-    elif request.solver == "ortools":
-        result = optimize_route(locations_data, depot_index, distance_matrix=effective_matrix)
-        result["solver"] = "ortools"
-    else:
-        result = hybrid_optimize_route(
-            locations=locations_data,
-            depot_index=depot_index,
-            distance_matrix=effective_matrix,
-        )
+        if business_indices:
+            # Phase 1: Optimize business stops (open-ended from depot)
+            biz_locs = [locations_data[depot_index]] + [locations_data[i] for i in business_indices]
+            biz_matrix_size = len(biz_locs)
+            biz_idx_map = [depot_index] + business_indices
+            biz_matrix = [[road_matrix[biz_idx_map[r]][biz_idx_map[c]] for c in range(biz_matrix_size)] for r in range(biz_matrix_size)]
+            # Open-ended: zero return to depot
+            for r in range(biz_matrix_size):
+                biz_matrix[r][0] = 0
+            biz_result = hybrid_optimize_route(biz_locs, 0, biz_matrix)
+
+            # Phase 2: Optimize non-business stops (open-ended from last business stop)
+            if non_business_indices:
+                last_biz = biz_result["route"][-1] if biz_result.get("success") and biz_result["route"] else locations_data[depot_index]
+                # Find the original index of the last business stop
+                last_biz_orig_idx = next((i for i, loc in enumerate(locations_data) if loc.get("id") == last_biz.get("id")), depot_index)
+                non_biz_locs = [locations_data[last_biz_orig_idx]] + [locations_data[i] for i in non_business_indices]
+                non_biz_size = len(non_biz_locs)
+                non_biz_idx_map = [last_biz_orig_idx] + non_business_indices
+                non_biz_matrix = [[road_matrix[non_biz_idx_map[r]][non_biz_idx_map[c]] for c in range(non_biz_size)] for r in range(non_biz_size)]
+                for r in range(non_biz_size):
+                    non_biz_matrix[r][0] = 0
+                non_biz_result = hybrid_optimize_route(non_biz_locs, 0, non_biz_matrix)
+                # Combine: depot + business route + non-business route (skip depot of each)
+                combined_route = [locations_data[depot_index]]
+                if biz_result.get("success"):
+                    combined_route += biz_result["route"][1:]  # Skip depot
+                if non_biz_result.get("success"):
+                    combined_route += non_biz_result["route"][1:]  # Skip fake depot
+                total_dist = (biz_result.get("total_distance_meters", 0) or 0) + (non_biz_result.get("total_distance_meters", 0) or 0)
+                result = {
+                    "success": True, "route": combined_route,
+                    "total_distance_meters": total_dist,
+                    "total_distance_km": round(total_dist / 1000, 2),
+                    "num_stops": len(combined_route),
+                    "solver": biz_result.get("solver", "pyvrp"),
+                    "strategy": "businesses_first",
+                    "has_time_windows": False,
+                    "message": f"Negocios primero: {len(business_indices)} negocios + {len(non_business_indices)} particulares"
+                }
+            else:
+                result = biz_result
+                result["strategy"] = "businesses_first"
+        else:
+            # No business stops, just optimize normally (nearest_first)
+            strategy = "nearest_first"
+
+    if strategy != "businesses_first":
+        # Open-ended route: zero return-to-depot distances
+        effective_matrix = road_matrix
+        if strategy != "round_trip" and effective_matrix:
+            effective_matrix = [row[:] for row in road_matrix]  # Deep copy
+            for i in range(len(effective_matrix)):
+                effective_matrix[i][depot_index] = 0
+
+        # Allow forcing a specific solver for testing/comparison
+        if request.solver == "vroom":
+            from optimizer import solve_with_vroom
+            result = solve_with_vroom(locations_data, depot_index, effective_matrix)
+        elif request.solver == "pyvrp":
+            from optimizer import solve_with_pyvrp
+            result = solve_with_pyvrp(locations_data, depot_index, effective_matrix)
+        elif request.solver == "ortools":
+            result = optimize_route(locations_data, depot_index, distance_matrix=effective_matrix)
+            result["solver"] = "ortools"
+        else:
+            result = hybrid_optimize_route(
+                locations=locations_data,
+                depot_index=depot_index,
+                distance_matrix=effective_matrix,
+            )
+
+        # farthest_first: optimize then reverse (keep depot at start)
+        if strategy == "farthest_first" and result.get("success") and len(result.get("route", [])) > 2:
+            depot = result["route"][0]
+            result["route"] = [depot] + list(reversed(result["route"][1:]))
+
+        result["strategy"] = strategy
+
     if road_matrix:
         result["distance_source"] = "road"
     else:
