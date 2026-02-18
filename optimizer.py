@@ -427,7 +427,7 @@ def solve_with_pyvrp(
             orig_idx = pyvrp_to_orig[loc_idx]
             optimized_route.append(locations[orig_idx])
 
-    total_distance = result.best.distance
+    total_distance = result.best.distance()
 
     return {
         "success": True,
