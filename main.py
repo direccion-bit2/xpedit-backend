@@ -650,22 +650,67 @@ async def download_apk(request: Request):
 
 
 OSRM_URL = os.getenv("OSRM_URL", "http://router.project-osrm.org")
+OSRM_MAX_RETRIES = 3
+OSRM_RETRY_DELAYS = [1.0, 2.0, 4.0]  # exponential backoff
 
 
 async def get_road_distance_matrix(locations: list) -> list | None:
-    """Obtiene matriz de distancias reales por carretera usando OSRM."""
-    if len(locations) < 2 or len(locations) > 200:
+    """
+    Obtiene matriz de distancias reales por carretera usando OSRM.
+    Incluye reintentos con backoff exponencial y manejo de rate limits.
+    Retorna None (fallback a Haversine) si OSRM no responde tras reintentos.
+    """
+    import asyncio
+
+    n = len(locations)
+    if n < 2 or n > 200:
         return None
-    try:
-        coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
-        url = f"{OSRM_URL}/table/v1/driving/{coords}?annotations=distance"
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=30.0)
-            data = resp.json()
-            if data.get("code") == "Ok" and data.get("distances"):
-                return [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
-    except Exception:
-        pass
+
+    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+    url = f"{OSRM_URL}/table/v1/driving/{coords}?annotations=distance"
+
+    for attempt in range(OSRM_MAX_RETRIES):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=30.0)
+
+                # Rate limited - wait and retry
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After", OSRM_RETRY_DELAYS[attempt]))
+                    logger.warning(f"OSRM rate limited (429), retry {attempt+1}/{OSRM_MAX_RETRIES} in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                # Server error - retry with backoff
+                if resp.status_code >= 500:
+                    logger.warning(f"OSRM server error ({resp.status_code}), retry {attempt+1}/{OSRM_MAX_RETRIES}")
+                    await asyncio.sleep(OSRM_RETRY_DELAYS[attempt])
+                    continue
+
+                # Client error (bad request, etc) - don't retry
+                if resp.status_code >= 400:
+                    logger.warning(f"OSRM client error ({resp.status_code}) for {n} locations, falling back to Haversine")
+                    return None
+
+                data = resp.json()
+                if data.get("code") == "Ok" and data.get("distances"):
+                    logger.info(f"OSRM road matrix OK: {n} locations (attempt {attempt+1})")
+                    return [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
+
+                # OSRM returned non-Ok code (e.g. "InvalidQuery", "TooBig")
+                logger.warning(f"OSRM returned code '{data.get('code')}' for {n} locations, falling back to Haversine")
+                return None
+
+        except httpx.TimeoutException:
+            logger.warning(f"OSRM timeout for {n} locations, retry {attempt+1}/{OSRM_MAX_RETRIES}")
+            if attempt < OSRM_MAX_RETRIES - 1:
+                await asyncio.sleep(OSRM_RETRY_DELAYS[attempt])
+        except Exception as e:
+            logger.warning(f"OSRM error: {type(e).__name__}: {e}, retry {attempt+1}/{OSRM_MAX_RETRIES}")
+            if attempt < OSRM_MAX_RETRIES - 1:
+                await asyncio.sleep(OSRM_RETRY_DELAYS[attempt])
+
+    logger.warning(f"OSRM failed after {OSRM_MAX_RETRIES} retries for {n} locations, falling back to Haversine")
     return None
 
 
