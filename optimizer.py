@@ -24,7 +24,7 @@ except Exception as e:
     logger.warning(f"VROOM solver unavailable: {e}")
 
 try:
-    import pyvrp
+    import pyvrp  # noqa: F401
     from pyvrp import Model as PyVRPModel
     from pyvrp.stop import MaxRuntime
     HAS_PYVRP = True

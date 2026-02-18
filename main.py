@@ -4298,7 +4298,7 @@ async def health_check():
     checks["environment"] = os.getenv("SENTRY_ENVIRONMENT", "production")
 
     # Solver availability
-    from optimizer import HAS_VROOM, HAS_PYVRP
+    from optimizer import HAS_PYVRP, HAS_VROOM
     checks["solvers"] = {"vroom": HAS_VROOM, "pyvrp": HAS_PYVRP, "ortools": True}
 
     status_code = 200 if healthy else 503
