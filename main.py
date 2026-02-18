@@ -4211,6 +4211,10 @@ async def health_check():
     checks["version"] = "1.1.3"
     checks["environment"] = os.getenv("SENTRY_ENVIRONMENT", "production")
 
+    # Solver availability
+    from optimizer import HAS_VROOM, HAS_PYVRP
+    checks["solvers"] = {"vroom": HAS_VROOM, "pyvrp": HAS_PYVRP, "ortools": True}
+
     status_code = 200 if healthy else 503
     from fastapi.responses import JSONResponse
     return JSONResponse(
