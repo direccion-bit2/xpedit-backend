@@ -57,6 +57,7 @@ from optimizer import (
     calculate_eta,
     calculate_route_etas,
     cluster_stops_by_zone,
+    hybrid_optimize_route,
     optimize_multi_vehicle,
     optimize_route,
 )
@@ -648,15 +649,18 @@ async def download_apk(request: Request):
     return RedirectResponse(url=APK_DOWNLOAD_URL, status_code=302)
 
 
+OSRM_URL = os.getenv("OSRM_URL", "http://router.project-osrm.org")
+
+
 async def get_road_distance_matrix(locations: list) -> list | None:
-    """Obtiene matriz de distancias reales por carretera usando OSRM (gratis)."""
-    if len(locations) < 2 or len(locations) > 100:
+    """Obtiene matriz de distancias reales por carretera usando OSRM."""
+    if len(locations) < 2 or len(locations) > 200:
         return None
     try:
         coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
-        url = f"http://router.project-osrm.org/table/v1/driving/{coords}?annotations=distance"
+        url = f"{OSRM_URL}/table/v1/driving/{coords}?annotations=distance"
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=15.0)
+            resp = await client.get(url, timeout=30.0)
             data = resp.json()
             if data.get("code") == "Ok" and data.get("distances"):
                 return [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
@@ -667,16 +671,16 @@ async def get_road_distance_matrix(locations: list) -> list | None:
 
 @app.post("/optimize", tags=["optimize"], summary="Optimizar ruta")
 async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
-    """Calcula el orden óptimo de paradas para minimizar distancia/tiempo. Máximo 100 paradas."""
-    if len(request.locations) > 100:
-        raise HTTPException(status_code=400, detail="Máximo 100 paradas")
+    """Calcula el orden óptimo de paradas para minimizar distancia/tiempo. Máximo 500 paradas."""
+    if len(request.locations) > 500:
+        raise HTTPException(status_code=400, detail="Máximo 500 paradas")
 
     locations_data = [loc.model_dump() for loc in request.locations]
 
     # Intentar obtener distancias reales por carretera (OSRM)
     road_matrix = await get_road_distance_matrix(locations_data)
 
-    result = optimize_route(
+    result = hybrid_optimize_route(
         locations=locations_data,
         depot_index=request.start_index or 0,
         distance_matrix=road_matrix,
@@ -717,11 +721,14 @@ async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
 
 @app.post("/optimize-multi", tags=["optimize"], summary="Optimizar multi-vehículo")
 async def optimize_multi(request: MultiVehicleOptimizeRequest, user=Depends(get_current_user)):
-    """Optimiza rutas para múltiples vehículos (CVRP). Máximo 200 paradas y 50 vehículos."""
-    if len(request.locations) > 200:
-        raise HTTPException(status_code=400, detail="Máximo 200 paradas para multi-vehicle")
+    """Optimiza rutas para múltiples vehículos (CVRP). Máximo 500 paradas y 50 vehículos."""
+    if len(request.locations) > 500:
+        raise HTTPException(status_code=400, detail="Máximo 500 paradas para multi-vehicle")
 
     locations_data = [loc.model_dump() for loc in request.locations]
+
+    # Intentar obtener distancias reales por carretera (OSRM)
+    road_matrix = await get_road_distance_matrix(locations_data)
 
     max_distance = None
     if request.max_distance_per_vehicle_km:
@@ -731,8 +738,13 @@ async def optimize_multi(request: MultiVehicleOptimizeRequest, user=Depends(get_
         locations=locations_data,
         num_vehicles=request.num_vehicles,
         depot_index=request.depot_index or 0,
-        max_distance_per_vehicle=max_distance
+        max_distance_per_vehicle=max_distance,
+        distance_matrix=road_matrix,
     )
+    if road_matrix:
+        result["distance_source"] = "road"
+    else:
+        result["distance_source"] = "haversine"
     return result
 
 

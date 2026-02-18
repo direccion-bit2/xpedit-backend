@@ -4,12 +4,32 @@ Usa Google OR-Tools para resolver el Vehicle Routing Problem (VRP)
 Incluye: ETA, clustering por zonas, asignación inteligente, multi-vehicle
 """
 
+import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+logger = logging.getLogger("xpedit")
+
+# Optional solvers - graceful fallback if not installed
+try:
+    import vroom
+    HAS_VROOM = True
+except ImportError:
+    HAS_VROOM = False
+    logger.warning("pyvroom not installed - VROOM solver unavailable")
+
+try:
+    import pyvrp
+    from pyvrp import Model as PyVRPModel
+    from pyvrp.stop import MaxRuntime
+    HAS_PYVRP = True
+except ImportError:
+    HAS_PYVRP = False
+    logger.warning("pyvrp not installed - PyVRP solver unavailable")
 
 
 def haversine_distance(coord1: Tuple[float, float], coord2: Tuple[float, float]) -> int:
@@ -230,6 +250,309 @@ def optimize_route(
         "has_time_windows": has_time_windows,
         "message": f"Ruta optimizada: {len(optimized_route)} paradas, {round(total_distance/1000, 2)} km"
     }
+
+
+# ============================================================
+# VROOM SOLVER (ultrarrápido, <500ms)
+# ============================================================
+
+def solve_with_vroom(
+    locations: List[Dict[str, Any]],
+    depot_index: int = 0,
+    distance_matrix: Optional[List[List[int]]] = None,
+) -> Dict[str, Any]:
+    """
+    Resuelve TSP/VRP usando VROOM (pyvroom).
+    Ideal para <=25 paradas por su velocidad (<500ms).
+    """
+    if not HAS_VROOM:
+        return {"success": False, "error": "VROOM not available"}
+
+    n = len(locations)
+    if n < 2:
+        return {
+            "success": True, "route": locations,
+            "total_distance_meters": 0, "total_distance_km": 0,
+            "solver": "vroom",
+            "message": "Solo hay una parada, no hay nada que optimizar"
+        }
+
+    # Build distance matrix if not provided
+    if distance_matrix is None:
+        distance_matrix = create_distance_matrix(locations)
+
+    # Create VROOM problem instance
+    problem = vroom.Input()
+
+    # Add matrix (VROOM expects it as-is)
+    matrix = vroom.Matrix(n)
+    for i in range(n):
+        for j in range(n):
+            matrix[i][j] = distance_matrix[i][j]
+    problem.set_durations_matrix(profile="car", matrix=matrix)
+    problem.set_costs_matrix(profile="car", matrix=matrix)
+
+    # Add vehicle starting and ending at depot
+    problem.add_vehicle(
+        vroom.Vehicle(
+            id=0,
+            start=depot_index,
+            end=depot_index,
+            profile="car",
+        )
+    )
+
+    # Add jobs (all stops except depot)
+    for i in range(n):
+        if i == depot_index:
+            continue
+        job_kwargs = {"id": i, "location": i}
+        # Time windows if present
+        tw_start = _parse_time_to_minutes(locations[i].get('time_window_start'))
+        tw_end = _parse_time_to_minutes(locations[i].get('time_window_end'))
+        if tw_start is not None and tw_end is not None:
+            # VROOM uses seconds for time windows
+            job_kwargs["time_windows"] = [vroom.TimeWindow(tw_start * 60, tw_end * 60)]
+        problem.add_job(vroom.Job(**job_kwargs))
+
+    # Solve
+    solution = problem.solve(exploration_level=5, nb_threads=4)
+
+    if solution.routes is None or len(solution.routes) == 0:
+        return {"success": False, "error": "VROOM no encontró solución"}
+
+    # Extract route order
+    route_steps = solution.routes[0].steps
+    optimized_route = []
+    for step in route_steps:
+        if step.step_type == vroom.STEP_TYPE.JOB:
+            optimized_route.append(locations[step.id])
+
+    total_distance = solution.summary.cost
+
+    return {
+        "success": True,
+        "route": optimized_route,
+        "total_distance_meters": total_distance,
+        "total_distance_km": round(total_distance / 1000, 2),
+        "num_stops": len(optimized_route),
+        "solver": "vroom",
+        "has_time_windows": any(
+            loc.get('time_window_start') or loc.get('time_window_end')
+            for loc in locations
+        ),
+        "message": f"Ruta optimizada (VROOM): {len(optimized_route)} paradas, {round(total_distance/1000, 2)} km"
+    }
+
+
+# ============================================================
+# PyVRP SOLVER (alta calidad, 0.22% gap)
+# ============================================================
+
+def solve_with_pyvrp(
+    locations: List[Dict[str, Any]],
+    depot_index: int = 0,
+    distance_matrix: Optional[List[List[int]]] = None,
+    time_limit_s: int = 10,
+) -> Dict[str, Any]:
+    """
+    Resuelve TSP/VRP usando PyVRP.
+    Alta calidad (0.22% gap), ideal para 25-500 paradas.
+    """
+    if not HAS_PYVRP:
+        return {"success": False, "error": "PyVRP not available"}
+
+    n = len(locations)
+    if n < 2:
+        return {
+            "success": True, "route": locations,
+            "total_distance_meters": 0, "total_distance_km": 0,
+            "solver": "pyvrp",
+            "message": "Solo hay una parada, no hay nada que optimizar"
+        }
+
+    if distance_matrix is None:
+        distance_matrix = create_distance_matrix(locations)
+
+    # Build PyVRP model
+    model = PyVRPModel()
+
+    # Add depot
+    depot_loc = locations[depot_index]
+    model.add_depot(
+        x=int(depot_loc['lng'] * 100000),
+        y=int(depot_loc['lat'] * 100000),
+    )
+
+    # Add clients (all stops except depot)
+    client_indices = []  # maps PyVRP client index -> original location index
+    for i in range(n):
+        if i == depot_index:
+            continue
+        loc = locations[i]
+        client_kwargs = {
+            "x": int(loc['lng'] * 100000),
+            "y": int(loc['lat'] * 100000),
+            "delivery": [1],  # unit demand
+        }
+        # Time windows if present (PyVRP uses integer time)
+        tw_start = _parse_time_to_minutes(loc.get('time_window_start'))
+        tw_end = _parse_time_to_minutes(loc.get('time_window_end'))
+        if tw_start is not None and tw_end is not None:
+            client_kwargs["tw_early"] = tw_start
+            client_kwargs["tw_late"] = tw_end
+        model.add_client(**client_kwargs)
+        client_indices.append(i)
+
+    # Add vehicle type
+    model.add_vehicle_type(
+        num_available=1,
+        capacity=[n],  # enough capacity for all stops
+    )
+
+    # Add distance/duration matrix edges
+    # PyVRP expects: index 0 = depot, 1..n-1 = clients (in order added)
+    # Build mapping: pyvrp_idx -> original_idx
+    pyvrp_to_orig = [depot_index] + client_indices
+
+    for i in range(len(pyvrp_to_orig)):
+        for j in range(len(pyvrp_to_orig)):
+            orig_i = pyvrp_to_orig[i]
+            orig_j = pyvrp_to_orig[j]
+            dist = distance_matrix[orig_i][orig_j]
+            model.add_edge(i, j, distance=dist, duration=dist)
+
+    # Solve
+    result = model.solve(stop=MaxRuntime(time_limit_s), display=False)
+
+    if not result.is_feasible():
+        return {"success": False, "error": "PyVRP no encontró solución factible"}
+
+    # Extract route
+    optimized_route = []
+    total_distance = 0
+
+    for route in result.best.routes():
+        visits = route.visits()
+        for visit_idx in visits:
+            # visit_idx is 0-based client index (not including depot)
+            orig_idx = client_indices[visit_idx]
+            optimized_route.append(locations[orig_idx])
+
+    # Calculate total distance from the solution
+    total_distance = int(result.best.distance())
+
+    return {
+        "success": True,
+        "route": optimized_route,
+        "total_distance_meters": total_distance,
+        "total_distance_km": round(total_distance / 1000, 2),
+        "num_stops": len(optimized_route),
+        "solver": "pyvrp",
+        "has_time_windows": any(
+            loc.get('time_window_start') or loc.get('time_window_end')
+            for loc in locations
+        ),
+        "message": f"Ruta optimizada (PyVRP): {len(optimized_route)} paradas, {round(total_distance/1000, 2)} km"
+    }
+
+
+# ============================================================
+# HYBRID OPTIMIZER (selección automática del mejor solver)
+# ============================================================
+
+def hybrid_optimize_route(
+    locations: List[Dict[str, Any]],
+    depot_index: int = 0,
+    distance_matrix: Optional[List[List[int]]] = None,
+    avg_speed_kmh: float = 30.0,
+    stop_time_minutes: float = 5.0,
+) -> Dict[str, Any]:
+    """
+    Optimizador híbrido: selecciona el mejor solver según el tamaño del problema.
+
+    - N <= 25: VROOM (instantáneo, <500ms)
+    - 25 < N <= 500: PyVRP (5-30s, calidad 0.22% gap)
+    - Fallback: OR-Tools (función optimize_route original)
+
+    Siempre retorna un resultado válido gracias al fallback.
+    """
+    n = len(locations)
+
+    if n < 2:
+        return {
+            "success": True, "route": locations,
+            "total_distance_meters": 0, "total_distance_km": 0,
+            "solver": "none", "num_stops": n,
+            "message": "Solo hay una parada, no hay nada que optimizar"
+        }
+
+    # Validate depot_index
+    if depot_index < 0 or depot_index >= n:
+        depot_index = 0
+
+    # Build distance matrix once, reuse for all solvers
+    if distance_matrix is None:
+        distance_matrix = create_distance_matrix(locations)
+
+    # Select solver based on problem size
+    if n <= 25 and HAS_VROOM:
+        logger.info(f"Hybrid optimizer: using VROOM for {n} stops")
+        result = solve_with_vroom(
+            locations=locations,
+            depot_index=depot_index,
+            distance_matrix=distance_matrix,
+        )
+        if result.get("success"):
+            return result
+        logger.warning(f"VROOM failed: {result.get('error')}, falling back")
+
+    if n > 25 and HAS_PYVRP:
+        # Adaptive time limit based on problem size
+        if n <= 50:
+            time_limit = 5
+        elif n <= 100:
+            time_limit = 10
+        elif n <= 200:
+            time_limit = 20
+        else:
+            time_limit = 30
+
+        logger.info(f"Hybrid optimizer: using PyVRP for {n} stops (time_limit={time_limit}s)")
+        result = solve_with_pyvrp(
+            locations=locations,
+            depot_index=depot_index,
+            distance_matrix=distance_matrix,
+            time_limit_s=time_limit,
+        )
+        if result.get("success"):
+            return result
+        logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+
+    # Also try PyVRP for small problems if VROOM is not available
+    if n <= 25 and not HAS_VROOM and HAS_PYVRP:
+        logger.info(f"Hybrid optimizer: VROOM unavailable, using PyVRP for {n} stops")
+        result = solve_with_pyvrp(
+            locations=locations,
+            depot_index=depot_index,
+            distance_matrix=distance_matrix,
+            time_limit_s=3,
+        )
+        if result.get("success"):
+            return result
+        logger.warning(f"PyVRP failed: {result.get('error')}, falling back")
+
+    # Fallback: OR-Tools (always available)
+    logger.info(f"Hybrid optimizer: using OR-Tools fallback for {n} stops")
+    result = optimize_route(
+        locations=locations,
+        depot_index=depot_index,
+        distance_matrix=distance_matrix,
+        avg_speed_kmh=avg_speed_kmh,
+        stop_time_minutes=stop_time_minutes,
+    )
+    result["solver"] = "ortools"
+    return result
 
 
 # ============================================================
@@ -525,7 +848,8 @@ def optimize_multi_vehicle(
     locations: List[Dict[str, Any]],
     num_vehicles: int,
     depot_index: int = 0,
-    max_distance_per_vehicle: Optional[int] = None
+    max_distance_per_vehicle: Optional[int] = None,
+    distance_matrix: Optional[List[List[int]]] = None,
 ) -> Dict[str, Any]:
     """
     Optimiza rutas para múltiples vehículos usando CVRP.
@@ -535,6 +859,7 @@ def optimize_multi_vehicle(
         num_vehicles: Número de vehículos
         depot_index: Índice del depósito
         max_distance_per_vehicle: Límite de distancia por vehículo (metros)
+        distance_matrix: Matriz de distancias pre-calculada (OSRM o Haversine)
 
     Returns:
         Dict con routes (lista de rutas, una por vehículo)
@@ -550,8 +875,9 @@ def optimize_multi_vehicle(
     if depot_index < 0 or depot_index >= len(locations):
         depot_index = 0
 
-    # Crear matriz de distancias
-    distance_matrix = create_distance_matrix(locations)
+    # Usar matriz proporcionada o crear con Haversine
+    if distance_matrix is None:
+        distance_matrix = create_distance_matrix(locations)
 
     # Crear modelo
     manager = pywrapcp.RoutingIndexManager(

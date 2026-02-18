@@ -42,12 +42,14 @@ class TestOptimizeEndpoint:
             {"lat": 40.420000, "lng": -3.710000, "address": "Stop 2"},
         ]
 
-        with patch("main.optimize_route") as mock_optimize:
+        with patch("main.hybrid_optimize_route") as mock_optimize:
             mock_optimize.return_value = {
                 "success": True,
-                "optimized_order": [0, 2, 1],
+                "route": locations,
                 "total_distance_km": 5.2,
-                "locations": locations,
+                "total_distance_meters": 5200,
+                "num_stops": 3,
+                "solver": "vroom",
             }
             response = await client.post("/optimize", json={
                 "locations": locations,
@@ -57,20 +59,22 @@ class TestOptimizeEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert "optimized_order" in data
         assert "total_distance_km" in data
+        assert "solver" in data
 
     @pytest.mark.asyncio
     async def test_optimize_single_stop(self, client):
         """Optimization with a single stop should still work."""
         locations = [{"lat": 40.416775, "lng": -3.703790}]
 
-        with patch("main.optimize_route") as mock_optimize:
+        with patch("main.hybrid_optimize_route") as mock_optimize:
             mock_optimize.return_value = {
                 "success": True,
-                "optimized_order": [0],
+                "route": locations,
                 "total_distance_km": 0,
-                "locations": locations,
+                "total_distance_meters": 0,
+                "num_stops": 1,
+                "solver": "none",
             }
             response = await client.post("/optimize", json={
                 "locations": locations,
@@ -88,13 +92,13 @@ class TestOptimizeEndpoint:
 
     @pytest.mark.asyncio
     async def test_optimize_too_many_stops(self, client):
-        """Optimization with more than 100 stops should return 400."""
-        locations = [{"lat": 40.0 + i * 0.001, "lng": -3.0} for i in range(101)]
+        """Optimization with more than 500 stops should return 400."""
+        locations = [{"lat": 40.0 + i * 0.001, "lng": -3.0} for i in range(501)]
         response = await client.post("/optimize", json={
             "locations": locations,
         })
         assert response.status_code == 400
-        assert "100" in response.json()["detail"]
+        assert "500" in response.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_optimize_invalid_coordinates(self, client):
@@ -143,8 +147,8 @@ class TestOptimizeMultiEndpoint:
 
     @pytest.mark.asyncio
     async def test_optimize_multi_too_many_stops(self, client):
-        """More than 200 stops should be rejected."""
-        locations = [{"lat": 40.0 + i * 0.001, "lng": -3.0} for i in range(201)]
+        """More than 500 stops should be rejected."""
+        locations = [{"lat": 40.0 + i * 0.001, "lng": -3.0} for i in range(501)]
         response = await client.post("/optimize-multi", json={
             "locations": locations,
             "num_vehicles": 2,
