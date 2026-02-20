@@ -438,6 +438,10 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"places:{client_ip}", max_requests=30, window_seconds=60)
         elif path == "/optimize":
             check_rate_limit(f"optimize:{client_ip}", max_requests=10, window_seconds=60)
+        elif path.startswith("/voice"):
+            check_rate_limit(f"voice:{client_ip}", max_requests=30, window_seconds=60)
+        elif path.startswith("/email"):
+            check_rate_limit(f"email:{client_ip}", max_requests=20, window_seconds=60)
     except HTTPException as e:
         from starlette.responses import JSONResponse
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
@@ -4516,40 +4520,53 @@ async def periodic_health_check():
 
 # === VOICE ASSISTANT (Gemini Flash) ===
 
-VOICE_ASSISTANT_PROMPT = """Eres el asistente de voz de Xpedit, una app de reparto. El repartidor te habla mientras conduce.
-Debes interpretar lo que dice y devolver UN JSON con esta estructura exacta:
+VOICE_ASSISTANT_PROMPT = """Eres COPILOTO, el asistente de voz de Xpedit, una app de reparto de ultima milla.
+Eres el copiloto del repartidor. Hablas con naturalidad, eres directo y util.
+El repartidor te habla mientras conduce. Tu respuesta sera leida en voz alta.
 
+Devuelve UN JSON con esta estructura exacta:
 {
-  "action": "complete|fail|note|reminder|call|eta|info|mute|unmute|next|navigate|unknown",
+  "action": "complete|fail|next|skip|reorder|reoptimize|call|eta|status|note|reminder|navigate|mute|unmute|pause|resume|time|info|unknown",
   "target_stop": "current",
   "payload": {},
-  "confirmation": "texto corto para leer en voz alta al repartidor"
+  "confirmation": "texto para leer en voz alta (max 20 palabras)"
 }
 
-Acciones disponibles:
-- "complete": marcar parada actual como entregada
-- "fail": marcar parada actual como fallida/no entregada
-- "next": ir a la siguiente parada
-- "mute": silenciar la voz de navegacion
-- "unmute": activar la voz de navegacion
-- "call": llamar al cliente de la parada actual
-- "eta": preguntar cuanto falta/cuantas paradas quedan
-- "note": añadir una nota a la parada. payload: {"text": "contenido de la nota"}
-- "reminder": crear un recordatorio. payload: {"text": "contenido", "time": "HH:MM" o null}
-- "navigate": navegar a una parada especifica. payload: {"stop_number": N} o {"address": "..."}
-- "info": pregunta general sobre el reparto. Responde directamente en confirmation.
-- "unknown": no entendiste el comando
+ACCIONES:
+- "complete": marcar parada como entregada. Si dice nombre del receptor: payload: {"recipient": "nombre"}
+- "fail": marcar parada como fallida. payload: {"reason": "motivo"} si lo menciona
+- "next": ir a la siguiente parada pendiente
+- "skip": saltar parada actual sin completar/fallar, moverla al final. payload: {"move_to": "end"}
+- "reorder": mover parada a posicion especifica. payload: {"stop_number": N, "new_position": M}
+- "reoptimize": re-optimizar la ruta con las paradas pendientes
+- "call": llamar al cliente de la parada actual (o especifica si dice numero)
+- "eta": cuanto falta para terminar (tiempo + paradas restantes)
+- "status": resumen rapido del estado actual (hechas, pendientes, fallidas)
+- "note": añadir nota a la parada. payload: {"text": "contenido"}
+- "reminder": recordatorio. payload: {"text": "contenido", "time": "HH:MM" o null}
+- "navigate": ir a parada especifica. payload: {"stop_number": N} o {"address": "..."}
+- "mute": silenciar voz de navegacion
+- "unmute": activar voz de navegacion
+- "pause": pausar navegacion/ruta
+- "resume": reanudar navegacion/ruta
+- "time": decir la hora actual
+- "info": pregunta general. Responde en confirmation con lo que sepas del contexto.
+- "unknown": no entendiste. Sugiere que repita.
 
 CONTEXTO DEL REPARTO ACTUAL:
 {context}
 
-IMPORTANTE:
-- La confirmacion debe ser CORTA (max 15 palabras), natural y en español
-- Para "info" sobre paradas restantes, calcula con los datos del contexto
-- Si mencionan una hora como "a las 5", "sobre las cinco", convierte a formato 24h (17:00)
-- Si dicen "apunta", "anota", "pon en notas" → action = "note"
-- Si dicen "recuerdame", "no me dejes olvidar" → action = "reminder"
-- Devuelve SOLO el JSON, sin texto adicional ni markdown"""
+REGLAS:
+- Confirmacion CORTA, natural, en español. Como un copiloto humano hablaria.
+- Para "eta"/"status" calcula con los datos del contexto
+- "a las 5" / "sobre las cinco" → "17:00"
+- "apunta" / "anota" / "pon en notas" → "note"
+- "recuerdame" / "no me dejes olvidar" → "reminder"
+- "salta esta" / "dejala para el final" / "pasala al final" → "skip"
+- "reoptimiza" / "organiza la ruta" / "optimiza" → "reoptimize"
+- "cuantas me quedan" / "como voy" → "status"
+- "que hora es" → "time"
+- Devuelve SOLO el JSON, sin markdown ni texto extra"""
 
 
 class VoiceCommandRequest(BaseModel):
@@ -4557,6 +4574,11 @@ class VoiceCommandRequest(BaseModel):
     current_stop: Optional[dict] = None
     stops_summary: Optional[str] = None
     remaining_minutes: Optional[float] = None
+    total_stops: Optional[int] = None
+    completed_stops: Optional[int] = None
+    failed_stops: Optional[int] = None
+    total_distance_km: Optional[float] = None
+    driver_name: Optional[str] = None
 
 
 @app.post("/voice/command")
@@ -4567,6 +4589,8 @@ async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current
 
     # Build context string
     context_parts = []
+    if req.driver_name:
+        context_parts.append(f"Conductor: {req.driver_name}")
     if req.current_stop:
         stop = req.current_stop
         context_parts.append(f"Parada actual: {stop.get('address', 'desconocida')}")
@@ -4576,10 +4600,19 @@ async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current
             context_parts.append(f"Notas existentes: {stop['notes']}")
         if stop.get('packageId'):
             context_parts.append(f"ID paquete: {stop['packageId']}")
-    if req.stops_summary:
+        if stop.get('position') is not None:
+            context_parts.append(f"Posicion en ruta: {stop['position'] + 1}")
+    if req.total_stops is not None:
+        pending = (req.total_stops or 0) - (req.completed_stops or 0) - (req.failed_stops or 0)
+        context_parts.append(f"Total: {req.total_stops} paradas ({req.completed_stops or 0} hechas, {req.failed_stops or 0} fallidas, {pending} pendientes)")
+    elif req.stops_summary:
         context_parts.append(f"Resumen paradas: {req.stops_summary}")
     if req.remaining_minutes is not None:
         context_parts.append(f"Tiempo restante estimado: {req.remaining_minutes:.0f} minutos")
+    if req.total_distance_km is not None:
+        context_parts.append(f"Distancia total: {req.total_distance_km:.1f} km")
+    import datetime
+    context_parts.append(f"Hora actual: {datetime.datetime.now().strftime('%H:%M')}")
 
     context = "\n".join(context_parts) if context_parts else "Sin contexto disponible"
     prompt = VOICE_ASSISTANT_PROMPT.replace("{context}", context)
