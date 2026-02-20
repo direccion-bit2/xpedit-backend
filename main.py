@@ -2009,6 +2009,35 @@ async def admin_toggle_company(company_id: str, request: dict, user=Depends(requ
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
+class DriverFeatureToggleRequest(BaseModel):
+    voice_assistant_enabled: Optional[bool] = None
+
+
+@app.patch("/admin/drivers/{driver_id}/features", tags=["admin"], summary="Toggle feature flags de un driver")
+async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureToggleRequest, user=Depends(require_admin)):
+    """Activa o desactiva feature flags de un driver. Solo admin."""
+    try:
+        update_data = {}
+        if request.voice_assistant_enabled is not None:
+            update_data["voice_assistant_enabled"] = request.voice_assistant_enabled
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        result = supabase.table("drivers").update(update_data).eq("id", driver_id).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Driver not found")
+
+        return {"success": True, "driver": safe_first(result)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
+
+
 # === REFERRAL SYSTEM ===
 
 INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -4483,6 +4512,117 @@ async def periodic_health_check():
         if SENTRY_DSN:
             sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
             sentry_sdk.capture_exception(e)
+
+
+# === VOICE ASSISTANT (Gemini Flash) ===
+
+VOICE_ASSISTANT_PROMPT = """Eres el asistente de voz de Xpedit, una app de reparto. El repartidor te habla mientras conduce.
+Debes interpretar lo que dice y devolver UN JSON con esta estructura exacta:
+
+{
+  "action": "complete|fail|note|reminder|call|eta|info|mute|unmute|next|navigate|unknown",
+  "target_stop": "current",
+  "payload": {},
+  "confirmation": "texto corto para leer en voz alta al repartidor"
+}
+
+Acciones disponibles:
+- "complete": marcar parada actual como entregada
+- "fail": marcar parada actual como fallida/no entregada
+- "next": ir a la siguiente parada
+- "mute": silenciar la voz de navegacion
+- "unmute": activar la voz de navegacion
+- "call": llamar al cliente de la parada actual
+- "eta": preguntar cuanto falta/cuantas paradas quedan
+- "note": añadir una nota a la parada. payload: {"text": "contenido de la nota"}
+- "reminder": crear un recordatorio. payload: {"text": "contenido", "time": "HH:MM" o null}
+- "navigate": navegar a una parada especifica. payload: {"stop_number": N} o {"address": "..."}
+- "info": pregunta general sobre el reparto. Responde directamente en confirmation.
+- "unknown": no entendiste el comando
+
+CONTEXTO DEL REPARTO ACTUAL:
+{context}
+
+IMPORTANTE:
+- La confirmacion debe ser CORTA (max 15 palabras), natural y en español
+- Para "info" sobre paradas restantes, calcula con los datos del contexto
+- Si mencionan una hora como "a las 5", "sobre las cinco", convierte a formato 24h (17:00)
+- Si dicen "apunta", "anota", "pon en notas" → action = "note"
+- Si dicen "recuerdame", "no me dejes olvidar" → action = "reminder"
+- Devuelve SOLO el JSON, sin texto adicional ni markdown"""
+
+
+class VoiceCommandRequest(BaseModel):
+    transcript: str
+    current_stop: Optional[dict] = None
+    stops_summary: Optional[str] = None
+    remaining_minutes: Optional[float] = None
+
+
+@app.post("/voice/command")
+async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current_user)):
+    client = get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="Servicio de IA no disponible")
+
+    # Build context string
+    context_parts = []
+    if req.current_stop:
+        stop = req.current_stop
+        context_parts.append(f"Parada actual: {stop.get('address', 'desconocida')}")
+        if stop.get('phone'):
+            context_parts.append(f"Telefono cliente: {stop['phone']}")
+        if stop.get('notes'):
+            context_parts.append(f"Notas existentes: {stop['notes']}")
+        if stop.get('packageId'):
+            context_parts.append(f"ID paquete: {stop['packageId']}")
+    if req.stops_summary:
+        context_parts.append(f"Resumen paradas: {req.stops_summary}")
+    if req.remaining_minutes is not None:
+        context_parts.append(f"Tiempo restante estimado: {req.remaining_minutes:.0f} minutos")
+
+    context = "\n".join(context_parts) if context_parts else "Sin contexto disponible"
+    prompt = VOICE_ASSISTANT_PROMPT.replace("{context}", context)
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                {"role": "user", "parts": [{"text": f"Comando del repartidor: \"{req.transcript}\""}]},
+            ],
+            config={
+                "system_instruction": prompt,
+                "temperature": 0.1,
+                "max_output_tokens": 256,
+            },
+        )
+
+        raw = response.text.strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        result = json.loads(raw)
+
+        # Validate required fields
+        if "action" not in result:
+            result["action"] = "unknown"
+        if "confirmation" not in result:
+            result["confirmation"] = "No entendi el comando"
+
+        return result
+
+    except json.JSONDecodeError:
+        return {
+            "action": "unknown",
+            "target_stop": "current",
+            "payload": {},
+            "confirmation": "No pude procesar el comando",
+        }
+    except Exception as e:
+        logger.error(f"Voice command error: {e}")
+        raise HTTPException(status_code=500, detail="Error procesando comando de voz")
 
 
 # === MAIN ===
