@@ -4023,7 +4023,7 @@ Desarrollada en España por TAES PACK S.L. Pensada para repartidores autónomos 
 === FUNCIONALIDADES REALES (solo menciona estas) ===
 - Optimización de rutas con IA: calcula el orden óptimo de paradas para ahorrar tiempo y combustible
 - Entrada por voz: añade direcciones hablando, sin teclear mientras conduces
-- Avisos WhatsApp automáticos: notifica a cada cliente cuando estás de camino con ETA y enlace de seguimiento
+- Notificaciones automáticas por email: notifica a cada cliente cuando estás de camino con ETA y enlace de seguimiento
 - Seguimiento en tiempo real: los clientes ven al repartidor en un mapa en vivo
 - Funciona offline: la ruta optimizada se mantiene sin conexión a internet
 - Prueba de entrega con foto: haz foto en cada parada como comprobante
@@ -4109,7 +4109,7 @@ class GenerateCalendarRequest(BaseModel):
 
 
 TOPIC_PROMPTS = {
-    "feature": "Destaca una funcionalidad de Xpedit (optimización, voz, WhatsApp, offline, foto entrega, lugares recurrentes)",
+    "feature": "Destaca una funcionalidad de Xpedit (optimización, voz, notificaciones email, offline, foto entrega, lugares recurrentes)",
     "tip": "Comparte un consejo práctico de reparto/logística que ayude a repartidores",
     "comparativa": "Compara Xpedit con la competencia (OptimoRoute $35, Circuit $20-200, Routific $49-93) destacando la ventaja de precio",
     "oferta": "Destaca que Xpedit es gratis en Google Play y el Pro es solo 4.99€/mes vs competencia de $35-93/mes",

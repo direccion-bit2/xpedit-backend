@@ -91,7 +91,7 @@ def send_welcome_email(to_email: str, user_name: str) -> dict:
         </div>
 
         <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px;">
-            ¿Necesitas ayuda? Escríbenos por WhatsApp al +34 632 073 689
+            ¿Necesitas ayuda? Escríbenos a info@xpedit.es
         </p>
     """
 
@@ -270,7 +270,7 @@ def send_delivery_failed_email(
 
         <div style="background-color: #fef3c7; border-radius: 8px; padding: 15px; margin-top: 20px;">
             <p style="margin: 0; color: #92400e; font-size: 14px;">
-                <strong>¿Necesitas ayuda?</strong> Contacta con nosotros por WhatsApp al +34 632 073 689
+                <strong>¿Necesitas ayuda?</strong> Contacta con nosotros en info@xpedit.es
             </p>
         </div>
     """
