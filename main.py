@@ -35,7 +35,7 @@ if SENTRY_DSN:
         traces_sample_rate=0.1,
         profiles_sample_rate=0.1,
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
-        release="xpedit-backend@1.1.3",
+        release="xpedit-backend@1.1.4",
         send_default_pii=False,
     )
     logger.info("Sentry initialized for error monitoring")
@@ -212,6 +212,8 @@ async def get_current_user(authorization: str = Header(default=None)):
         if not user_id:
             raise HTTPException(status_code=401, detail="Token invalido")
 
+        sentry_sdk.set_user({"id": user_id})
+
         # Get user profile from DB
         result = supabase.table("users").select("id, email, role, company_id").eq("id", user_id).single().execute()
         if not result.data:
@@ -381,12 +383,15 @@ tags_metadata = [
     },
 ]
 
+_is_production = os.getenv("SENTRY_ENVIRONMENT") == "production"
+
 app = FastAPI(
     title="Xpedit API",
     description="API para la app de optimización de rutas Xpedit",
-    version="1.1.3",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    version="1.1.4",
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    openapi_url=None if _is_production else "/openapi.json",
     openapi_tags=tags_metadata,
 )
 
@@ -408,6 +413,9 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+    if request.url.path.startswith("/admin"):
+        response.headers["Cache-Control"] = "no-store, private"
     return response
 
 
@@ -1933,7 +1941,6 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
         return {
             "success": True,
             "user_id": user_id,
-            "password": new_password,
             "message": "Password reset successfully."
         }
 
@@ -3404,7 +3411,8 @@ async def resend_webhook(request: Request):
             logger.error(f"Resend webhook verification error: {type(e).__name__}: {e}")
             raise HTTPException(status_code=400, detail="Verification failed")
     else:
-        logger.warning("No RESEND_WEBHOOK_SECRET configured, skipping verification")
+        logger.error("No RESEND_WEBHOOK_SECRET configured - rejecting webhook")
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     try:
         payload = json.loads(payload_bytes)
@@ -4372,7 +4380,8 @@ async def backup_critical_tables():
 
         # Guardar en Supabase Storage
         backup_json = json.dumps(backup_data, default=str, ensure_ascii=False)
-        backup_path = f"backups/{backup_date}/backup_{backup_date}.json"
+        backup_uid = uuid_mod.uuid4().hex[:12]
+        backup_path = f"backups/{backup_date}/backup_{backup_date}_{backup_uid}.json"
 
         try:
             supabase.storage.from_("social-media").upload(
@@ -4382,18 +4391,8 @@ async def backup_critical_tables():
             )
             logger.info(f"Backup completed: {backup_path} ({len(backup_json)} bytes, {len(tables)} tables)")
         except Exception as e:
-            # Si ya existe, intentar con timestamp
-            if "Duplicate" in str(e) or "already exists" in str(e):
-                ts = datetime.utcnow().strftime("%H%M%S")
-                backup_path = f"backups/{backup_date}/backup_{backup_date}_{ts}.json"
-                supabase.storage.from_("social-media").upload(
-                    backup_path,
-                    backup_json.encode("utf-8"),
-                    {"content-type": "application/json"}
-                )
-                logger.info(f"Backup completed (retry): {backup_path}")
-            else:
-                raise
+            logger.error(f"Backup upload error: {e}")
+            raise
 
         # Sentry cron OK
         if SENTRY_DSN:

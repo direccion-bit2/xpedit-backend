@@ -396,7 +396,8 @@ class TestAdminResetPassword:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["password"] == "NewPass123!"
+        assert data["success"] is True
+        assert "password" not in data
 
     @pytest.mark.asyncio
     async def test_reset_password_too_short(self, admin_client):
