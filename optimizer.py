@@ -462,6 +462,85 @@ def solve_with_pyvrp(
 # HYBRID OPTIMIZER (selección automática del mejor solver)
 # ============================================================
 
+def _reorder_nearby_clusters(
+    route: List[Dict[str, Any]],
+    road_distance_matrix: Optional[List[List[int]]],
+    original_locations: List[Dict[str, Any]],
+    threshold_m: int = 500,
+) -> List[Dict[str, Any]]:
+    """
+    Post-processing: reorder nearby clusters for door-to-door delivery.
+
+    Within clusters of consecutive stops that are < threshold_m apart (by road),
+    reorder by haversine nearest-neighbor from approach direction. This ensures
+    the driver visits nearby stops in visual/geographical order (door-to-door)
+    rather than strict driving-time order, which can differ by just seconds
+    for nearby stops due to one-way streets but matters for practical delivery
+    (parking, keeping car in sight, stopping at each door in sequence).
+    """
+    if len(route) < 3:
+        return route
+
+    def _find_orig_idx(loc: Dict) -> int:
+        for i, orig in enumerate(original_locations):
+            if abs(orig['lat'] - loc['lat']) < 1e-6 and abs(orig['lng'] - loc['lng']) < 1e-6:
+                return i
+        return -1
+
+    def _road_dist(a: Dict, b: Dict) -> int:
+        """Minimum road distance between two stops (handles one-way asymmetry)."""
+        if road_distance_matrix:
+            ia, ib = _find_orig_idx(a), _find_orig_idx(b)
+            if ia >= 0 and ib >= 0:
+                return min(road_distance_matrix[ia][ib], road_distance_matrix[ib][ia])
+        return haversine_distance((a['lat'], a['lng']), (b['lat'], b['lng']))
+
+    result = list(route)
+    i = 1  # skip depot at index 0
+    changes = 0
+
+    while i < len(result) - 1:
+        # Find cluster: consecutive stops where each pair is within threshold by road
+        j = i
+        while j + 1 < len(result) and _road_dist(result[j], result[j + 1]) < threshold_m:
+            j += 1
+
+        if j > i:
+            # Cluster of 2+ stops found
+            cluster = [result[k] for k in range(i, j + 1)]
+            approach = result[i - 1]
+
+            # Reorder by haversine nearest-neighbor from approach direction
+            reordered = []
+            remaining = list(cluster)
+            current = approach
+            while remaining:
+                nearest = min(remaining, key=lambda s: haversine_distance(
+                    (current['lat'], current['lng']),
+                    (s['lat'], s['lng']),
+                ))
+                reordered.append(nearest)
+                current = nearest
+                remaining.remove(nearest)
+
+            if reordered != cluster:
+                for k, stop in enumerate(reordered):
+                    result[i + k] = stop
+                changes += 1
+                old_ids = [s.get('id', '?') for s in cluster]
+                new_ids = [s.get('id', '?') for s in reordered]
+                logger.info(f"Delivery reorder cluster: {old_ids} → {new_ids}")
+
+            i = j + 1
+        else:
+            i += 1
+
+    if changes:
+        logger.info(f"Delivery reorder: {changes} cluster(s) reordered for door-to-door")
+
+    return result
+
+
 def hybrid_optimize_route(
     locations: List[Dict[str, Any]],
     depot_index: int = 0,
@@ -523,6 +602,7 @@ def hybrid_optimize_route(
                 time_limit_s=time_limit,
             )
             if result.get("success"):
+                result["route"] = _reorder_nearby_clusters(result["route"], distance_matrix, locations)
                 return result
             logger.warning(f"PyVRP failed: {result.get('error')}, falling back to VROOM")
         except Exception as e:
@@ -539,6 +619,7 @@ def hybrid_optimize_route(
                 duration_matrix=duration_matrix,
             )
             if result.get("success"):
+                result["route"] = _reorder_nearby_clusters(result["route"], distance_matrix, locations)
                 return result
             logger.warning(f"VROOM failed: {result.get('error')}, falling back to OR-Tools")
         except Exception as e:
@@ -555,6 +636,7 @@ def hybrid_optimize_route(
         stop_time_minutes=stop_time_minutes,
     )
     result["solver"] = "ortools"
+    result["route"] = _reorder_nearby_clusters(result["route"], distance_matrix, locations)
     return result
 
 
