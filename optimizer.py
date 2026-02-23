@@ -91,7 +91,8 @@ def optimize_route(
     num_vehicles: int = 1,
     avg_speed_kmh: float = 30.0,
     stop_time_minutes: float = 5.0,
-    distance_matrix: Optional[List[List[int]]] = None
+    distance_matrix: Optional[List[List[int]]] = None,
+    duration_matrix: Optional[List[List[int]]] = None,
 ) -> Dict[str, Any]:
     """
     Optimiza la ruta para visitar todas las ubicaciones.
@@ -140,11 +141,14 @@ def optimize_route(
 
     routing = pywrapcp.RoutingModel(manager)
 
-    # Definir callback de distancia
+    # Use duration matrix as cost when available (minimize travel TIME, not distance)
+    # Duration matrix from OSRM is asymmetric → handles one-way streets
+    cost_matrix = duration_matrix if duration_matrix is not None else distance_matrix
+
     def distance_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        return distance_matrix[from_node][to_node]
+        return cost_matrix[from_node][to_node]
 
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
@@ -155,8 +159,12 @@ def optimize_route(
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
-            distance_m = distance_matrix[from_node][to_node]
-            travel_time_min = int((distance_m / 1000 / avg_speed_kmh) * 60)
+            if duration_matrix is not None:
+                # OSRM durations are in seconds → convert to minutes
+                travel_time_min = int(duration_matrix[from_node][to_node] / 60)
+            else:
+                distance_m = distance_matrix[from_node][to_node]
+                travel_time_min = int((distance_m / 1000 / avg_speed_kmh) * 60)
             return travel_time_min + int(stop_time_minutes)
 
         time_callback_index = routing.RegisterTransitCallback(time_callback)
@@ -262,6 +270,7 @@ def solve_with_vroom(
     locations: List[Dict[str, Any]],
     depot_index: int = 0,
     distance_matrix: Optional[List[List[int]]] = None,
+    duration_matrix: Optional[List[List[int]]] = None,
 ) -> Dict[str, Any]:
     """
     Resuelve TSP/VRP usando VROOM (pyvroom).
@@ -287,7 +296,8 @@ def solve_with_vroom(
     problem = vroom.Input()
 
     # Set matrices (pyvroom accepts list-of-lists directly)
-    problem.set_durations_matrix(profile="car", matrix_input=distance_matrix)
+    # VROOM optimizes on durations (minimizes travel time)
+    problem.set_durations_matrix(profile="car", matrix_input=duration_matrix if duration_matrix is not None else distance_matrix)
     problem.set_distances_matrix(profile="car", matrix_input=distance_matrix)
 
     # Add vehicle starting and ending at depot
@@ -349,6 +359,7 @@ def solve_with_pyvrp(
     locations: List[Dict[str, Any]],
     depot_index: int = 0,
     distance_matrix: Optional[List[List[int]]] = None,
+    duration_matrix: Optional[List[List[int]]] = None,
     time_limit_s: int = 10,
 ) -> Dict[str, Any]:
     """
@@ -369,6 +380,8 @@ def solve_with_pyvrp(
 
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
+    if duration_matrix is None:
+        duration_matrix = distance_matrix
 
     # Build PyVRP model
     model = PyVRPModel()
@@ -411,7 +424,8 @@ def solve_with_pyvrp(
     for i, frm in enumerate(all_locs):
         for j, to in enumerate(all_locs):
             dist = distance_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
-            model.add_edge(frm, to, distance=dist, duration=dist)
+            dur = duration_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
+            model.add_edge(frm, to, distance=dist, duration=dur)
 
     # Solve
     result = model.solve(stop=MaxRuntime(time_limit_s), display=False)
@@ -452,6 +466,7 @@ def hybrid_optimize_route(
     locations: List[Dict[str, Any]],
     depot_index: int = 0,
     distance_matrix: Optional[List[List[int]]] = None,
+    duration_matrix: Optional[List[List[int]]] = None,
     avg_speed_kmh: float = 30.0,
     stop_time_minutes: float = 5.0,
 ) -> Dict[str, Any]:
@@ -504,6 +519,7 @@ def hybrid_optimize_route(
                 locations=locations,
                 depot_index=depot_index,
                 distance_matrix=distance_matrix,
+                duration_matrix=duration_matrix,
                 time_limit_s=time_limit,
             )
             if result.get("success"):
@@ -520,6 +536,7 @@ def hybrid_optimize_route(
                 locations=locations,
                 depot_index=depot_index,
                 distance_matrix=distance_matrix,
+                duration_matrix=duration_matrix,
             )
             if result.get("success"):
                 return result
@@ -533,6 +550,7 @@ def hybrid_optimize_route(
         locations=locations,
         depot_index=depot_index,
         distance_matrix=distance_matrix,
+        duration_matrix=duration_matrix,
         avg_speed_kmh=avg_speed_kmh,
         stop_time_minutes=stop_time_minutes,
     )

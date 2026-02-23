@@ -670,11 +670,12 @@ OSRM_MAX_RETRIES = 3
 OSRM_RETRY_DELAYS = [1.0, 2.0, 4.0]  # exponential backoff
 
 
-async def get_road_distance_matrix(locations: list) -> list | None:
+async def get_road_distance_matrix(locations: list) -> dict | None:
     """
-    Obtiene matriz de distancias reales por carretera usando OSRM.
+    Obtiene matrices de distancias y duraciones reales por carretera usando OSRM.
     Incluye reintentos con backoff exponencial y manejo de rate limits.
-    Retorna None (fallback a Haversine) si OSRM no responde tras reintentos.
+    Retorna {"distances": [...], "durations": [...]} o None (fallback a Haversine).
+    La matriz de duraciones es ASIMÉTRICA (A→B ≠ B→A) por calles de un sentido.
     """
     import asyncio
 
@@ -683,12 +684,12 @@ async def get_road_distance_matrix(locations: list) -> list | None:
         return None
 
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
-    url = f"{OSRM_URL}/table/v1/driving/{coords}?annotations=distance"
+    url = f"{OSRM_URL}/table/v1/driving/{coords}?annotations=duration,distance"
 
     for attempt in range(OSRM_MAX_RETRIES):
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(url, timeout=30.0)
+                resp = await client.get(url, timeout=30.0, headers={"User-Agent": "Xpedit/1.0"})
 
                 # Rate limited - wait and retry
                 if resp.status_code == 429:
@@ -709,9 +710,11 @@ async def get_road_distance_matrix(locations: list) -> list | None:
                     return None
 
                 data = resp.json()
-                if data.get("code") == "Ok" and data.get("distances"):
-                    logger.info(f"OSRM road matrix OK: {n} locations (attempt {attempt+1})")
-                    return [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
+                if data.get("code") == "Ok" and data.get("distances") and data.get("durations"):
+                    logger.info(f"OSRM road matrix OK: {n} locations, asymmetric durations (attempt {attempt+1})")
+                    distances = [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
+                    durations = [[int(d) if d is not None else 999999 for d in row] for row in data["durations"]]
+                    return {"distances": distances, "durations": durations}
 
                 # OSRM returned non-Ok code (e.g. "InvalidQuery", "TooBig")
                 logger.warning(f"OSRM returned code '{data.get('code')}' for {n} locations, falling back to Haversine")
@@ -742,8 +745,11 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
     # Determine strategy (new field takes precedence over deprecated round_trip)
     strategy = request.strategy or ("round_trip" if request.round_trip else "nearest_first")
 
-    # Intentar obtener distancias reales por carretera (OSRM)
-    road_matrix = await get_road_distance_matrix(locations_data)
+    # Obtener distancias Y duraciones reales por carretera (OSRM)
+    # La matriz de duraciones es ASIMÉTRICA: respeta calles de un sentido
+    road_data = await get_road_distance_matrix(locations_data)
+    road_matrix = road_data["distances"] if road_data else None
+    duration_matrix = road_data["durations"] if road_data else None
 
     # For businesses_first: split into business and non-business stops, optimize separately
     if strategy == "businesses_first" and road_matrix:
@@ -755,30 +761,33 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
             biz_locs = [locations_data[depot_index]] + [locations_data[i] for i in business_indices]
             biz_matrix_size = len(biz_locs)
             biz_idx_map = [depot_index] + business_indices
-            biz_matrix = [[road_matrix[biz_idx_map[r]][biz_idx_map[c]] for c in range(biz_matrix_size)] for r in range(biz_matrix_size)]
+            biz_dist_matrix = [[road_matrix[biz_idx_map[r]][biz_idx_map[c]] for c in range(biz_matrix_size)] for r in range(biz_matrix_size)]
+            biz_dur_matrix = [[duration_matrix[biz_idx_map[r]][biz_idx_map[c]] for c in range(biz_matrix_size)] for r in range(biz_matrix_size)]
             # Open-ended: zero return to depot
             for r in range(biz_matrix_size):
-                biz_matrix[r][0] = 0
-            biz_result = hybrid_optimize_route(biz_locs, 0, biz_matrix)
+                biz_dist_matrix[r][0] = 0
+                biz_dur_matrix[r][0] = 0
+            biz_result = hybrid_optimize_route(biz_locs, 0, biz_dist_matrix, biz_dur_matrix)
 
             # Phase 2: Optimize non-business stops (open-ended from last business stop)
             if non_business_indices:
                 last_biz = biz_result["route"][-1] if biz_result.get("success") and biz_result["route"] else locations_data[depot_index]
-                # Find the original index of the last business stop
                 last_biz_orig_idx = next((i for i, loc in enumerate(locations_data) if loc.get("id") == last_biz.get("id")), depot_index)
                 non_biz_locs = [locations_data[last_biz_orig_idx]] + [locations_data[i] for i in non_business_indices]
                 non_biz_size = len(non_biz_locs)
                 non_biz_idx_map = [last_biz_orig_idx] + non_business_indices
-                non_biz_matrix = [[road_matrix[non_biz_idx_map[r]][non_biz_idx_map[c]] for c in range(non_biz_size)] for r in range(non_biz_size)]
+                non_biz_dist_matrix = [[road_matrix[non_biz_idx_map[r]][non_biz_idx_map[c]] for c in range(non_biz_size)] for r in range(non_biz_size)]
+                non_biz_dur_matrix = [[duration_matrix[non_biz_idx_map[r]][non_biz_idx_map[c]] for c in range(non_biz_size)] for r in range(non_biz_size)]
                 for r in range(non_biz_size):
-                    non_biz_matrix[r][0] = 0
-                non_biz_result = hybrid_optimize_route(non_biz_locs, 0, non_biz_matrix)
+                    non_biz_dist_matrix[r][0] = 0
+                    non_biz_dur_matrix[r][0] = 0
+                non_biz_result = hybrid_optimize_route(non_biz_locs, 0, non_biz_dist_matrix, non_biz_dur_matrix)
                 # Combine: depot + business route + non-business route (skip depot of each)
                 combined_route = [locations_data[depot_index]]
                 if biz_result.get("success"):
-                    combined_route += biz_result["route"][1:]  # Skip depot
+                    combined_route += biz_result["route"][1:]
                 if non_biz_result.get("success"):
-                    combined_route += non_biz_result["route"][1:]  # Skip fake depot
+                    combined_route += non_biz_result["route"][1:]
                 total_dist = (biz_result.get("total_distance_meters", 0) or 0) + (non_biz_result.get("total_distance_meters", 0) or 0)
                 result = {
                     "success": True, "route": combined_route,
@@ -794,32 +803,35 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
                 result = biz_result
                 result["strategy"] = "businesses_first"
         else:
-            # No business stops, just optimize normally (nearest_first)
             strategy = "nearest_first"
 
     if strategy != "businesses_first":
-        # Open-ended route: zero return-to-depot distances
-        effective_matrix = road_matrix
-        if strategy != "round_trip" and effective_matrix:
-            effective_matrix = [row[:] for row in road_matrix]  # Deep copy
-            for i in range(len(effective_matrix)):
-                effective_matrix[i][depot_index] = 0
+        # Prepare effective matrices (zero return-to-depot for open-ended routes)
+        eff_dist = road_matrix
+        eff_dur = duration_matrix
+        if strategy != "round_trip" and road_matrix:
+            eff_dist = [row[:] for row in road_matrix]
+            eff_dur = [row[:] for row in duration_matrix]
+            for i in range(len(eff_dist)):
+                eff_dist[i][depot_index] = 0
+                eff_dur[i][depot_index] = 0
 
         # Allow forcing a specific solver for testing/comparison
         if request.solver == "vroom":
             from optimizer import solve_with_vroom
-            result = solve_with_vroom(locations_data, depot_index, effective_matrix)
+            result = solve_with_vroom(locations_data, depot_index, eff_dist, eff_dur)
         elif request.solver == "pyvrp":
             from optimizer import solve_with_pyvrp
-            result = solve_with_pyvrp(locations_data, depot_index, effective_matrix)
+            result = solve_with_pyvrp(locations_data, depot_index, eff_dist, eff_dur)
         elif request.solver == "ortools":
-            result = optimize_route(locations_data, depot_index, distance_matrix=effective_matrix)
+            result = optimize_route(locations_data, depot_index, distance_matrix=eff_dist, duration_matrix=eff_dur)
             result["solver"] = "ortools"
         else:
             result = hybrid_optimize_route(
                 locations=locations_data,
                 depot_index=depot_index,
-                distance_matrix=effective_matrix,
+                distance_matrix=eff_dist,
+                duration_matrix=eff_dur,
             )
 
         # farthest_first: optimize then reverse (keep depot at start)
@@ -829,10 +841,11 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
 
         result["strategy"] = strategy
 
-    if road_matrix:
+    if road_data:
         result["distance_source"] = "road"
     else:
         result["distance_source"] = "haversine"
+
     return result
 
 
