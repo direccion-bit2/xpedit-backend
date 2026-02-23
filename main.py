@@ -3507,26 +3507,34 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
 
     if data.get("status") != "OK":
         # Fallback: Nominatim (OpenStreetMap) - free, no API key
-        nom_query = input if lat and lng else f"{input}"
-        nom_params = {
-            "q": nom_query,
+        import re
+        nom_query = input
+        nom_base_params = {
             "format": "json",
             "addressdetails": "1",
             "limit": "5",
             "accept-language": "es",
         }
-        # Bias Nominatim results to user's area if coordinates available
         if lat and lng:
-            nom_params["viewbox"] = f"{lng-0.5},{lat+0.5},{lng+0.5},{lat-0.5}"
-            nom_params["bounded"] = "0"
+            nom_base_params["viewbox"] = f"{lng-0.5},{lat+0.5},{lng+0.5},{lat-0.5}"
+            nom_base_params["bounded"] = "0"
 
+        # Try original query first, then stripped of street prefixes
+        street_prefixes = r"^(calle|avenida|avda|av|plaza|paseo|camino|carretera|ctra|ronda|travesia|urbanizacion|urb|poligono|pol)\s+"
+        stripped = re.sub(street_prefixes, "", nom_query, flags=re.IGNORECASE).strip()
+        queries = [nom_query] if stripped == nom_query else [nom_query, stripped]
+
+        nom_data = []
         async with httpx.AsyncClient() as client:
-            nom_resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params=nom_params,
-                headers={"User-Agent": "Xpedit/1.1"}
-            )
-            nom_data = nom_resp.json()
+            for q in queries:
+                nom_resp = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={**nom_base_params, "q": q},
+                    headers={"User-Agent": "Xpedit/1.1"}
+                )
+                nom_data = nom_resp.json()
+                if nom_data:
+                    break
 
         if nom_data:
             results = [{"place_id": None, "display_name": r["display_name"], "lat": r["lat"], "lon": r["lon"], "source": "nominatim"} for r in nom_data]
