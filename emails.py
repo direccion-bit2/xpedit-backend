@@ -543,6 +543,53 @@ def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def send_alert_email(to_email: str, alert_title: str, details: str) -> dict:
+    """Email de alerta del sistema (health check, errores criticos)"""
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #991b1b; font-size: 24px; text-align: center;">
+            {alert_title}
+        </h2>
+
+        <div style="background-color: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 20px; margin: 20px 0;">
+            <pre style="margin: 0; color: #991b1b; font-size: 13px; white-space: pre-wrap; word-break: break-all; font-family: monospace;">{details}</pre>
+        </div>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            Revisa el estado en <a href="https://xpedit.es/api/health" style="color: #dc2626;">xpedit.es/api/health</a>
+        </p>
+    """
+
+    alert_template = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f4f4f5;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f5; padding: 40px 20px;">
+            <tr><td align="center">
+                <table width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                    <tr><td style="background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); padding: 30px; text-align: center;">
+                        <h1 style="margin: 0; color: #fff; font-size: 28px;">Xpedit ALERTA</h1>
+                    </td></tr>
+                    <tr><td style="padding: 40px 30px;">{content}</td></tr>
+                </table>
+            </td></tr>
+        </table>
+    </body>
+    </html>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"[ALERTA] {alert_title}",
+            "html": alert_template,
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def send_broadcast_email(to_emails: List[str], subject: str, body_html: str) -> dict:
     """Email masivo a multiples usuarios"""
     results = {"sent": 0, "failed": 0, "errors": []}

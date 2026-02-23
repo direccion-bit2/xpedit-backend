@@ -41,6 +41,7 @@ if SENTRY_DSN:
     logger.info("Sentry initialized for error monitoring")
 
 from emails import (
+    send_alert_email,
     send_broadcast_email,
     send_custom_email,
     send_daily_summary_email,
@@ -4501,7 +4502,15 @@ async def start_monitoring_jobs():
         id="health_check",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC)")
+    # Website health monitor cada 15 minutos
+    social_scheduler.add_job(
+        monitor_website_health,
+        "interval",
+        minutes=15,
+        id="website_health",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC)")
 
 
 async def periodic_health_check():
@@ -4523,6 +4532,70 @@ async def periodic_health_check():
         if SENTRY_DSN:
             sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
             sentry_sdk.capture_exception(e)
+
+
+# Website health monitor - cooldown timestamp
+_last_website_alert: Optional[datetime] = None
+WEBSITE_HEALTH_URL = "https://xpedit.es/api/health"
+ALERT_COOLDOWN_HOURS = 2
+ALERT_EMAIL = "direccion@taespack.com"
+
+
+async def monitor_website_health():
+    """Pinga /api/health de la web cada 15 min. Si falla, envia email alerta."""
+    global _last_website_alert
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(WEBSITE_HEALTH_URL)
+
+        if resp.status_code == 200:
+            if SENTRY_DSN:
+                sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="ok")
+            return
+
+        # Degraded or error
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text[:500]}
+
+        logger.warning(f"Website health degraded: status={resp.status_code} body={body}")
+
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="error")
+
+        # Check cooldown before sending alert email
+        now = datetime.utcnow()
+        if _last_website_alert and (now - _last_website_alert).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
+            logger.info("Website alert skipped (cooldown active)")
+            return
+
+        details = f"Status: {resp.status_code}\nURL: {WEBSITE_HEALTH_URL}\nTimestamp: {now.isoformat()}Z\n\n"
+        if isinstance(body, dict) and "checks" in body:
+            for check, result in body["checks"].items():
+                details += f"{check}: {result}\n"
+        else:
+            details += f"Response: {json.dumps(body, indent=2)}"
+
+        result = send_alert_email(ALERT_EMAIL, "Web xpedit.es degradada", details)
+        if result.get("success"):
+            _last_website_alert = now
+            logger.info(f"Website alert email sent to {ALERT_EMAIL}")
+        else:
+            logger.error(f"Failed to send website alert: {result.get('error')}")
+
+    except Exception as e:
+        logger.error(f"Website health monitor failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="error")
+            sentry_sdk.capture_exception(e)
+
+        # Also alert on connection failures (site completely down)
+        now = datetime.utcnow()
+        if not _last_website_alert or (now - _last_website_alert).total_seconds() >= ALERT_COOLDOWN_HOURS * 3600:
+            result = send_alert_email(ALERT_EMAIL, "Web xpedit.es NO responde", f"URL: {WEBSITE_HEALTH_URL}\nError: {e}\nTimestamp: {now.isoformat()}Z")
+            if result.get("success"):
+                _last_website_alert = now
 
 
 # === VOICE ASSISTANT (Gemini Flash) ===
