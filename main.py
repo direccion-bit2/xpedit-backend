@@ -1738,7 +1738,7 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="No tienes acceso a estos datos")
     try:
         result = supabase.table("drivers")\
-            .select("promo_plan, promo_plan_expires_at")\
+            .select("promo_plan, promo_plan_expires_at, is_ambassador")\
             .eq("id", driver_id)\
             .single()\
             .execute()
@@ -1750,13 +1750,16 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
         promo_plan = driver.get("promo_plan")
         expires_at_str = driver.get("promo_plan_expires_at")
 
+        is_ambassador = driver.get("is_ambassador", False)
+
         if not promo_plan:
             return {
                 "has_promo": False,
                 "plan": None,
                 "expires_at": None,
                 "days_remaining": 0,
-                "permanent": False
+                "permanent": False,
+                "is_ambassador": is_ambassador
             }
 
         # Permanent plan (no expiration date)
@@ -1766,7 +1769,8 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
                 "plan": promo_plan,
                 "expires_at": None,
                 "days_remaining": -1,
-                "permanent": True
+                "permanent": True,
+                "is_ambassador": is_ambassador
             }
 
         expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
@@ -1781,7 +1785,8 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
             "plan": promo_plan if has_promo else None,
             "expires_at": expires_at_str if has_promo else None,
             "days_remaining": days_remaining,
-            "permanent": False
+            "permanent": False,
+            "is_ambassador": is_ambassador
         }
 
     except HTTPException:
@@ -2092,6 +2097,7 @@ async def admin_toggle_company(company_id: str, request: dict, user=Depends(requ
 
 class DriverFeatureToggleRequest(BaseModel):
     voice_assistant_enabled: Optional[bool] = None
+    is_ambassador: Optional[bool] = None
 
 
 @app.patch("/admin/drivers/{driver_id}/features", tags=["admin"], summary="Toggle feature flags de un driver")
@@ -2101,6 +2107,15 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
         update_data = {}
         if request.voice_assistant_enabled is not None:
             update_data["voice_assistant_enabled"] = request.voice_assistant_enabled
+
+        if request.is_ambassador is not None:
+            update_data["is_ambassador"] = request.is_ambassador
+            if request.is_ambassador:
+                update_data["promo_plan"] = "pro"
+                update_data["promo_plan_expires_at"] = None
+            else:
+                update_data["promo_plan"] = None
+                update_data["promo_plan_expires_at"] = None
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
