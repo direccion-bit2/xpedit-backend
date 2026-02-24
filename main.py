@@ -3579,6 +3579,30 @@ async def places_details(place_id: str, user=Depends(get_current_user)):
     return resp.json()
 
 
+@app.get("/places/snap", tags=["places"], summary="Alinear coordenadas a la red de carreteras de Google")
+async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
+    """Reverse geocode via Google to get road-aligned coordinates.
+    Used when stops come from Nominatim (which can be 30-40m off from Google's road network)."""
+    params = {
+        "latlng": f"{lat},{lng}",
+        "language": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.get("https://maps.googleapis.com/maps/api/geocode/json", params=params)
+        data = resp.json()
+    if data.get("status") == "OK" and data.get("results"):
+        result = data["results"][0]
+        gloc = result.get("geometry", {}).get("location", {})
+        return {
+            "status": "OK",
+            "lat": gloc.get("lat", lat),
+            "lng": gloc.get("lng", lng),
+            "formatted_address": result.get("formatted_address", ""),
+        }
+    return {"status": "FALLBACK", "lat": lat, "lng": lng, "formatted_address": ""}
+
+
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
