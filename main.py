@@ -668,76 +668,124 @@ async def download_apk(request: Request):
 OSRM_URL = os.getenv("OSRM_URL", "http://router.project-osrm.org")
 OSRM_MAX_RETRIES = 8  # Persist: better to wait than fall back to haversine
 OSRM_RETRY_DELAYS = [1.5, 2.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0]  # ~26s total wait max
+OSRM_CHUNK_SIZE = 100  # Max sources per chunked request
 
 
-async def get_road_distance_matrix(locations: list) -> dict | None:
-    """
-    Obtiene matrices de distancias y duraciones reales por carretera usando OSRM.
-    PERSISTE: reintenta agresivamente antes de caer a Haversine (ruta basura).
-    La matriz de duraciones es ASIMÉTRICA (A→B ≠ B→A) por calles de un sentido.
-    Retorna {"distances": [...], "durations": [...]} o None solo si OSRM es inalcanzable.
-    """
+async def _osrm_table_request(
+    coords_str: str,
+    sources_param: str = "",
+    destinations_param: str = "",
+    n_label: int = 0,
+) -> dict | None:
+    """Single OSRM table request with retries. Returns raw distances/durations or None."""
     import asyncio
 
-    n = len(locations)
-    if n < 2 or n > 200:
-        return None
-
-    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
-    url = f"{OSRM_URL}/table/v1/driving/{coords}?annotations=duration,distance"
+    params = "annotations=duration,distance"
+    if sources_param:
+        params += f"&sources={sources_param}"
+    if destinations_param:
+        params += f"&destinations={destinations_param}"
+    url = f"{OSRM_URL}/table/v1/driving/{coords_str}?{params}"
 
     for attempt in range(OSRM_MAX_RETRIES):
         try:
-            # Respect 1 req/s rate limit of public server
             if attempt > 0:
                 delay = OSRM_RETRY_DELAYS[min(attempt, len(OSRM_RETRY_DELAYS) - 1)]
-                logger.info(f"OSRM: waiting {delay}s before retry {attempt+1}/{OSRM_MAX_RETRIES} ({n} locations)")
+                logger.info(f"OSRM: waiting {delay}s before retry {attempt+1}/{OSRM_MAX_RETRIES} ({n_label} locs)")
                 await asyncio.sleep(delay)
 
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, timeout=30.0, headers={"User-Agent": "Xpedit/1.0"})
 
-                # Rate limited - always retry (we WANT road distances)
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", 3.0))
-                    logger.warning(f"OSRM rate limited (429), waiting {retry_after}s (attempt {attempt+1}/{OSRM_MAX_RETRIES})")
+                    logger.warning(f"OSRM rate limited (429), waiting {retry_after}s (attempt {attempt+1})")
                     await asyncio.sleep(retry_after)
                     continue
 
-                # Server error - retry
                 if resp.status_code >= 500:
-                    logger.warning(f"OSRM server error ({resp.status_code}), attempt {attempt+1}/{OSRM_MAX_RETRIES}")
+                    logger.warning(f"OSRM server error ({resp.status_code}), attempt {attempt+1}")
                     continue
 
-                # Client error 400 (bad coords, etc) - no point retrying
                 if resp.status_code >= 400:
-                    logger.error(f"OSRM client error ({resp.status_code}) for {n} locations - cannot recover")
+                    logger.error(f"OSRM client error ({resp.status_code}) - cannot recover")
                     return None
 
                 data = resp.json()
                 if data.get("code") == "Ok" and data.get("distances") and data.get("durations"):
-                    logger.info(f"OSRM road matrix OK: {n} locations, attempt {attempt+1}")
-                    distances = [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
-                    durations = [[int(d) if d is not None else 999999 for d in row] for row in data["durations"]]
-                    return {"distances": distances, "durations": durations}
+                    return data
 
-                # TooBig = too many coords for public server, can't recover
                 osrm_code = data.get("code", "Unknown")
                 if osrm_code == "TooBig":
-                    logger.error(f"OSRM: {n} locations too many for server (code={osrm_code})")
+                    logger.warning(f"OSRM TooBig for {n_label} locs")
                     return None
 
-                # Other OSRM errors - retry (might be transient)
-                logger.warning(f"OSRM code '{osrm_code}' for {n} locations, attempt {attempt+1}/{OSRM_MAX_RETRIES}")
+                logger.warning(f"OSRM code '{osrm_code}', attempt {attempt+1}")
                 continue
 
         except httpx.TimeoutException:
-            logger.warning(f"OSRM timeout ({n} locations), attempt {attempt+1}/{OSRM_MAX_RETRIES}")
+            logger.warning(f"OSRM timeout, attempt {attempt+1}")
         except Exception as e:
-            logger.warning(f"OSRM error: {type(e).__name__}: {e}, attempt {attempt+1}/{OSRM_MAX_RETRIES}")
+            logger.warning(f"OSRM error: {type(e).__name__}: {e}, attempt {attempt+1}")
 
-    logger.error(f"OSRM FAILED after {OSRM_MAX_RETRIES} retries for {n} locations - falling back to Haversine (degraded route quality)")
     return None
+
+
+async def get_road_distance_matrix(locations: list) -> dict | None:
+    """
+    Obtiene matrices de distancias y duraciones reales por carretera usando OSRM.
+    Reintenta agresivamente. Para >100 paradas, chunkea con sources/destinations.
+    La matriz de duraciones es ASIMÉTRICA (A→B ≠ B→A) por calles de un sentido.
+    Retorna {"distances": [...], "durations": [...]} o None si OSRM es inalcanzable.
+    """
+    import asyncio
+
+    n = len(locations)
+    if n < 2 or n > 500:
+        return None
+
+    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+
+    # Small enough for a single request
+    if n <= OSRM_CHUNK_SIZE:
+        data = await _osrm_table_request(coords, n_label=n)
+        if not data:
+            logger.error(f"OSRM FAILED for {n} locations after all retries")
+            return None
+        logger.info(f"OSRM road matrix OK: {n} locations")
+        distances = [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
+        durations = [[int(d) if d is not None else 999999 for d in row] for row in data["durations"]]
+        return {"distances": distances, "durations": durations}
+
+    # Chunked: send all coords but request source rows in batches
+    # OSRM sources/destinations params select which rows/columns to compute
+    logger.info(f"OSRM chunked mode: {n} locations, chunk_size={OSRM_CHUNK_SIZE}")
+    distances = [[0] * n for _ in range(n)]
+    durations = [[0] * n for _ in range(n)]
+
+    for chunk_start in range(0, n, OSRM_CHUNK_SIZE):
+        chunk_end = min(chunk_start + OSRM_CHUNK_SIZE, n)
+        sources_param = ";".join(str(i) for i in range(chunk_start, chunk_end))
+
+        # Rate limit: wait 1.5s between chunks
+        if chunk_start > 0:
+            await asyncio.sleep(1.5)
+
+        data = await _osrm_table_request(coords, sources_param=sources_param, n_label=n)
+        if not data:
+            logger.error(f"OSRM chunk {chunk_start}-{chunk_end} FAILED for {n} locations")
+            return None
+
+        # data["distances"] has (chunk_end - chunk_start) rows x n columns
+        for local_i, row_dist in enumerate(data["distances"]):
+            global_i = chunk_start + local_i
+            distances[global_i] = [int(d) if d is not None else 999999 for d in row_dist]
+        for local_i, row_dur in enumerate(data["durations"]):
+            global_i = chunk_start + local_i
+            durations[global_i] = [int(d) if d is not None else 999999 for d in row_dur]
+
+    logger.info(f"OSRM chunked matrix OK: {n} locations in {(n + OSRM_CHUNK_SIZE - 1) // OSRM_CHUNK_SIZE} chunks")
+    return {"distances": distances, "durations": durations}
 
 
 @app.post("/optimize", tags=["optimize"], summary="Optimizar ruta")
@@ -852,6 +900,7 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
         result["distance_source"] = "road"
     else:
         result["distance_source"] = "haversine"
+        result["warning"] = "No se pudieron obtener distancias por carretera. La ruta es aproximada."
 
     return result
 

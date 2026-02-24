@@ -122,7 +122,6 @@ def optimize_route(
     if depot_index < 0 or depot_index >= len(locations):
         depot_index = 0
 
-    # Usar matriz proporcionada (distancias reales) o crear con Haversine (fallback)
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
 
@@ -288,7 +287,6 @@ def solve_with_vroom(
             "message": "Solo hay una parada, no hay nada que optimizar"
         }
 
-    # Build distance matrix if not provided
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
 
@@ -572,7 +570,6 @@ def hybrid_optimize_route(
     if depot_index < 0 or depot_index >= n:
         depot_index = 0
 
-    # Build distance matrix once, reuse for all solvers
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
 
