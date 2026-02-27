@@ -7,6 +7,8 @@ Tests for admin endpoints:
   - PATCH /admin/promo-codes/{code_id}
   - POST /admin/users/{user_id}/reset-password
   - POST /admin/companies
+  - GET /admin/stats
+  - GET /admin/companies (list)
   - Admin-only access control
 """
 
@@ -477,3 +479,189 @@ class TestAdminCreateCompany:
         data = response.json()
         assert data["success"] is True
         assert data["company"]["name"] == "Test Company"
+
+
+class TestAdminStats:
+    """Tests for GET /admin/stats"""
+
+    @pytest.mark.asyncio
+    async def test_stats_success(self, admin_client):
+        """Admin should get global stats."""
+        with patch("main.supabase") as mock_sb:
+            # Build mock results for each query
+            drivers_result = MagicMock()
+            drivers_result.count = 50
+            drivers_result.data = []
+
+            routes_today_result = MagicMock()
+            routes_today_result.count = 5
+            routes_today_result.data = [
+                {"driver_id": "d1"}, {"driver_id": "d2"}, {"driver_id": "d1"},
+            ]
+
+            routes_week_result = MagicMock()
+            routes_week_result.count = 20
+            routes_week_result.data = [
+                {"driver_id": "d1"}, {"driver_id": "d2"}, {"driver_id": "d3"},
+            ]
+
+            new_month_result = MagicMock()
+            new_month_result.count = 8
+            new_month_result.data = []
+
+            routes_total_result = MagicMock()
+            routes_total_result.count = 200
+            routes_total_result.data = []
+
+            routes_month_result = MagicMock()
+            routes_month_result.count = 40
+            routes_month_result.data = []
+
+            stops_total_result = MagicMock()
+            stops_total_result.count = 1000
+            stops_total_result.data = []
+
+            stops_today_result = MagicMock()
+            stops_today_result.count = 15
+            stops_today_result.data = []
+
+            stops_week_result = MagicMock()
+            stops_week_result.count = 80
+            stops_week_result.data = []
+
+            stops_month_result = MagicMock()
+            stops_month_result.count = 300
+            stops_month_result.data = []
+
+            failed_today_result = MagicMock()
+            failed_today_result.count = 2
+            failed_today_result.data = []
+
+            failed_week_result = MagicMock()
+            failed_week_result.count = 5
+            failed_week_result.data = []
+
+            call_index = {"drivers": 0, "routes": 0, "stops": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    call_index["drivers"] += 1
+                    if call_index["drivers"] == 1:
+                        chain.select.return_value.execute.return_value = drivers_result
+                    else:
+                        chain.select.return_value.gte.return_value.execute.return_value = new_month_result
+                elif name == "routes":
+                    call_index["routes"] += 1
+                    if call_index["routes"] == 1:
+                        chain.select.return_value.gte.return_value.execute.return_value = routes_today_result
+                    elif call_index["routes"] == 2:
+                        chain.select.return_value.gte.return_value.execute.return_value = routes_week_result
+                    elif call_index["routes"] == 3:
+                        chain.select.return_value.execute.return_value = routes_total_result
+                    else:
+                        chain.select.return_value.gte.return_value.execute.return_value = routes_month_result
+                elif name == "stops":
+                    call_index["stops"] += 1
+                    if call_index["stops"] == 1:
+                        chain.select.return_value.eq.return_value.execute.return_value = stops_total_result
+                    elif call_index["stops"] == 2:
+                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = stops_today_result
+                    elif call_index["stops"] == 3:
+                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = stops_week_result
+                    elif call_index["stops"] == 4:
+                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = stops_month_result
+                    elif call_index["stops"] == 5:
+                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = failed_today_result
+                    else:
+                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = failed_week_result
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+
+            response = await admin_client.get("/admin/stats")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        stats = data["stats"]
+        assert "users" in stats
+        assert "routes" in stats
+        assert "deliveries" in stats
+        assert "failed" in stats
+        assert stats["users"]["total"] == 50
+        assert stats["users"]["active_today"] == 2  # d1, d2 unique
+        assert stats["users"]["active_week"] == 3  # d1, d2, d3 unique
+
+    @pytest.mark.asyncio
+    async def test_stats_requires_admin(self, client):
+        """Regular driver should get 403 on stats."""
+        response = await client.get("/admin/stats")
+        assert response.status_code == 403
+
+
+class TestAdminListCompanies:
+    """Tests for GET /admin/companies (list)"""
+
+    @pytest.mark.asyncio
+    async def test_list_companies_success(self, admin_client):
+        """Admin should see all companies with driver count and subscription."""
+        with patch("main.supabase") as mock_sb:
+            companies_result = MagicMock()
+            companies_result.data = [
+                {"id": "c1", "name": "Company A", "active": True},
+                {"id": "c2", "name": "Company B", "active": False},
+            ]
+
+            links_c1 = MagicMock()
+            links_c1.count = 5
+            links_c1.data = []
+
+            links_c2 = MagicMock()
+            links_c2.count = 2
+            links_c2.data = []
+
+            sub_c1 = MagicMock()
+            sub_c1.data = [{"id": "s1", "plan": "pro", "status": "active"}]
+
+            sub_c2 = MagicMock()
+            sub_c2.data = []
+
+            call_index = {"links": 0, "subs": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "companies":
+                    chain.select.return_value.order.return_value.execute.return_value = companies_result
+                elif name == "company_driver_links":
+                    call_index["links"] += 1
+                    if call_index["links"] == 1:
+                        chain.select.return_value.eq.return_value.execute.return_value = links_c1
+                    else:
+                        chain.select.return_value.eq.return_value.execute.return_value = links_c2
+                elif name == "company_subscriptions":
+                    call_index["subs"] += 1
+                    if call_index["subs"] == 1:
+                        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = sub_c1
+                    else:
+                        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = sub_c2
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+
+            response = await admin_client.get("/admin/companies")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert len(data["companies"]) == 2
+        assert data["companies"][0]["driver_count"] == 5
+        assert data["companies"][0]["subscription"]["plan"] == "pro"
+        assert data["companies"][1]["driver_count"] == 2
+        assert data["companies"][1]["subscription"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_companies_requires_admin(self, client):
+        """Regular driver should get 403 on list companies."""
+        response = await client.get("/admin/companies")
+        assert response.status_code == 403

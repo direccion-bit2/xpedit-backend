@@ -2205,6 +2205,98 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
+@app.get("/admin/stats", tags=["admin"], summary="Estadísticas globales")
+async def admin_stats(user=Depends(require_admin)):
+    """Estadísticas globales: usuarios, rutas, entregas, fallos. Solo admin."""
+    try:
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+        # Total drivers
+        drivers_total = supabase.table("drivers").select("id", count="exact").execute()
+
+        # Active today (have routes created today)
+        routes_today = supabase.table("routes").select("driver_id", count="exact").gte("created_at", today_start).execute()
+        active_today_ids = {r["driver_id"] for r in (routes_today.data or []) if r.get("driver_id")}
+
+        # Active this week
+        routes_week = supabase.table("routes").select("driver_id", count="exact").gte("created_at", week_start).execute()
+        active_week_ids = {r["driver_id"] for r in (routes_week.data or []) if r.get("driver_id")}
+
+        # New drivers this month
+        new_month = supabase.table("drivers").select("id", count="exact").gte("created_at", month_start).execute()
+
+        # Routes counts
+        routes_total = supabase.table("routes").select("id", count="exact").execute()
+        routes_month = supabase.table("routes").select("id", count="exact").gte("created_at", month_start).execute()
+
+        # Stops delivered/failed
+        stops_total = supabase.table("stops").select("id", count="exact").eq("status", "completed").execute()
+        stops_today = supabase.table("stops").select("id", count="exact").eq("status", "completed").gte("completed_at", today_start).execute()
+        stops_week = supabase.table("stops").select("id", count="exact").eq("status", "completed").gte("completed_at", week_start).execute()
+        stops_month = supabase.table("stops").select("id", count="exact").eq("status", "completed").gte("completed_at", month_start).execute()
+        failed_today = supabase.table("stops").select("id", count="exact").eq("status", "failed").gte("completed_at", today_start).execute()
+        failed_week = supabase.table("stops").select("id", count="exact").eq("status", "failed").gte("completed_at", week_start).execute()
+
+        return {
+            "success": True,
+            "stats": {
+                "users": {
+                    "total": drivers_total.count or 0,
+                    "active_today": len(active_today_ids),
+                    "active_week": len(active_week_ids),
+                    "new_month": new_month.count or 0,
+                },
+                "routes": {
+                    "today": routes_today.count or 0,
+                    "week": routes_week.count or 0,
+                    "month": routes_month.count or 0,
+                    "total": routes_total.count or 0,
+                },
+                "deliveries": {
+                    "today": stops_today.count or 0,
+                    "week": stops_week.count or 0,
+                    "month": stops_month.count or 0,
+                    "total": stops_total.count or 0,
+                },
+                "failed": {
+                    "today": failed_today.count or 0,
+                    "week": failed_week.count or 0,
+                },
+            },
+        }
+    except Exception as e:
+        logger.error(f"Admin stats error: {e}")
+        raise HTTPException(status_code=500, detail="Error obteniendo estadísticas")
+
+
+@app.get("/admin/companies", tags=["admin", "company"], summary="Listar empresas")
+async def admin_list_companies(user=Depends(require_admin)):
+    """Lista todas las empresas con conteo de drivers y suscripción. Solo admin."""
+    try:
+        companies = supabase.table("companies").select("*").order("created_at", desc=True).execute()
+
+        result = []
+        for company in (companies.data or []):
+            # Driver count
+            links = supabase.table("company_driver_links").select("id", count="exact").eq("company_id", company["id"]).execute()
+            # Subscription
+            sub = supabase.table("company_subscriptions").select("*").eq("company_id", company["id"]).order("created_at", desc=True).limit(1).execute()
+
+            result.append({
+                **company,
+                "driver_count": links.count or 0,
+                "subscription": safe_first(sub),
+            })
+
+        return {"success": True, "companies": result}
+    except Exception as e:
+        logger.error(f"Admin companies error: {e}")
+        raise HTTPException(status_code=500, detail="Error listando empresas")
+
+
 # === REFERRAL SYSTEM ===
 
 INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
