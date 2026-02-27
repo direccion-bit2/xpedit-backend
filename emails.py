@@ -65,33 +65,56 @@ def get_base_template(content: str, title: str = "Xpedit") -> str:
 
 
 def send_welcome_email(to_email: str, user_name: str) -> dict:
-    """Email de bienvenida para nuevos usuarios"""
+    """Email de bienvenida para nuevos usuarios - guia de activacion en 3 pasos"""
     content = f"""
-        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px;">¡Bienvenido a Xpedit, {user_name}!</h2>
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px;">Hola {user_name}, tu primera ruta te espera</h2>
 
-        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Gracias por unirte a Xpedit. Estamos encantados de tenerte con nosotros.
+        <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Crear y optimizar una ruta con Xpedit lleva menos de 2 minutos. Asi de facil:
         </p>
 
-        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Con Xpedit podrás:
-        </p>
+        <!-- Paso 1 -->
+        <div style="display: flex; align-items: flex-start; margin-bottom: 20px;">
+            <div style="background-color: #3b82f6; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px; flex-shrink: 0; margin-right: 14px;">1</div>
+            <div>
+                <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Abre la app y agrega paradas</p>
+                <p style="margin: 0; color: #6b7280; font-size: 14px;">Escribe direcciones, usa la voz o escanea etiquetas con la camara.</p>
+            </div>
+        </div>
 
-        <ul style="margin: 0 0 25px 0; padding-left: 20px; color: #4b5563; font-size: 15px; line-height: 1.8;">
-            <li><strong>Optimizar rutas</strong> - Ahorra tiempo y combustible</li>
-            <li><strong>Seguimiento en tiempo real</strong> - Sabe dónde están tus repartidores</li>
-            <li><strong>Pruebas de entrega</strong> - Fotos y firmas digitales</li>
-            <li><strong>Notificaciones automáticas</strong> - Mantén informados a tus clientes</li>
-        </ul>
+        <!-- Paso 2 -->
+        <div style="display: flex; align-items: flex-start; margin-bottom: 20px;">
+            <div style="background-color: #22c55e; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px; flex-shrink: 0; margin-right: 14px;">2</div>
+            <div>
+                <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Pulsa "Optimizar"</p>
+                <p style="margin: 0; color: #6b7280; font-size: 14px;">Nuestra IA ordena las paradas en el recorrido mas corto. Ahorra hasta un 30% en km.</p>
+            </div>
+        </div>
+
+        <!-- Paso 3 -->
+        <div style="display: flex; align-items: flex-start; margin-bottom: 25px;">
+            <div style="background-color: #f59e0b; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px; flex-shrink: 0; margin-right: 14px;">3</div>
+            <div>
+                <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Navega y entrega</p>
+                <p style="margin: 0; color: #6b7280; font-size: 14px;">Navegacion paso a paso con voz. Marca entregas con foto y firma.</p>
+            </div>
+        </div>
+
+        <!-- Promo code callout -->
+        <div style="background-color: #eff6ff; border: 2px dashed #3b82f6; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center;">
+            <p style="margin: 0 0 6px 0; color: #1e40af; font-size: 14px; font-weight: 600;">REGALO DE BIENVENIDA</p>
+            <p style="margin: 0 0 8px 0; color: #111827; font-size: 22px; font-weight: 700;">10 dias de Pro+ gratis</p>
+            <p style="margin: 0; color: #6b7280; font-size: 14px;">Usa el codigo <strong style="color: #3b82f6; font-size: 16px;">BETAXPEDIT</strong> en Ajustes &gt; Canjear codigo</p>
+        </div>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es/dashboard" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
-                Ir al Dashboard
+            <a href="https://xpedit.es" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+                Abrir Xpedit
             </a>
         </div>
 
-        <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px;">
-            ¿Necesitas ayuda? Escríbenos a info@xpedit.es
+        <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            Responde a este email si necesitas ayuda — te contestamos en menos de 24h.
         </p>
     """
 
@@ -99,7 +122,8 @@ def send_welcome_email(to_email: str, user_name: str) -> dict:
         response = resend.Emails.send({
             "from": FROM_EMAIL,
             "to": [to_email],
-            "subject": f"¡Bienvenido a Xpedit, {user_name}!",
+            "reply_to": REPLY_TO,
+            "subject": "Crea tu primera ruta en 2 minutos",
             "html": get_base_template(content, "Bienvenido a Xpedit")
         })
         return {"success": True, "id": response["id"]}

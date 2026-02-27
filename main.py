@@ -84,6 +84,30 @@ def safe_first(result) -> Optional[dict]:
     return result.data[0] if result.data else None
 
 
+async def send_push_to_token(token: str, title: str, body: str, data: dict = None) -> bool:
+    """Send an Expo push notification to a single token. Returns True on success."""
+    if not token or not token.startswith("ExponentPushToken["):
+        return False
+    payload = {"to": token, "title": title, "body": body, "sound": "default"}
+    if data:
+        payload["data"] = data
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=payload,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+            result = resp.json()
+            if result.get("data", {}).get("status") == "error":
+                logger.warning(f"Push failed for token {token[:30]}...: {result['data'].get('message')}")
+                return False
+            return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Push send error: {e}")
+        return False
+
+
 # ========== ADDRESS NORMALIZATION ==========
 _STREET_PREFIXES = {
     "c/": "calle", "cl": "calle", "cl.": "calle",
@@ -602,6 +626,12 @@ class AdminBroadcastEmailRequest(BaseModel):
     subject: str
     body: str  # HTML body
     target: str = "all"  # all, free, pro, pro_plus
+
+
+class AdminPushBlastRequest(BaseModel):
+    title: str
+    body: str
+    target: str = "inactive"  # "inactive" | "all"
 
 
 class CustomerNotificationRequest(BaseModel):
@@ -1614,6 +1644,44 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error enviando broadcast")
+
+
+@app.post("/admin/push-blast")
+async def admin_push_blast(request: AdminPushBlastRequest, user=Depends(require_admin)):
+    """Send push notifications to drivers. target='inactive' = drivers with push_token but 0 routes, 'all' = all with push_token."""
+    import asyncio
+
+    try:
+        # Get all drivers with push tokens
+        drivers_result = supabase.table("drivers").select("id, name, push_token").not_.is_("push_token", "null").execute()
+        if not drivers_result.data:
+            return {"success": True, "sent": 0, "failed": 0, "total": 0, "message": "No drivers with push tokens"}
+
+        targets = drivers_result.data
+
+        if request.target == "inactive":
+            # Filter to drivers with 0 routes
+            routes_result = supabase.table("routes").select("driver_id").execute()
+            drivers_with_routes = {r["driver_id"] for r in (routes_result.data or []) if r.get("driver_id")}
+            targets = [d for d in targets if d["id"] not in drivers_with_routes]
+
+        if not targets:
+            return {"success": True, "sent": 0, "failed": 0, "total": 0, "message": "No matching drivers"}
+
+        # Send pushes in parallel
+        results = await asyncio.gather(*[
+            send_push_to_token(d["push_token"], request.title, request.body)
+            for d in targets
+        ])
+
+        sent = sum(1 for r in results if r)
+        failed = sum(1 for r in results if not r)
+        logger.info(f"Push blast ({request.target}): {sent} sent, {failed} failed out of {len(targets)}")
+
+        return {"success": True, "sent": sent, "failed": failed, "total": len(targets)}
+    except Exception as e:
+        logger.error(f"Push blast error: {e}")
+        raise HTTPException(status_code=500, detail="Error enviando push blast")
 
 
 # === PROMO CODE MODELS ===
@@ -4576,6 +4644,47 @@ async def run_retention_cleanup():
             sentry_sdk.capture_exception(e)
 
 
+async def send_weekly_reengagement_push():
+    """Weekly push to drivers registered in last 30 days with 0 routes. Runs Monday 10:00 UTC."""
+    import asyncio
+
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        # Drivers registered in last 30 days with push tokens
+        drivers_result = (
+            supabase.table("drivers")
+            .select("id, name, push_token")
+            .not_.is_("push_token", "null")
+            .gte("created_at", cutoff)
+            .execute()
+        )
+        if not drivers_result.data:
+            logger.info("Weekly re-engagement: no recent drivers with push tokens")
+            return
+
+        # Filter out those who already created routes
+        routes_result = supabase.table("routes").select("driver_id").execute()
+        drivers_with_routes = {r["driver_id"] for r in (routes_result.data or []) if r.get("driver_id")}
+        inactive = [d for d in drivers_result.data if d["id"] not in drivers_with_routes]
+
+        if not inactive:
+            logger.info("Weekly re-engagement: all recent drivers already have routes")
+            return
+
+        results = await asyncio.gather(*[
+            send_push_to_token(
+                d["push_token"],
+                "Tu primera ruta te espera",
+                "Crea una ruta en 2 minutos y ahorra hasta un 30% en km. Abre Xpedit.",
+            )
+            for d in inactive
+        ])
+        sent = sum(1 for r in results if r)
+        logger.info(f"Weekly re-engagement: {sent}/{len(inactive)} pushes sent")
+    except Exception as e:
+        logger.error(f"Weekly re-engagement push error: {e}")
+
+
 # Track server start time for uptime
 _server_start_time = datetime.utcnow()
 
@@ -4583,6 +4692,16 @@ _server_start_time = datetime.utcnow()
 @app.on_event("startup")
 async def start_monitoring_jobs():
     """Iniciar jobs de backup y limpieza."""
+    # Re-engagement push semanal (lunes 10:00 UTC)
+    social_scheduler.add_job(
+        send_weekly_reengagement_push,
+        "cron",
+        day_of_week="mon",
+        hour=10,
+        minute=0,
+        id="weekly_reengagement_push",
+        replace_existing=True,
+    )
     # Backup diario a las 3:00 AM UTC
     social_scheduler.add_job(
         backup_critical_tables,
@@ -4618,7 +4737,7 @@ async def start_monitoring_jobs():
         id="website_health",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC)")
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC)")
 
 
 async def periodic_health_check():
