@@ -191,9 +191,12 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
 stripe.api_key = STRIPE_SECRET_KEY
 
+STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
+STRIPE_PRICE_PRO_PLUS = os.getenv("STRIPE_PRICE_PRO_PLUS", "")
+
 STRIPE_PLANS = {
-    "pro": {"name": "Xpedit Pro", "amount": 499, "interval": "month"},
-    "pro_plus": {"name": "Xpedit Pro+", "amount": 999, "interval": "month"},
+    "pro": {"name": "Xpedit Pro", "price_id": STRIPE_PRICE_PRO},
+    "pro_plus": {"name": "Xpedit Pro+", "price_id": STRIPE_PRICE_PRO_PLUS},
 }
 
 # JWKS client for ES256 token verification (Supabase uses ES256)
@@ -3416,24 +3419,33 @@ async def create_stripe_checkout(request: StripeCheckoutRequest, user=Depends(ge
     if not plan_info:
         raise HTTPException(status_code=400, detail="Plan invalido. Use 'pro' o 'pro_plus'")
 
+    if not plan_info["price_id"]:
+        logger.error(f"Stripe Price ID not configured for plan: {request.plan}")
+        raise HTTPException(status_code=503, detail="Plan no configurado en Stripe")
+
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "eur",
-                    "product_data": {"name": plan_info["name"]},
-                    "unit_amount": plan_info["amount"],
-                    "recurring": {"interval": plan_info["interval"]},
-                },
-                "quantity": 1,
-            }],
-            client_reference_id=user["id"],
-            metadata={"plan": request.plan, "user_id": user["id"]},
-            success_url="https://xpedit.es/dashboard?payment=success",
-            cancel_url="https://xpedit.es/dashboard?payment=cancel",
-        )
+        # Get user email for pre-filling checkout
+        user_email = None
+        try:
+            user_result = supabase.table("users").select("email").eq("id", user["id"]).single().execute()
+            if user_result.data:
+                user_email = user_result.data.get("email")
+        except Exception:
+            pass  # Non-critical, proceed without email
+
+        checkout_params = {
+            "mode": "subscription",
+            "line_items": [{"price": plan_info["price_id"], "quantity": 1}],
+            "client_reference_id": user["id"],
+            "metadata": {"plan": request.plan, "user_id": user["id"]},
+            "subscription_data": {"trial_period_days": 10, "metadata": {"plan": request.plan}},
+            "success_url": "https://xpedit.es/dashboard?payment=success",
+            "cancel_url": "https://xpedit.es/#pricing",
+        }
+        if user_email:
+            checkout_params["customer_email"] = user_email
+
+        session = stripe.checkout.Session.create(**checkout_params)
         return {"success": True, "url": session.url}
 
     except stripe.StripeError as e:
@@ -3533,6 +3545,11 @@ async def stripe_webhook(request: Request):
                         "promo_plan_expires_at": expires_at,
                     }).eq("id", user_id).execute()
                     logger.info(f"Stripe renewal for user {user_id}")
+
+        elif event_type == "invoice.payment_failed":
+            customer_id = getattr(data_obj, "customer", None)
+            attempt_count = getattr(data_obj, "attempt_count", None)
+            logger.warning(f"Stripe payment failed for customer {customer_id}, attempt {attempt_count}")
 
         else:
             logger.info(f"Stripe webhook unhandled event type: {event_type} (ignored)")
