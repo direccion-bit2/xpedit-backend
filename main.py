@@ -267,6 +267,21 @@ async def require_admin(user=Depends(get_current_user)):
     return user
 
 
+def log_audit(admin_id: str, action: str, resource_type: str, resource_id: str = None, details: dict = None, ip_address: str = None):
+    """Log an admin action to the audit_log table. Fire and forget."""
+    try:
+        supabase.table("audit_log").insert({
+            "admin_id": admin_id,
+            "action": action,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "details": details,
+            "ip_address": ip_address,
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Audit log failed: {e}")
+
+
 async def require_admin_or_dispatcher(user=Depends(get_current_user)):
     """Require admin or dispatcher role"""
     if user.get("role") not in ("admin", "dispatcher"):
@@ -1607,6 +1622,7 @@ async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest,
         except Exception:
             pass
 
+        log_audit(user["id"], "send_email", "driver", user_id, {"subject": request.subject, "recipient": driver.data["email"]})
         return {"success": True, "email": driver.data["email"], "message_id": result.get("id")}
     except HTTPException:
         raise
@@ -1654,6 +1670,7 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
         except Exception:
             pass
 
+        log_audit(user["id"], "broadcast_email", "email", None, {"subject": request.subject, "target": request.target, "total": len(emails), "sent": results["sent"]})
         return {
             "success": True,
             "total": len(emails),
@@ -1698,6 +1715,7 @@ async def admin_push_blast(request: AdminPushBlastRequest, user=Depends(require_
         failed = sum(1 for r in results if not r)
         logger.info(f"Push blast ({request.target}): {sent} sent, {failed} failed out of {len(targets)}")
 
+        log_audit(user["id"], "push_blast", "notification", None, {"target": request.target, "title": request.title, "sent": sent, "failed": failed})
         return {"success": True, "sent": sent, "failed": failed, "total": len(targets)}
     except Exception as e:
         logger.error(f"Push blast error: {e}")
@@ -1932,6 +1950,7 @@ async def create_promo_code(request: PromoCodeCreateRequest, user=Depends(requir
         if not promo_code:
             raise HTTPException(status_code=500, detail="Error al crear promo code")
 
+        log_audit(user["id"], "create_promo_code", "promo_code", promo_code.get("id"), {"code": request.code.strip().upper(), "plan": request.benefit_plan, "value": request.benefit_value})
         return {"success": True, "promo_code": promo_code}
 
     except HTTPException:
@@ -1967,6 +1986,7 @@ async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest, user=
         if not result.data:
             raise HTTPException(status_code=404, detail="Promo code not found")
 
+        log_audit(user["id"], "update_promo_code", "promo_code", code_id, update_data)
         return {"success": True, "promo_code": safe_first(result)}
 
     except HTTPException:
@@ -2054,6 +2074,7 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
             except Exception as e:
                 logger.warning(f"Could not send plan email: {e}")
 
+        log_audit(user["id"], "grant_plan", "driver", user_id, {"plan": request.plan, "days": request.days, "permanent": request.permanent})
         return {
             "success": True,
             "user_id": user_id,
@@ -2101,6 +2122,7 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
         if driver.data:
             supabase.table("drivers").update({"must_change_password": True}).eq("id", driver.data[0]["id"]).execute()
 
+        log_audit(user["id"], "reset_password", "user", user_id)
         return {
             "success": True,
             "user_id": user_id,
@@ -2149,6 +2171,7 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
             "current_period_end": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
         }).execute()
 
+        log_audit(user["id"], "create_company", "company", company["id"], {"name": request.name, "payment_model": request.payment_model})
         return {"success": True, "company": company}
 
     except HTTPException:
@@ -2178,6 +2201,7 @@ async def admin_toggle_company(company_id: str, request: CompanyToggleRequest, u
         if not result.data:
             raise HTTPException(status_code=404, detail="Company not found")
 
+        log_audit(user["id"], "toggle_company", "company", company_id, update_data)
         return {"success": True, "company": safe_first(result)}
 
     except HTTPException:
@@ -2217,6 +2241,7 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
         if not result.data:
             raise HTTPException(status_code=404, detail="Driver not found")
 
+        log_audit(user["id"], "toggle_features", "driver", driver_id, update_data)
         return {"success": True, "driver": safe_first(result)}
 
     except HTTPException:
@@ -2224,6 +2249,24 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
+
+
+@app.get("/admin/audit-log", tags=["admin"], summary="Audit log")
+async def get_audit_log(limit: int = 100, offset: int = 0, user=Depends(require_admin)):
+    """Devuelve el historial de acciones admin."""
+    try:
+        result = supabase.table("audit_log")\
+            .select("*")\
+            .order("created_at", desc=True)\
+            .range(offset, offset + limit - 1)\
+            .execute()
+
+        count_result = supabase.table("audit_log").select("*", count="exact", head=True).execute()
+
+        return {"success": True, "logs": result.data or [], "total": count_result.count or 0}
+    except Exception as e:
+        logger.error(f"{type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error obteniendo audit log")
 
 
 @app.get("/admin/stats", tags=["admin"], summary="Estadísticas globales")
@@ -4982,47 +5025,83 @@ Eres el copiloto del repartidor. Hablas con naturalidad, eres directo y util.
 El repartidor te habla mientras conduce. Tu respuesta sera leida en voz alta.
 
 Devuelve UN JSON con esta estructura exacta:
-{
-  "action": "complete|fail|next|skip|reorder|reoptimize|call|eta|status|note|reminder|navigate|mute|unmute|pause|resume|time|info|unknown",
+{{
+  "action": "<action>",
   "target_stop": "current",
-  "payload": {},
+  "payload": {{}},
   "confirmation": "texto para leer en voz alta (max 20 palabras)"
-}
+}}
 
-ACCIONES:
-- "complete": marcar parada como entregada. Si dice nombre del receptor: payload: {"recipient": "nombre"}
-- "fail": marcar parada como fallida. payload: {"reason": "motivo"} si lo menciona
+ACCIONES DISPONIBLES:
+--- Navegacion ---
+- "complete": marcar parada como entregada. payload: {{"recipient": "nombre"}} si lo menciona
+- "fail": marcar parada como fallida. payload: {{"reason": "motivo"}} si lo menciona
 - "next": ir a la siguiente parada pendiente
-- "skip": saltar parada actual sin completar/fallar, moverla al final. payload: {"move_to": "end"}
-- "reorder": mover parada a posicion especifica. payload: {"stop_number": N, "new_position": M}
-- "reoptimize": re-optimizar la ruta con las paradas pendientes
-- "call": llamar al cliente de la parada actual (o especifica si dice numero)
-- "eta": cuanto falta para terminar (tiempo + paradas restantes)
-- "status": resumen rapido del estado actual (hechas, pendientes, fallidas)
-- "note": añadir nota a la parada. payload: {"text": "contenido"}
-- "reminder": recordatorio. payload: {"text": "contenido", "time": "HH:MM" o null}
-- "navigate": ir a parada especifica. payload: {"stop_number": N} o {"address": "..."}
-- "mute": silenciar voz de navegacion
-- "unmute": activar voz de navegacion
-- "pause": pausar navegacion/ruta
-- "resume": reanudar navegacion/ruta
-- "time": decir la hora actual
-- "info": pregunta general. Responde en confirmation con lo que sepas del contexto.
-- "unknown": no entendiste. Sugiere que repita.
+- "skip": saltar parada actual, moverla al final
+- "reorder": mover parada. payload: {{"stop_number": N, "new_position": M}}
+- "call": llamar al cliente
+- "mute": silenciar voz
+- "unmute": activar voz
+- "pause": pausar navegacion
+- "resume": reanudar navegacion
+- "navigate": ir a parada especifica. payload: {{"stop_number": N}} o {{"address": "..."}}
+
+--- Ruta ---
+- "optimize_route": optimizar/reorganizar la ruta
+- "invert_route": invertir el orden de la ruta
+- "clear_route": borrar todas las paradas
+- "share_route": abrir pantalla de compartir ruta
+- "save_route": guardar ruta. payload: {{"name": "nombre"}} si lo dice
+- "start_route": empezar navegacion a la primera parada
+- "finish_route": terminar/finalizar la ruta
+
+--- Paradas ---
+- "add_stop": añadir parada. payload: {{"address": "direccion completa"}}
+- "delete_last_stop": borrar la ultima parada
+- "undo_last": deshacer la ultima accion (completar/fallar)
+
+--- Consultas ---
+- "query_remaining": cuantas paradas quedan
+- "query_status": resumen (completadas, pendientes, fallidas)
+- "query_distance": distancia total de la ruta
+- "query_time": a que hora terminara
+- "query_clock": que hora es ahora
+- "eta": cuanto falta para terminar
+
+--- Modales ---
+- "open_modal": abrir pantalla. payload: {{"modal": "settings|routes|share|recurring|depot"}}
+- "close_modal": cerrar pantalla actual
+
+--- Settings ---
+- "toggle_dark_mode": cambiar modo oscuro
+- "toggle_customer_alerts": activar/desactivar avisos a clientes
+
+--- Otros ---
+- "note": añadir nota. payload: {{"text": "contenido"}}
+- "reminder": recordatorio. payload: {{"text": "contenido", "time": "HH:MM"}}
+- "take_photo": abrir camara para foto
+- "sign_delivery": abrir firma digital
+- "info": pregunta general. Responde en confirmation
+- "unknown": no entendiste. Sugiere que repita
 
 CONTEXTO DEL REPARTO ACTUAL:
 {context}
 
+IDIOMA: Responde en {language}.
+
 REGLAS:
-- Confirmacion CORTA, natural, en español. Como un copiloto humano hablaria.
-- Para "eta"/"status" calcula con los datos del contexto
+- Confirmacion CORTA, natural. Como un copiloto humano hablaria.
+- Para consultas (query_*) calcula con los datos del contexto y pon resultado en confirmation
 - "a las 5" / "sobre las cinco" → "17:00"
-- "apunta" / "anota" / "pon en notas" → "note"
-- "recuerdame" / "no me dejes olvidar" → "reminder"
-- "salta esta" / "dejala para el final" / "pasala al final" → "skip"
-- "reoptimiza" / "organiza la ruta" / "optimiza" → "reoptimize"
-- "cuantas me quedan" / "como voy" → "status"
-- "que hora es" → "time"
+- "apunta" / "anota" → "note"
+- "recuerdame" → "reminder"
+- "salta esta" / "dejala para el final" → "skip"
+- "optimiza" / "organiza la ruta" → "optimize_route"
+- "cuantas me quedan" / "como voy" → "query_status"
+- "que hora es" → "query_clock"
+- "abre ajustes" → open_modal con modal "settings"
+- "borra todo" / "limpia la ruta" → "clear_route"
+- "invierte la ruta" → "invert_route"
 - Devuelve SOLO el JSON, sin markdown ni texto extra"""
 
 
@@ -5036,6 +5115,10 @@ class VoiceCommandRequest(BaseModel):
     failed_stops: Optional[int] = None
     total_distance_km: Optional[float] = None
     driver_name: Optional[str] = None
+    screen: Optional[str] = None
+    route_name: Optional[str] = None
+    is_optimized: Optional[bool] = None
+    language: Optional[str] = "es"
 
 
 @app.post("/voice/command")
@@ -5068,10 +5151,18 @@ async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current
         context_parts.append(f"Tiempo restante estimado: {req.remaining_minutes:.0f} minutos")
     if req.total_distance_km is not None:
         context_parts.append(f"Distancia total: {req.total_distance_km:.1f} km")
+    if req.screen:
+        context_parts.append(f"Pantalla actual: {req.screen}")
+    if req.route_name:
+        context_parts.append(f"Nombre ruta: {req.route_name}")
+    if req.is_optimized is not None:
+        context_parts.append(f"Ruta optimizada: {'si' if req.is_optimized else 'no'}")
     context_parts.append(f"Hora actual: {datetime.now(timezone.utc).strftime('%H:%M')}")
 
+    language = req.language or "es"
+    lang_label = "español" if language == "es" else "English"
     context = "\n".join(context_parts) if context_parts else "Sin contexto disponible"
-    prompt = VOICE_ASSISTANT_PROMPT.replace("{context}", context)
+    prompt = VOICE_ASSISTANT_PROMPT.replace("{context}", context).replace("{language}", lang_label)
 
     try:
         response = client.models.generate_content(
