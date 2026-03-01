@@ -22,9 +22,9 @@ class TestRootEndpoint:
         data = response.json()
         assert data["status"] == "ok"
         assert data["service"] == "Xpedit API"
-        assert "version" in data
-        assert "stripe_ok" in data
-        assert "jwks_ok" in data
+        assert "version" not in data
+        assert "stripe_ok" not in data
+        assert "jwks_ok" not in data
 
 
 # === Health Endpoint Tests ===

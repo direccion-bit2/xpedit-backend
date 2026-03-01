@@ -12,13 +12,13 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import httpx
 import jwt as pyjwt
 import sentry_sdk
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
 from pydantic import BaseModel, Field
@@ -663,13 +663,10 @@ class HealthCheckResponse(BaseModel):
 
 @app.get("/", tags=["health"], summary="Estado del servicio")
 async def root():
-    """Devuelve el estado general del servicio y la configuración activa."""
+    """Devuelve el estado general del servicio."""
     return {
         "status": "ok",
         "service": "Xpedit API",
-        "version": "0.5.0",
-        "stripe_ok": bool(STRIPE_SECRET_KEY),
-        "jwks_ok": _jwks_client is not None,
     }
 
 
@@ -1389,7 +1386,7 @@ async def get_latest_location(driver_id: str, user=Depends(get_current_user)):
 
 
 @app.get("/location/{driver_id}/history", tags=["tracking"], summary="Historial de ubicaciones")
-async def get_location_history(driver_id: str, route_id: Optional[str] = None, limit: int = 100, user=Depends(get_current_user)):
+async def get_location_history(driver_id: str, route_id: Optional[str] = None, limit: int = Query(default=100, ge=1, le=1000), user=Depends(get_current_user)):
     """Obtiene el historial de ubicaciones GPS de un conductor. Se puede filtrar por ruta."""
     await verify_driver_access(driver_id, user)
     query = supabase.table("location_history")\
@@ -3420,7 +3417,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 class OCRLabelRequest(BaseModel):
     image_base64: str = Field(..., max_length=10_000_000)  # ~7.5MB max image
-    media_type: str = "image/jpeg"
+    media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/jpeg"
 
 
 @app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
