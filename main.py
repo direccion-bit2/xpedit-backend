@@ -1761,7 +1761,7 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
         # 3. Validate: not expired
         if promo.get("expires_at"):
             expires_at = datetime.fromisoformat(promo["expires_at"].replace("Z", "+00:00"))
-            if datetime.now(expires_at.tzinfo) > expires_at:
+            if datetime.now(timezone.utc) > expires_at:
                 raise HTTPException(status_code=400, detail="This promo code has expired")
 
         # 4. Validate: max_uses not exceeded
