@@ -1076,7 +1076,7 @@ async def assign_drivers(request: AssignDriversRequest, user=Depends(get_current
 @app.get("/stats/daily", tags=["routes"], summary="Estadísticas diarias")
 async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_current_user)):
     """Obtiene estadísticas del día (rutas, paradas, distancia). Filtradas por permisos del usuario."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     try:
         # Obtener rutas filtradas por permisos
@@ -1220,7 +1220,7 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     # Crear la ruta
     route_data = {
         "driver_id": route_request.driver_id,
-        "name": route_request.name or f"Ruta {datetime.now().strftime('%d/%m %H:%M')}",
+        "name": route_request.name or f"Ruta {datetime.now(timezone.utc).strftime('%d/%m %H:%M')}",
         "total_distance_km": route_request.total_distance_km,
         "total_stops": len(route_request.stops),
         "status": "pending"
@@ -1282,7 +1282,7 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
     await verify_route_access(route_id, user)
     result = supabase.table("routes").update({
         "status": "in_progress",
-        "started_at": datetime.now().isoformat()
+        "started_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", route_id).execute()
     route = safe_first(result)
     if not route:
@@ -1296,7 +1296,7 @@ async def complete_route(route_id: str, user=Depends(get_current_user)):
     await verify_route_access(route_id, user)
     result = supabase.table("routes").update({
         "status": "completed",
-        "completed_at": datetime.now().isoformat()
+        "completed_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", route_id).execute()
     route = safe_first(result)
     if not route:
@@ -1335,7 +1335,7 @@ async def complete_stop(stop_id: str, user=Depends(get_current_user)):
     await verify_stop_access(stop_id, user)
     result = supabase.table("stops").update({
         "status": "completed",
-        "completed_at": datetime.now().isoformat()
+        "completed_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", stop_id).execute()
     stop = safe_first(result)
     if not stop:
@@ -1349,7 +1349,7 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
     await verify_stop_access(stop_id, user)
     result = supabase.table("stops").update({
         "status": "failed",
-        "completed_at": datetime.now().isoformat()
+        "completed_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", stop_id).execute()
     stop = safe_first(result)
     if not stop:
@@ -1494,7 +1494,7 @@ async def api_send_customer_notification(request: CustomerNotificationRequest, u
             elif request.alert_type == "entregado":
                 result = send_delivery_completed_email(
                     request.customer_email, client_name,
-                    datetime.now().strftime("%d/%m/%Y %H:%M")
+                    datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M")
                 )
             elif request.alert_type == "failed":
                 result = send_delivery_failed_email(
@@ -1538,7 +1538,7 @@ async def enrich_existing_stops(request: EnrichExistingRequest, user=Depends(get
     """Enriquece paradas de hoy con datos del directorio de clientes de la empresa."""
     if user["role"] not in ("admin", "dispatcher"):
         raise HTTPException(status_code=403, detail="Solo admin o dispatcher")
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     drivers = supabase.table("drivers").select("id").eq("company_id", request.company_id).execute()
     driver_ids = [d["id"] for d in (drivers.data or [])]
     if not driver_ids:
@@ -1780,7 +1780,7 @@ async def redeem_promo_code(request: PromoRedeemRequest, user=Depends(get_curren
             raise HTTPException(status_code=400, detail="You have already redeemed this promo code")
 
         # 6. Calculate benefit expiration
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         benefit_expires_at = now + timedelta(days=promo["benefit_value"])
         benefit_expires_at_iso = benefit_expires_at.isoformat()
 
@@ -1862,7 +1862,7 @@ async def check_promo_benefit(driver_id: str, user=Depends(get_current_user)):
             }
 
         expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
-        now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+        now = datetime.now(timezone.utc)
         remaining = expires_at - now
         days_remaining = max(0, remaining.days)
 
@@ -2010,7 +2010,7 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
             # Temporary plan with days
             if request.days <= 0:
                 raise HTTPException(status_code=400, detail="Days must be > 0 for temporary plans")
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             expires_at = now + timedelta(days=request.days)
             expires_at_iso = expires_at.isoformat()
             update_data = {"promo_plan": request.plan, "promo_plan_expires_at": expires_at_iso}
@@ -2144,9 +2144,9 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
             "max_drivers": 15,
             "price_per_month": 0,
             "status": "trialing",
-            "trial_ends_at": (datetime.now() + timedelta(days=14)).isoformat(),
-            "current_period_start": datetime.now().isoformat(),
-            "current_period_end": (datetime.now() + timedelta(days=14)).isoformat(),
+            "trial_ends_at": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+            "current_period_start": datetime.now(timezone.utc).isoformat(),
+            "current_period_end": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
         }).execute()
 
         return {"success": True, "company": company}
@@ -2158,13 +2158,17 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
+class CompanyToggleRequest(BaseModel):
+    active: Optional[bool] = None
+
+
 @app.patch("/admin/companies/{company_id}", tags=["admin", "company"], summary="Activar/desactivar empresa")
-async def admin_toggle_company(company_id: str, request: dict, user=Depends(require_admin)):
+async def admin_toggle_company(company_id: str, request: CompanyToggleRequest, user=Depends(require_admin)):
     """Activa o desactiva una empresa. Solo admin."""
     try:
         update_data = {}
-        if "active" in request:
-            update_data["active"] = bool(request["active"])
+        if request.active is not None:
+            update_data["active"] = request.active
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -2393,7 +2397,7 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
 
         REWARD_DAYS = 7
         REWARD_PLAN = "pro"
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         expires_at = (now + timedelta(days=REWARD_DAYS)).isoformat()
 
         # Grant reward to referred (new user)
@@ -2590,7 +2594,7 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
         }).eq("user_id", user["id"]).execute()
 
         # Create subscription with 14-day trial
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         trial_end = now + timedelta(days=14)
         subscription_data = {
             "company_id": company_id,
@@ -2730,7 +2734,7 @@ async def update_company(company_id: str, request: CompanyUpdateRequest, user=De
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        update_data["updated_at"] = datetime.now().isoformat()
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         result = supabase.table("companies")\
             .update(update_data)\
@@ -2815,7 +2819,7 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         # Total drivers in company
         links_result = supabase.table("company_driver_links")\
@@ -2897,7 +2901,7 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
         else:
             raise HTTPException(status_code=500, detail="Failed to generate unique invite code")
 
-        expires_at = (datetime.now() + timedelta(hours=request.expires_hours)).isoformat()
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=request.expires_hours)).isoformat()
 
         invite_data = {
             "code": code,
@@ -3000,7 +3004,7 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
         # Validate: not expired
         if invite.get("expires_at"):
             expires_at = datetime.fromisoformat(invite["expires_at"].replace("Z", "+00:00"))
-            now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+            now = datetime.now(timezone.utc)
             if now > expires_at:
                 raise HTTPException(status_code=400, detail="This invite code has expired")
 
@@ -3620,7 +3624,7 @@ async def stripe_webhook(request: Request):
             logger.info(f"Stripe checkout.session.completed: user_id={user_id}, plan={plan}, customer={customer_id}")
 
             if user_id:
-                expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
                 # Update drivers table (if user has a linked driver)
                 supabase.table("drivers").update({
                     "promo_plan": plan,
@@ -3657,7 +3661,7 @@ async def stripe_webhook(request: Request):
                 user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
                 if user_result.data:
                     user_id = user_result.data[0]["id"]
-                    expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+                    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
                     supabase.table("drivers").update({
                         "promo_plan_expires_at": expires_at,
                     }).eq("user_id", user_id).execute()
@@ -3718,7 +3722,7 @@ async def resend_webhook(request: Request):
 
     logger.info(f"Resend webhook event: {event_type}, email_id: {email_id}")
 
-    now = datetime.now().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     update_data = {}
 
     if event_type == "email.delivered":
@@ -4582,7 +4586,7 @@ async def generate_social_calendar(req: GenerateCalendarRequest, user=Depends(re
 
     total_posts = req.days * req.posts_per_day
     themes_str = ", ".join(req.themes)
-    start_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    start_date = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
 
     prompt = f"""{XPEDIT_CONTEXT}
 
@@ -4714,7 +4718,7 @@ async def backup_critical_tables():
         backup_path = f"backups/{backup_date}/backup_{backup_date}_{backup_uid}.json"
 
         try:
-            supabase.storage.from_("social-media").upload(
+            supabase.storage.from_("backups").upload(
                 backup_path,
                 backup_json.encode("utf-8"),
                 {"content-type": "application/json"}
@@ -4807,8 +4811,9 @@ async def send_weekly_reengagement_push():
             logger.info("Weekly re-engagement: no recent drivers with push tokens")
             return
 
-        # Filter out those who already created routes
-        routes_result = supabase.table("routes").select("driver_id").execute()
+        # Filter out those who already created routes (only check the candidate drivers)
+        candidate_ids = [d["id"] for d in drivers_result.data]
+        routes_result = supabase.table("routes").select("driver_id").in_("driver_id", candidate_ids).execute()
         drivers_with_routes = {r["driver_id"] for r in (routes_result.data or []) if r.get("driver_id")}
         inactive = [d for d in drivers_result.data if d["id"] not in drivers_with_routes]
 
@@ -5063,7 +5068,7 @@ async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current
         context_parts.append(f"Tiempo restante estimado: {req.remaining_minutes:.0f} minutos")
     if req.total_distance_km is not None:
         context_parts.append(f"Distancia total: {req.total_distance_km:.1f} km")
-    context_parts.append(f"Hora actual: {datetime.now().strftime('%H:%M')}")
+    context_parts.append(f"Hora actual: {datetime.now(timezone.utc).strftime('%H:%M')}")
 
     context = "\n".join(context_parts) if context_parts else "Sin contexto disponible"
     prompt = VOICE_ASSISTANT_PROMPT.replace("{context}", context)

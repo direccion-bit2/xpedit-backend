@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'INPUT=$(cat); FILE_PATH=$(echo \"$INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get(\\\"tool_input\\\",{}).get(\\\"file_path\\\",\\\"\\\"))\"); if [[ \"$FILE_PATH\" == *.py ]]; then cd /Users/migue/Desktop/rutamax/backend && ruff check \"$FILE_PATH\" --config ruff.toml --output-format=concise 2>&1 || { echo \"ruff found issues in $FILE_PATH\" >&2; exit 2; }; fi'",
+            "timeout": 15,
+            "statusMessage": "Linting Python..."
+          }
+        ]
+      }
+    ]
+  }
+}

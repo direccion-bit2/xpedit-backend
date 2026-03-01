@@ -3,6 +3,7 @@ Xpedit - Servicio de emails con Resend
 """
 
 import os
+from html import escape as html_escape
 from typing import List, Optional
 
 import resend
@@ -66,6 +67,7 @@ def get_base_template(content: str, title: str = "Xpedit") -> str:
 
 def send_welcome_email(to_email: str, user_name: str) -> dict:
     """Email de bienvenida para nuevos usuarios - guia de activacion en 3 pasos"""
+    user_name = html_escape(user_name)
     content = f"""
         <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px;">Hola {user_name}, tu primera ruta te espera</h2>
 
@@ -139,6 +141,10 @@ def send_delivery_started_email(
     tracking_url: Optional[str] = None
 ) -> dict:
     """Email cuando el pedido está en camino"""
+    client_name = html_escape(client_name)
+    driver_name = html_escape(driver_name)
+    estimated_time = html_escape(estimated_time) if estimated_time else None
+    tracking_url = html_escape(tracking_url) if tracking_url else None
 
     time_text = f"<p style='margin: 0 0 20px 0; color: #4b5563; font-size: 16px;'>Tiempo estimado de llegada: <strong>{estimated_time}</strong></p>" if estimated_time else ""
 
@@ -202,6 +208,10 @@ def send_delivery_completed_email(
     recipient_name: Optional[str] = None
 ) -> dict:
     """Email de confirmación de entrega"""
+    client_name = html_escape(client_name)
+    delivery_time = html_escape(delivery_time)
+    photo_url = html_escape(photo_url) if photo_url else None
+    recipient_name = html_escape(recipient_name) if recipient_name else None
 
     photo_section = ""
     if photo_url:
@@ -266,6 +276,9 @@ def send_delivery_failed_email(
     next_attempt: Optional[str] = None
 ) -> dict:
     """Email cuando la entrega no se pudo completar"""
+    client_name = html_escape(client_name)
+    reason = html_escape(reason) if reason else None
+    next_attempt = html_escape(next_attempt) if next_attempt else None
 
     reason_text = f"<p style='margin: 0 0 20px 0; color: #4b5563; font-size: 16px;'><strong>Motivo:</strong> {reason}</p>" if reason else ""
     next_text = f"<p style='margin: 0 0 20px 0; color: #4b5563; font-size: 16px;'>Próximo intento: <strong>{next_attempt}</strong></p>" if next_attempt else ""
@@ -321,6 +334,8 @@ def send_daily_summary_email(
     failed_stops: int
 ) -> dict:
     """Email de resumen diario para dispatchers"""
+    dispatcher_name = html_escape(dispatcher_name)
+    date = html_escape(date)
 
     success_rate = round((completed_stops / total_stops * 100) if total_stops > 0 else 0, 1)
 
@@ -387,6 +402,8 @@ def send_daily_summary_email(
 
 def send_plan_activated_email(to_email: str, user_name: str, plan_name: str, days: Optional[int] = None, permanent: bool = False) -> dict:
     """Email cuando se activa un plan (por admin o por compra)"""
+    user_name = html_escape(user_name)
+    plan_name = html_escape(plan_name)
     duration_text = "de forma permanente" if permanent else f"durante {days} dias"
 
     content = f"""
@@ -439,6 +456,8 @@ def send_plan_activated_email(to_email: str, user_name: str, plan_name: str, day
 
 def send_referral_reward_email(to_email: str, user_name: str, referred_name: str, reward_days: int) -> dict:
     """Email cuando un referido se registra y ambos reciben reward"""
+    user_name = html_escape(user_name)
+    referred_name = html_escape(referred_name)
     content = f"""
         <div style="text-align: center; margin-bottom: 25px;">
             <div style="display: inline-block; background-color: #fef3c7; border-radius: 50%; padding: 20px;">
@@ -495,6 +514,9 @@ def send_upcoming_email(
     tracking_url: Optional[str] = None
 ) -> dict:
     """Email cuando el repartidor está a X paradas del cliente"""
+    client_name = html_escape(client_name)
+    driver_name = html_escape(driver_name)
+    tracking_url = html_escape(tracking_url) if tracking_url else None
 
     tracking_button = ""
     if tracking_url:
@@ -569,6 +591,8 @@ def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
 
 def send_alert_email(to_email: str, alert_title: str, details: str) -> dict:
     """Email de alerta del sistema (health check, errores criticos)"""
+    alert_title = html_escape(alert_title)
+    details = html_escape(details)
     content = f"""
         <h2 style="margin: 0 0 20px 0; color: #991b1b; font-size: 24px; text-align: center;">
             {alert_title}
