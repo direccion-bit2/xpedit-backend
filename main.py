@@ -298,7 +298,7 @@ async def verify_route_access(route_id: str, user: dict):
     # Dispatcher can access routes from same company
     if user["role"] == "dispatcher" and user.get("company_id"):
         driver_result = supabase.table("drivers").select("company_id").eq("id", route["driver_id"]).limit(1).execute()
-        if driver_result.data and driver_result.data[0].get("company_id") == user["company_id"]:
+        if driver_result.data and driver_result.data[0].get("company_id") == user.get("company_id"):
             return route
     raise HTTPException(status_code=403, detail="No tienes acceso a esta ruta")
 
@@ -321,7 +321,7 @@ async def verify_driver_access(driver_id: str, user: dict):
         return True
     if user["role"] == "dispatcher" and user.get("company_id"):
         driver_result = supabase.table("drivers").select("company_id").eq("id", driver_id).limit(1).execute()
-        if driver_result.data and driver_result.data[0].get("company_id") == user["company_id"]:
+        if driver_result.data and driver_result.data[0].get("company_id") == user.get("company_id"):
             return True
     raise HTTPException(status_code=403, detail="No tienes acceso a este conductor")
 
@@ -331,7 +331,7 @@ async def verify_company_management(user: dict, company_id: str = None):
     if user["role"] == "admin":
         return True
     if user["role"] == "dispatcher" and user.get("company_id"):
-        if company_id is None or user["company_id"] == company_id:
+        if company_id is None or user.get("company_id") == company_id:
             return True
     raise HTTPException(status_code=403, detail="No tienes permisos para gestionar esta empresa")
 
@@ -478,6 +478,14 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"voice:{client_ip}", max_requests=30, window_seconds=60)
         elif path.startswith("/email"):
             check_rate_limit(f"email:{client_ip}", max_requests=20, window_seconds=60)
+        elif path.startswith("/ocr"):
+            check_rate_limit(f"ocr:{client_ip}", max_requests=5, window_seconds=60)
+        elif path.startswith("/location"):
+            check_rate_limit(f"location:{client_ip}", max_requests=60, window_seconds=60)
+        elif path.startswith("/routes"):
+            check_rate_limit(f"routes:{client_ip}", max_requests=30, window_seconds=60)
+        elif path.startswith("/stops"):
+            check_rate_limit(f"stops:{client_ip}", max_requests=30, window_seconds=60)
     except HTTPException as e:
         from starlette.responses import JSONResponse
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
@@ -1071,7 +1079,7 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
             if company_id:
                 query = query.eq("company_id", company_id)
         elif user["role"] == "dispatcher" and user.get("company_id"):
-            company_drivers = supabase.table("drivers").select("id").eq("company_id", user["company_id"]).execute()
+            company_drivers = supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).execute()
             driver_ids = [d["id"] for d in (company_drivers.data or [])]
             if driver_ids:
                 query = query.in_("driver_id", driver_ids)
@@ -1138,7 +1146,7 @@ async def get_drivers(user=Depends(get_current_user)):
     if user["role"] == "admin":
         pass  # Admin sees all
     elif user["role"] == "dispatcher" and user.get("company_id"):
-        query = query.eq("company_id", user["company_id"])
+        query = query.eq("company_id", user.get("company_id"))
     else:
         query = query.eq("user_id", user["id"])
     result = query.execute()
@@ -1165,7 +1173,7 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
             query = query.eq("driver_id", driver_id)
     elif user["role"] == "dispatcher" and user.get("company_id"):
         # Dispatcher: only routes from drivers in their company
-        company_drivers = supabase.table("drivers").select("id").eq("company_id", user["company_id"]).execute()
+        company_drivers = supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).execute()
         company_driver_ids = [d["id"] for d in (company_drivers.data or [])]
         if driver_id:
             if driver_id not in company_driver_ids:
@@ -1497,10 +1505,11 @@ async def api_send_customer_notification(request: CustomerNotificationRequest, u
     notification_id = None
     if request.stop_id:
         try:
+            driver_id = await get_user_driver_id(user)
             notif = supabase.table("customer_notifications").insert({
                 "stop_id": request.stop_id,
                 "route_id": request.route_id,
-                "driver_id": user["id"],
+                "driver_id": driver_id,
                 "alert_type": request.alert_type,
                 "phone": request.customer_phone or "",
                 "message": f"[{request.alert_type}] {request.stop_address}",
@@ -1620,18 +1629,21 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
         emails = [d["email"] for d in drivers.data if d.get("email")]
         results = send_broadcast_email(emails, request.subject, request.body)
 
-        # Log each email in broadcast
+        # Log all emails in broadcast (batch insert)
         try:
-            for d in drivers.data:
-                if d.get("email"):
-                    supabase.table("email_log").insert({
-                        "recipient_email": d["email"],
-                        "recipient_name": d.get("name"),
-                        "subject": request.subject,
-                        "body": request.body,
-                        "sent_by": f"broadcast:{request.target}",
-                        "status": "sent",
-                    }).execute()
+            email_logs = [
+                {
+                    "recipient_email": d["email"],
+                    "recipient_name": d.get("name"),
+                    "subject": request.subject,
+                    "body": request.body,
+                    "sent_by": f"broadcast:{request.target}",
+                    "status": "sent",
+                }
+                for d in drivers.data if d.get("email")
+            ]
+            if email_logs:
+                supabase.table("email_log").insert(email_logs).execute()
         except Exception:
             pass
 
@@ -2637,7 +2649,7 @@ async def check_company_access(driver_id: str, user=Depends(get_current_user)):
 async def get_company(company_id: str, user=Depends(get_current_user)):
     """Obtiene los datos de una empresa con información de suscripción."""
     # Authorization: user must belong to this company or be admin
-    if user["company_id"] != company_id and user["role"] != "admin":
+    if user.get("company_id") != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
@@ -2677,7 +2689,7 @@ async def get_company(company_id: str, user=Depends(get_current_user)):
 async def update_company(company_id: str, request: CompanyUpdateRequest, user=Depends(get_current_user)):
     """Actualiza los datos de una empresa (nombre, email, teléfono, dirección, modelo de pago)."""
     # Authorization: user must belong to this company or be admin
-    if user["company_id"] != company_id and user["role"] != "admin":
+    if user.get("company_id") != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
@@ -2722,7 +2734,7 @@ async def update_company(company_id: str, request: CompanyUpdateRequest, user=De
 async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
     """Lista todos los conductores de una empresa con modo de pago, coste y plan."""
     # Authorization: user must belong to this company or be admin
-    if user["company_id"] != company_id and user["role"] != "admin":
+    if user.get("company_id") != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
@@ -2782,7 +2794,7 @@ async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
 async def get_company_stats(company_id: str, user=Depends(get_current_user)):
     """Estadísticas de la flota: conductores totales, activos hoy, rutas/paradas/entregas del día."""
     # Authorization: user must belong to this company or be admin
-    if user["company_id"] != company_id and user["role"] != "admin":
+    if user.get("company_id") != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
@@ -2900,7 +2912,7 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
 async def get_company_invites(company_id: str, user=Depends(get_current_user)):
     """Lista los códigos de invitación de una empresa."""
     # Authorization: user must belong to this company or be admin
-    if user["company_id"] != company_id and user["role"] != "admin":
+    if user.get("company_id") != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
@@ -3386,7 +3398,7 @@ async def change_driver_mode(user_id: str, request: CompanyDriverModeRequest, us
 async def get_company_subscription(company_id: str, user=Depends(get_current_user)):
     """Obtiene los detalles de la suscripción de una empresa."""
     # Authorization: user must belong to this company or be admin
-    if user["company_id"] != company_id and user["role"] != "admin":
+    if user.get("company_id") != company_id and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="No tienes acceso a esta empresa")
 
     try:
@@ -3436,7 +3448,7 @@ async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
                     "anthropic-version": "2023-06-01",
                 },
                 json={
-                    "model": "claude-3-haiku-20240307",
+                    "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 500,
                     "messages": [{
                         "role": "user",
@@ -3846,6 +3858,7 @@ async def places_directions(
     origin: str,
     destination: str,
     waypoints: Optional[str] = None,
+    avoid: Optional[str] = None,
     user=Depends(get_current_user)
 ):
     """Proxy de Google Directions API. Devuelve polylines y pasos de navegación."""
@@ -3857,6 +3870,8 @@ async def places_directions(
     }
     if waypoints:
         params["waypoints"] = waypoints
+    if avoid:
+        params["avoid"] = avoid
     async with httpx.AsyncClient() as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/directions/json", params=params)
     return resp.json()
@@ -3883,24 +3898,29 @@ async def delete_account(user=Depends(get_current_user)):
             route_ids = [r["id"] for r in (routes_result.data or [])]
 
             if route_ids:
-                # Delete stops for all driver's routes
+                # Collect all stop IDs across all routes in one query per route
+                all_stop_ids = []
                 for route_id in route_ids:
                     try:
-                        # Delete delivery_proofs for stops in this route
                         stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
-                        stop_ids = [s["id"] for s in (stops_result.data or [])]
-                        if stop_ids:
-                            for stop_id in stop_ids:
-                                try:
-                                    supabase.table("delivery_proofs").delete().eq("stop_id", stop_id).execute()
-                                except Exception:
-                                    pass
-                        # Delete tracking_links for this route
-                        try:
-                            supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
-                        except Exception:
-                            pass
-                        # Delete stops
+                        all_stop_ids.extend([s["id"] for s in (stops_result.data or [])])
+                    except Exception:
+                        pass
+
+                # Batch delete delivery_proofs for all stops at once
+                if all_stop_ids:
+                    try:
+                        supabase.table("delivery_proofs").delete().in_("stop_id", all_stop_ids).execute()
+                    except Exception:
+                        pass
+
+                # Batch delete tracking_links and stops per route
+                for route_id in route_ids:
+                    try:
+                        supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
+                    except Exception:
+                        pass
+                    try:
                         supabase.table("stops").delete().eq("route_id", route_id).execute()
                     except Exception:
                         pass
@@ -4626,7 +4646,7 @@ async def health_check():
 
     # Uptime
     checks["uptime_seconds"] = int((datetime.utcnow() - _server_start_time).total_seconds())
-    checks["version"] = "1.1.3"
+    checks["version"] = "1.1.4"
     checks["environment"] = os.getenv("SENTRY_ENVIRONMENT", "production")
 
     # Solver availability

@@ -74,7 +74,7 @@ class TestHealthEndpoint:
 
     @pytest.mark.asyncio
     async def test_health_version_matches(self, client):
-        """Version in health check should be 1.1.3."""
+        """Version in health check should be 1.1.4."""
         with patch("main.supabase") as mock_sb:
             mock_result = MagicMock()
             mock_result.count = 0
@@ -84,7 +84,7 @@ class TestHealthEndpoint:
                 response = await client.get("/health")
 
         data = response.json()
-        assert data["checks"]["version"] == "1.1.3"
+        assert data["checks"]["version"] == "1.1.4"
 
     @pytest.mark.asyncio
     async def test_health_returns_503_when_db_fails(self, client):
