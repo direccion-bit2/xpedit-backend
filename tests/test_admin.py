@@ -613,38 +613,28 @@ class TestAdminListCompanies:
                 {"id": "c2", "name": "Company B", "active": False},
             ]
 
-            links_c1 = MagicMock()
-            links_c1.count = 5
-            links_c1.data = []
+            # Batch links result: 5 links for c1, 2 for c2
+            all_links_result = MagicMock()
+            all_links_result.data = [
+                {"company_id": "c1"} for _ in range(5)
+            ] + [
+                {"company_id": "c2"} for _ in range(2)
+            ]
 
-            links_c2 = MagicMock()
-            links_c2.count = 2
-            links_c2.data = []
-
-            sub_c1 = MagicMock()
-            sub_c1.data = [{"id": "s1", "plan": "pro", "status": "active"}]
-
-            sub_c2 = MagicMock()
-            sub_c2.data = []
-
-            call_index = {"links": 0, "subs": 0}
+            # Batch subscriptions result (ordered desc)
+            all_subs_result = MagicMock()
+            all_subs_result.data = [
+                {"company_id": "c1", "id": "s1", "plan": "pro", "status": "active", "created_at": "2026-01-01"},
+            ]
 
             def table_dispatch(name):
                 chain = MagicMock()
                 if name == "companies":
                     chain.select.return_value.order.return_value.execute.return_value = companies_result
                 elif name == "company_driver_links":
-                    call_index["links"] += 1
-                    if call_index["links"] == 1:
-                        chain.select.return_value.eq.return_value.execute.return_value = links_c1
-                    else:
-                        chain.select.return_value.eq.return_value.execute.return_value = links_c2
+                    chain.select.return_value.in_.return_value.execute.return_value = all_links_result
                 elif name == "company_subscriptions":
-                    call_index["subs"] += 1
-                    if call_index["subs"] == 1:
-                        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = sub_c1
-                    else:
-                        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = sub_c2
+                    chain.select.return_value.in_.return_value.order.return_value.execute.return_value = all_subs_result
                 return chain
 
             mock_sb.table = MagicMock(side_effect=table_dispatch)

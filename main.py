@@ -11,7 +11,7 @@ import random
 import re
 import time
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
 import httpx
@@ -180,8 +180,8 @@ def enrich_stops_from_directory(company_id: str, stops: list[dict]) -> tuple[lis
     return stops, match_count
 
 
-# Webhook idempotency (in-memory, single instance)
-_processed_webhook_events: set = set()
+# Webhook idempotency (in-memory, ordered for LRU eviction)
+_processed_webhook_events: dict = {}
 
 # Stripe
 import stripe
@@ -451,10 +451,18 @@ async def add_security_headers(request: Request, call_next):
 from collections import defaultdict
 
 _rate_limits: dict = defaultdict(list)
+_rate_limits_last_cleanup = time.time()
 
 def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60):
     """Simple in-memory rate limiter. Raises 429 if exceeded."""
+    global _rate_limits_last_cleanup
     now = time.time()
+    # Purge stale keys every 5 minutes to prevent unbounded growth
+    if now - _rate_limits_last_cleanup > 300:
+        stale = [k for k, v in _rate_limits.items() if not v or v[-1] < now - window_seconds]
+        for k in stale:
+            del _rate_limits[k]
+        _rate_limits_last_cleanup = now
     _rate_limits[key] = [t for t in _rate_limits[key] if t > now - window_seconds]
     if len(_rate_limits[key]) >= max_requests:
         raise HTTPException(status_code=429, detail="Demasiadas solicitudes. Inténtalo en unos minutos.")
@@ -1484,7 +1492,6 @@ async def api_send_customer_notification(request: CustomerNotificationRequest, u
                     eta_text, request.tracking_url
                 )
             elif request.alert_type == "entregado":
-                from datetime import datetime
                 result = send_delivery_completed_email(
                     request.customer_email, client_name,
                     datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -1672,8 +1679,9 @@ async def admin_push_blast(request: AdminPushBlastRequest, user=Depends(require_
         targets = drivers_result.data
 
         if request.target == "inactive":
-            # Filter to drivers with 0 routes
-            routes_result = supabase.table("routes").select("driver_id").execute()
+            # Filter to drivers with 0 routes - only fetch distinct driver_ids, not all rows
+            target_ids = [d["id"] for d in targets]
+            routes_result = supabase.table("routes").select("driver_id").in_("driver_id", target_ids).execute()
             drivers_with_routes = {r["driver_id"] for r in (routes_result.data or []) if r.get("driver_id")}
             targets = [d for d in targets if d["id"] not in drivers_with_routes]
 
@@ -2218,7 +2226,7 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
 async def admin_stats(user=Depends(require_admin)):
     """Estadísticas globales: usuarios, rutas, entregas, fallos. Solo admin."""
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -2286,18 +2294,30 @@ async def admin_list_companies(user=Depends(require_admin)):
     """Lista todas las empresas con conteo de drivers y suscripción. Solo admin."""
     try:
         companies = supabase.table("companies").select("*").order("created_at", desc=True).execute()
+        company_ids = [c["id"] for c in (companies.data or [])]
+
+        # Batch fetch: all driver links and subscriptions in 2 queries instead of 2*N
+        all_links = supabase.table("company_driver_links").select("company_id", count="exact").in_("company_id", company_ids).execute() if company_ids else None
+        all_subs = supabase.table("company_subscriptions").select("*").in_("company_id", company_ids).order("created_at", desc=True).execute() if company_ids else None
+
+        # Build lookup maps
+        driver_counts: dict = {}
+        for link in (all_links.data if all_links else []):
+            cid = link["company_id"]
+            driver_counts[cid] = driver_counts.get(cid, 0) + 1
+
+        sub_map: dict = {}
+        for sub in (all_subs.data if all_subs else []):
+            cid = sub["company_id"]
+            if cid not in sub_map:  # first = most recent (ordered desc)
+                sub_map[cid] = sub
 
         result = []
         for company in (companies.data or []):
-            # Driver count
-            links = supabase.table("company_driver_links").select("id", count="exact").eq("company_id", company["id"]).execute()
-            # Subscription
-            sub = supabase.table("company_subscriptions").select("*").eq("company_id", company["id"]).order("created_at", desc=True).limit(1).execute()
-
             result.append({
                 **company,
-                "driver_count": links.count or 0,
-                "subscription": safe_first(sub),
+                "driver_count": driver_counts.get(company["id"], 0),
+                "subscription": sub_map.get(company["id"]),
             })
 
         return {"success": True, "companies": result}
@@ -2745,29 +2765,26 @@ async def get_company_drivers(company_id: str, user=Depends(get_current_user)):
             .execute()
 
         links = links_result.data or []
+        if not links:
+            return {"success": True, "drivers": [], "total": 0, "active_count": 0}
+
+        # Batch fetch all drivers and users in 2 queries instead of 2*N
+        user_ids = [link["user_id"] for link in links if link.get("user_id")]
+        all_drivers = supabase.table("drivers").select("*").in_("user_id", user_ids).execute() if user_ids else None
+        all_users = supabase.table("users").select("id, email, full_name, phone, role").in_("id", user_ids).execute() if user_ids else None
+
+        driver_map = {d["user_id"]: d for d in (all_drivers.data if all_drivers else [])}
+        user_map = {u["id"]: u for u in (all_users.data if all_users else [])}
+
         drivers_list = []
-
         for link in links:
-            # Get driver info
-            driver_result = supabase.table("drivers")\
-                .select("*")\
-                .eq("user_id", link["user_id"])\
-                .limit(1)\
-                .execute()
-
-            # Get user info
-            user_result = supabase.table("users")\
-                .select("id, email, full_name, phone, role")\
-                .eq("id", link["user_id"])\
-                .limit(1)\
-                .execute()
-
-            driver_data = safe_first(driver_result) or {}
-            user_data = safe_first(user_result) or {}
+            uid = link.get("user_id")
+            driver_data = driver_map.get(uid, {})
+            user_data = user_map.get(uid, {})
 
             drivers_list.append({
                 "link_id": link["id"],
-                "user_id": link["user_id"],
+                "user_id": uid,
                 "driver_id": link.get("driver_id"),
                 "mode": link.get("mode", "driver_pays"),
                 "company_cost": link.get("company_cost"),
@@ -3582,10 +3599,12 @@ async def stripe_webhook(request: Request):
         logger.info(f"Stripe webhook already processed event: {event_id}")
         return {"received": True, "status": "already_processed"}
     if event_id:
-        _processed_webhook_events.add(event_id)
-    # Limit set size to prevent memory leak
+        _processed_webhook_events[event_id] = True
+    # LRU eviction: keep newest 5000 instead of clearing all
     if len(_processed_webhook_events) > 10000:
-        _processed_webhook_events.clear()
+        to_remove = list(_processed_webhook_events.keys())[:5000]
+        for k in to_remove:
+            del _processed_webhook_events[k]
 
     logger.info(f"Stripe webhook received event: {event_type}")
 
@@ -4122,7 +4141,7 @@ async def publish_post(post_id: str):
                 errors.append("LinkedIn: API no configurada")
 
         # Update post with results
-        update = {"updated_at": datetime.utcnow().isoformat()}
+        update = {"updated_at": datetime.now(timezone.utc).isoformat()}
         if twitter_post_id:
             update["twitter_post_id"] = twitter_post_id
             update["twitter_url"] = twitter_url
@@ -4136,7 +4155,7 @@ async def publish_post(post_id: str):
             update["retry_count"] = (post.get("retry_count") or 0) + 1
         else:
             update["status"] = "published"
-            update["published_at"] = datetime.utcnow().isoformat()
+            update["published_at"] = datetime.now(timezone.utc).isoformat()
             if errors:
                 update["error_message"] = "; ".join(errors)
 
@@ -4158,7 +4177,7 @@ async def publish_post(post_id: str):
 async def check_scheduled_posts():
     """Check and publish scheduled posts that are due."""
     try:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         result = supabase.table("social_posts")\
             .select("id")\
             .eq("status", "scheduled")\
@@ -4229,7 +4248,7 @@ async def update_social_post(post_id: str, update: SocialPostUpdate, user=Depend
     if existing.data["status"] in ("published", "publishing"):
         raise HTTPException(status_code=400, detail="No se puede editar un post ya publicado")
 
-    data = {"updated_at": datetime.utcnow().isoformat()}
+    data = {"updated_at": datetime.now(timezone.utc).isoformat()}
     if update.content is not None:
         data["content"] = update.content
     if update.platforms is not None:
@@ -4645,7 +4664,7 @@ async def health_check():
         checks["scheduler"] = {"status": "unknown"}
 
     # Uptime
-    checks["uptime_seconds"] = int((datetime.utcnow() - _server_start_time).total_seconds())
+    checks["uptime_seconds"] = int((datetime.now(timezone.utc) - _server_start_time).total_seconds())
     checks["version"] = "1.1.4"
     checks["environment"] = os.getenv("SENTRY_ENVIRONMENT", "production")
 
@@ -4674,7 +4693,7 @@ async def backup_critical_tables():
             )
 
         tables = ["drivers", "users", "routes", "stops", "referrals", "promo_codes"]
-        backup_date = datetime.utcnow().strftime("%Y-%m-%d")
+        backup_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         backup_data = {}
 
         for table in tables:
@@ -4683,7 +4702,7 @@ async def backup_critical_tables():
                 backup_data[table] = {
                     "count": len(result.data),
                     "data": result.data,
-                    "backed_up_at": datetime.utcnow().isoformat()
+                    "backed_up_at": datetime.now(timezone.utc).isoformat()
                 }
             except Exception as e:
                 logger.error(f"Backup error for table {table}: {e}")
@@ -4775,7 +4794,7 @@ async def send_weekly_reengagement_push():
     import asyncio
 
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         # Drivers registered in last 30 days with push tokens
         drivers_result = (
             supabase.table("drivers")
@@ -4812,7 +4831,7 @@ async def send_weekly_reengagement_push():
 
 
 # Track server start time for uptime
-_server_start_time = datetime.utcnow()
+_server_start_time = datetime.now(timezone.utc)
 
 
 @app.on_event("startup")
@@ -4918,7 +4937,7 @@ async def monitor_website_health():
             sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="error")
 
         # Check cooldown before sending alert email
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if _last_website_alert and (now - _last_website_alert).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
             logger.info("Website alert skipped (cooldown active)")
             return
@@ -4944,7 +4963,7 @@ async def monitor_website_health():
             sentry_sdk.capture_exception(e)
 
         # Also alert on connection failures (site completely down)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if not _last_website_alert or (now - _last_website_alert).total_seconds() >= ALERT_COOLDOWN_HOURS * 3600:
             result = send_alert_email(ALERT_EMAIL, "Web xpedit.es NO responde", f"URL: {WEBSITE_HEALTH_URL}\nError: {e}\nTimestamp: {now.isoformat()}Z")
             if result.get("success"):
@@ -5044,8 +5063,7 @@ async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current
         context_parts.append(f"Tiempo restante estimado: {req.remaining_minutes:.0f} minutos")
     if req.total_distance_km is not None:
         context_parts.append(f"Distancia total: {req.total_distance_km:.1f} km")
-    import datetime
-    context_parts.append(f"Hora actual: {datetime.datetime.now().strftime('%H:%M')}")
+    context_parts.append(f"Hora actual: {datetime.now().strftime('%H:%M')}")
 
     context = "\n".join(context_parts) if context_parts else "Sin contexto disponible"
     prompt = VOICE_ASSISTANT_PROMPT.replace("{context}", context)
