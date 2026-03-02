@@ -380,7 +380,7 @@ class TestAdminResetPassword:
             mock_sb.auth.admin.update_user_by_id.return_value = MagicMock()
 
             driver_result = MagicMock()
-            driver_result.data = [{"id": "d1"}]
+            driver_result.data = [{"id": "d1", "email": "test@example.com", "name": "Test User"}]
 
             def table_dispatch(name):
                 chain = MagicMock()
@@ -399,7 +399,8 @@ class TestAdminResetPassword:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert "password" not in data
+        assert data["password"] == "NewPass123!"
+        assert "email_sent" in data
 
     @pytest.mark.asyncio
     async def test_reset_password_too_short(self, admin_client):

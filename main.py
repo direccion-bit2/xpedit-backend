@@ -2118,14 +2118,30 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
             raise HTTPException(status_code=404, detail="User not found")
 
         # Mark user to force password change on next login
-        driver = supabase.table("drivers").select("id").eq("user_id", user_id).execute()
+        driver = supabase.table("drivers").select("id, email, name").eq("user_id", user_id).execute()
         if driver.data:
             supabase.table("drivers").update({"must_change_password": True}).eq("id", driver.data[0]["id"]).execute()
+
+        # Send email with new password (best-effort)
+        email_sent = False
+        if driver.data and driver.data[0].get("email"):
+            try:
+                from emails import send_password_reset_email
+                email_result = send_password_reset_email(
+                    driver.data[0]["email"],
+                    driver.data[0].get("name", ""),
+                    new_password
+                )
+                email_sent = email_result.get("success", False)
+            except Exception as email_err:
+                logger.warning(f"Failed to send password reset email: {email_err}")
 
         log_audit(user["id"], "reset_password", "user", user_id)
         return {
             "success": True,
             "user_id": user_id,
+            "password": new_password,
+            "email_sent": email_sent,
             "message": "Password reset successfully."
         }
 

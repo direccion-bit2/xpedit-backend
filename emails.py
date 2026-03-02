@@ -568,6 +568,59 @@ def send_upcoming_email(
         return {"success": False, "error": str(e)}
 
 
+def send_password_reset_email(to_email: str, user_name: str, new_password: str) -> dict:
+    """Email con la nueva contraseña temporal cuando admin resetea"""
+    user_name = html_escape(user_name or "usuario")
+    new_password = html_escape(new_password)
+
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            Tu contraseña ha sido restablecida
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola <strong>{user_name}</strong>,
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Un administrador ha restablecido tu contraseña de Xpedit. Tu nueva contraseña temporal es:
+        </p>
+
+        <div style="background-color: #f0fdf4; border: 2px solid #22c55e; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center;">
+            <p style="margin: 0 0 6px 0; color: #166534; font-size: 14px; font-weight: 600;">NUEVA CONTRASEÑA</p>
+            <p style="margin: 0; color: #111827; font-size: 24px; font-weight: 700; font-family: monospace; letter-spacing: 2px;">{new_password}</p>
+        </div>
+
+        <div style="background-color: #fef3c7; border-radius: 8px; padding: 15px; margin: 20px 0;">
+            <p style="margin: 0; color: #92400e; font-size: 14px;">
+                <strong>Importante:</strong> Cambia esta contraseña la proxima vez que inicies sesion.
+            </p>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://xpedit.es" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+                Iniciar sesion
+            </a>
+        </div>
+
+        <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            Si no solicitaste este cambio, contacta con nosotros en info@xpedit.es
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": "Tu nueva contraseña de Xpedit",
+            "html": get_base_template(content, "Nueva contraseña")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
     """Email personalizado desde admin"""
     content = f"""
