@@ -1372,6 +1372,26 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
     return {"success": True, "stop": stop}
 
 
+# -- Push Token --
+
+class PushTokenUpdate(BaseModel):
+    push_token: str
+
+
+@app.put("/drivers/{driver_id}/push-token", tags=["drivers"], summary="Save push notification token")
+async def update_push_token(driver_id: str, body: PushTokenUpdate, user=Depends(get_current_user)):
+    """Save Expo push token for a driver. Uses service role to bypass RLS."""
+    # Verify the driver belongs to the authenticated user
+    driver = supabase.table("drivers").select("id, user_id").eq("id", driver_id).execute()
+    if not driver.data:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    if driver.data[0]["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your driver profile")
+
+    supabase.table("drivers").update({"push_token": body.push_token}).eq("id", driver_id).execute()
+    return {"success": True}
+
+
 # -- GPS Tracking --
 
 @app.post("/location", tags=["tracking"], summary="Registrar ubicación")
