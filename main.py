@@ -2156,7 +2156,9 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
             except Exception as email_err:
                 logger.warning(f"Failed to send password reset email: {email_err}")
 
-        log_audit(user["id"], "reset_password", "user", user_id)
+        driver_name = driver.data[0].get("name", "") if driver.data else ""
+        driver_email = driver.data[0].get("email", "") if driver.data else ""
+        log_audit(user["id"], "reset_password", "user", user_id, {"target_name": driver_name, "target_email": driver_email, "email_sent": email_sent})
         return {
             "success": True,
             "user_id": user_id,
@@ -2289,7 +2291,7 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
 
 @app.get("/admin/audit-log", tags=["admin"], summary="Audit log")
 async def get_audit_log(limit: int = 100, offset: int = 0, user=Depends(require_admin)):
-    """Devuelve el historial de acciones admin."""
+    """Devuelve el historial de acciones admin, enriquecido con nombres."""
     try:
         result = supabase.table("audit_log")\
             .select("*")\
@@ -2299,7 +2301,56 @@ async def get_audit_log(limit: int = 100, offset: int = 0, user=Depends(require_
 
         count_result = supabase.table("audit_log").select("*", count="exact", head=True).execute()
 
-        return {"success": True, "logs": result.data or [], "total": count_result.count or 0}
+        logs = result.data or []
+
+        # Enrich: resolve admin_id and resource_id to human-readable names
+        admin_ids = list({log["admin_id"] for log in logs if log.get("admin_id")})
+        resource_user_ids = list({log["resource_id"] for log in logs if log.get("resource_id") and log.get("resource_type") in ("user", "driver")})
+        resource_company_ids = list({log["resource_id"] for log in logs if log.get("resource_id") and log.get("resource_type") == "company"})
+
+        # Resolve admin names from drivers table (admin_id = user_id in auth)
+        admin_map = {}
+        if admin_ids:
+            admins = supabase.table("drivers").select("user_id, name, email").in_("user_id", admin_ids).execute()
+            for a in (admins.data or []):
+                admin_map[a["user_id"]] = {"name": a.get("name", ""), "email": a.get("email", "")}
+
+        # Resolve resource names for users/drivers
+        resource_user_map = {}
+        if resource_user_ids:
+            # resource_id for "user" type is the auth user_id
+            users = supabase.table("drivers").select("user_id, name, email").in_("user_id", resource_user_ids).execute()
+            for u in (users.data or []):
+                resource_user_map[u["user_id"]] = {"name": u.get("name", ""), "email": u.get("email", "")}
+            # Also try by driver id directly
+            drivers = supabase.table("drivers").select("id, name, email").in_("id", resource_user_ids).execute()
+            for d in (drivers.data or []):
+                if d["id"] not in resource_user_map:
+                    resource_user_map[d["id"]] = {"name": d.get("name", ""), "email": d.get("email", "")}
+
+        # Resolve company names
+        resource_company_map = {}
+        if resource_company_ids:
+            companies = supabase.table("companies").select("id, name").in_("id", resource_company_ids).execute()
+            for c in (companies.data or []):
+                resource_company_map[c["id"]] = c.get("name", "")
+
+        # Enrich logs
+        for log in logs:
+            admin_info = admin_map.get(log.get("admin_id"), {})
+            log["admin_name"] = admin_info.get("name", "")
+            log["admin_email"] = admin_info.get("email", "")
+
+            rid = log.get("resource_id")
+            rtype = log.get("resource_type")
+            if rid and rtype in ("user", "driver"):
+                rinfo = resource_user_map.get(rid, {})
+                log["resource_name"] = rinfo.get("name", "")
+                log["resource_email"] = rinfo.get("email", "")
+            elif rid and rtype == "company":
+                log["resource_name"] = resource_company_map.get(rid, "")
+
+        return {"success": True, "logs": logs, "total": count_result.count or 0}
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error obteniendo audit log")
