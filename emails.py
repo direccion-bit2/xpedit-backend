@@ -15,6 +15,13 @@ resend.api_key = os.getenv("RESEND_API_KEY")
 FROM_EMAIL = "Xpedit <info@xpedit.es>"
 REPLY_TO = "info@xpedit.es"
 
+# WhatsApp contact
+WHATSAPP_URL = "https://wa.me/34632073689"
+
+# App store links
+PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.taespack.rutamax"
+APP_STORE_URL = "https://apps.apple.com/app/xpedit-planificador-de-rutas/id6740513547"
+
 
 def get_base_template(content: str, title: str = "Xpedit") -> str:
     """Template base HTML para todos los emails"""
@@ -26,16 +33,16 @@ def get_base_template(content: str, title: str = "Xpedit") -> str:
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>{title}</title>
     </head>
-    <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f4f4f5;">
-        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f5; padding: 40px 20px;">
+    <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f0f4f8;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f0f4f8; padding: 40px 20px;">
             <tr>
                 <td align="center">
-                    <table width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                    <table width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);">
                         <!-- Header -->
                         <tr>
-                            <td style="background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%); padding: 30px; text-align: center;">
-                                <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700;">Xpedit</h1>
-                                <p style="margin: 8px 0 0 0; color: rgba(255,255,255,0.9); font-size: 14px;">Optimiza tus rutas de reparto</p>
+                            <td style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); padding: 32px; text-align: center;">
+                                <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Xpedit</h1>
+                                <p style="margin: 8px 0 0 0; color: rgba(255,255,255,0.85); font-size: 14px;">Optimiza tus rutas de reparto</p>
                             </td>
                         </tr>
                         <!-- Content -->
@@ -46,13 +53,16 @@ def get_base_template(content: str, title: str = "Xpedit") -> str:
                         </tr>
                         <!-- Footer -->
                         <tr>
-                            <td style="background-color: #f9fafb; padding: 25px 30px; text-align: center; border-top: 1px solid #e5e7eb;">
-                                <p style="margin: 0 0 10px 0; color: #6b7280; font-size: 13px;">
+                            <td style="background-color: #f8fafc; padding: 25px 30px; text-align: center; border-top: 1px solid #e2e8f0;">
+                                <p style="margin: 0 0 12px 0; color: #64748b; font-size: 13px;">
                                     Este email fue enviado por Xpedit
                                 </p>
-                                <p style="margin: 0; color: #9ca3af; font-size: 12px;">
-                                    <a href="https://xpedit.es" style="color: #22c55e; text-decoration: none;">xpedit.es</a> |
-                                    <a href="https://xpedit.es/legal/privacidad" style="color: #22c55e; text-decoration: none;">Privacidad</a>
+                                <p style="margin: 0; color: #94a3b8; font-size: 12px;">
+                                    <a href="https://xpedit.es" style="color: #3b82f6; text-decoration: none;">xpedit.es</a>
+                                    &nbsp;&middot;&nbsp;
+                                    <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none;">WhatsApp</a>
+                                    &nbsp;&middot;&nbsp;
+                                    <a href="https://xpedit.es/legal/privacidad" style="color: #3b82f6; text-decoration: none;">Privacidad</a>
                                 </p>
                             </td>
                         </tr>
@@ -66,57 +76,81 @@ def get_base_template(content: str, title: str = "Xpedit") -> str:
 
 
 def send_welcome_email(to_email: str, user_name: str) -> dict:
-    """Email de bienvenida para nuevos usuarios - guia de activacion en 3 pasos"""
+    """Email de bienvenida para nuevos usuarios - guía de activación en 3 pasos"""
     user_name = html_escape(user_name)
     content = f"""
         <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px;">Hola {user_name}, tu primera ruta te espera</h2>
 
         <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Crear y optimizar una ruta con Xpedit lleva menos de 2 minutos. Asi de facil:
+            Crear y optimizar una ruta con Xpedit lleva menos de 2 minutos. Así de fácil:
         </p>
 
         <!-- Paso 1 -->
-        <div style="display: flex; align-items: flex-start; margin-bottom: 20px;">
-            <div style="background-color: #3b82f6; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px; flex-shrink: 0; margin-right: 14px;">1</div>
-            <div>
-                <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Abre la app y agrega paradas</p>
-                <p style="margin: 0; color: #6b7280; font-size: 14px;">Escribe direcciones, usa la voz o escanea etiquetas con la camara.</p>
-            </div>
-        </div>
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 18px;">
+            <tr>
+                <td width="50" valign="top" style="padding-right: 14px;">
+                    <div style="background-color: #3b82f6; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px;">1</div>
+                </td>
+                <td valign="top">
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Abre la app y agrega paradas</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Escribe direcciones, usa la voz o escanea etiquetas con la cámara.</p>
+                </td>
+            </tr>
+        </table>
 
         <!-- Paso 2 -->
-        <div style="display: flex; align-items: flex-start; margin-bottom: 20px;">
-            <div style="background-color: #22c55e; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px; flex-shrink: 0; margin-right: 14px;">2</div>
-            <div>
-                <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Pulsa "Optimizar"</p>
-                <p style="margin: 0; color: #6b7280; font-size: 14px;">Nuestra IA ordena las paradas en el recorrido mas corto. Ahorra hasta un 30% en km.</p>
-            </div>
-        </div>
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 18px;">
+            <tr>
+                <td width="50" valign="top" style="padding-right: 14px;">
+                    <div style="background-color: #10b981; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px;">2</div>
+                </td>
+                <td valign="top">
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Pulsa "Optimizar"</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Nuestra IA ordena las paradas en el recorrido más corto. Ahorra hasta un 30% en km.</p>
+                </td>
+            </tr>
+        </table>
 
         <!-- Paso 3 -->
-        <div style="display: flex; align-items: flex-start; margin-bottom: 25px;">
-            <div style="background-color: #f59e0b; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px; flex-shrink: 0; margin-right: 14px;">3</div>
-            <div>
-                <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Navega y entrega</p>
-                <p style="margin: 0; color: #6b7280; font-size: 14px;">Navegacion paso a paso con voz. Marca entregas con foto y firma.</p>
-            </div>
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 25px;">
+            <tr>
+                <td width="50" valign="top" style="padding-right: 14px;">
+                    <div style="background-color: #f59e0b; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px;">3</div>
+                </td>
+                <td valign="top">
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Navega y entrega</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Navegación paso a paso con voz. Marca entregas con foto y firma.</p>
+                </td>
+            </tr>
+        </table>
+
+        <!-- App screenshot -->
+        <div style="text-align: center; margin: 25px 0;">
+            <img src="https://xpedit.es/screenshots/route-optimized.png" alt="Ruta optimizada en Xpedit" style="max-width: 280px; width: 100%; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
         </div>
 
-        <!-- Promo code callout -->
-        <div style="background-color: #eff6ff; border: 2px dashed #3b82f6; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center;">
+        <!-- Trial callout -->
+        <div style="background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%); border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center; border: 1px solid #e0e7ff;">
             <p style="margin: 0 0 6px 0; color: #1e40af; font-size: 14px; font-weight: 600;">REGALO DE BIENVENIDA</p>
-            <p style="margin: 0 0 8px 0; color: #111827; font-size: 22px; font-weight: 700;">10 dias de Pro+ gratis</p>
-            <p style="margin: 0; color: #6b7280; font-size: 14px;">Usa el codigo <strong style="color: #3b82f6; font-size: 16px;">BETAXPEDIT</strong> en Ajustes &gt; Canjear codigo</p>
+            <p style="margin: 0 0 4px 0; color: #111827; font-size: 22px; font-weight: 700;">14 días de Pro+ gratis</p>
+            <p style="margin: 0; color: #6b7280; font-size: 14px;">Paradas ilimitadas, optimización avanzada y más.</p>
+        </div>
+
+        <!-- LATAM mention -->
+        <div style="text-align: center; margin: 20px 0;">
+            <p style="margin: 0; color: #64748b; font-size: 13px;">
+                Disponible en España y toda Latinoamérica
+            </p>
         </div>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+            <a href="https://xpedit.es" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
                 Abrir Xpedit
             </a>
         </div>
 
         <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
-            Responde a este email si necesitas ayuda — te contestamos en menos de 24h.
+            ¿Necesitas ayuda? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escríbenos por WhatsApp</a> o responde a este email.
         </p>
     """
 
@@ -152,7 +186,7 @@ def send_delivery_started_email(
     if tracking_url:
         tracking_button = f"""
         <div style="text-align: center; margin: 30px 0;">
-            <a href="{tracking_url}" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+            <a href="{tracking_url}" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
                 Seguir mi pedido
             </a>
         </div>
@@ -243,7 +277,7 @@ def send_delivery_completed_email(
             Tu pedido ha sido entregado correctamente.
         </p>
 
-        <div style="background-color: #f9fafb; border-radius: 8px; padding: 20px; margin: 20px 0;">
+        <div style="background-color: #f8fafc; border-radius: 8px; padding: 20px; margin: 20px 0;">
             <p style="margin: 0 0 15px 0; color: #4b5563; font-size: 15px;">
                 Fecha y hora: <strong>{delivery_time}</strong>
             </p>
@@ -307,7 +341,7 @@ def send_delivery_failed_email(
 
         <div style="background-color: #fef3c7; border-radius: 8px; padding: 15px; margin-top: 20px;">
             <p style="margin: 0; color: #92400e; font-size: 14px;">
-                <strong>¿Necesitas ayuda?</strong> Contacta con nosotros en info@xpedit.es
+                <strong>¿Necesitas ayuda?</strong> Contáctanos en <a href="{WHATSAPP_URL}" style="color: #16a34a; text-decoration: none;">WhatsApp</a> o escríbenos a info@xpedit.es
             </p>
         </div>
     """
@@ -381,7 +415,7 @@ def send_daily_summary_email(
         </table>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es/dashboard" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+            <a href="https://xpedit.es/dashboard" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
                 Ver detalles en Dashboard
             </a>
         </div>
@@ -404,7 +438,7 @@ def send_plan_activated_email(to_email: str, user_name: str, plan_name: str, day
     """Email cuando se activa un plan (por admin o por compra)"""
     user_name = html_escape(user_name)
     plan_name = html_escape(plan_name)
-    duration_text = "de forma permanente" if permanent else f"durante {days} dias"
+    duration_text = "de forma permanente" if permanent else f"durante {days} días"
 
     content = f"""
         <div style="text-align: center; margin-bottom: 25px;">
@@ -428,14 +462,14 @@ def send_plan_activated_email(to_email: str, user_name: str, plan_name: str, day
         <div style="background-color: #f0fdf4; border-radius: 12px; padding: 20px; margin: 25px 0;">
             <h3 style="margin: 0 0 15px 0; color: #166534; font-size: 16px;">Tus beneficios:</h3>
             <ul style="margin: 0; padding-left: 20px; color: #166534; font-size: 14px; line-height: 2;">
-                <li>Mas paradas diarias</li>
-                <li>Optimizacion de rutas avanzada</li>
+                <li>Más paradas diarias</li>
+                <li>Optimización de rutas avanzada</li>
                 <li>Soporte prioritario</li>
             </ul>
         </div>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es" style="display: inline-block; background-color: #3b82f6; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+            <a href="https://xpedit.es" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
                 Abrir Xpedit
             </a>
         </div>
@@ -466,7 +500,7 @@ def send_referral_reward_email(to_email: str, user_name: str, referred_name: str
         </div>
 
         <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
-            ¡Has ganado {reward_days} dias Pro gratis!
+            ¡Has ganado {reward_days} días Pro gratis!
         </h2>
 
         <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
@@ -474,21 +508,21 @@ def send_referral_reward_email(to_email: str, user_name: str, referred_name: str
         </p>
 
         <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            <strong>{referred_name}</strong> se ha registrado con tu codigo de invitacion. Como agradecimiento, ambos recibis <strong>{reward_days} dias de Pro gratis</strong>.
+            <strong>{referred_name}</strong> se ha registrado con tu código de invitación. Como agradecimiento, ambos recibís <strong>{reward_days} días de Pro gratis</strong>.
         </p>
 
         <div style="background-color: #eff6ff; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center;">
             <p style="margin: 0 0 5px 0; color: #1e40af; font-size: 14px;">Tu recompensa</p>
-            <p style="margin: 0; color: #1e40af; font-size: 28px; font-weight: 700;">{reward_days} dias Pro</p>
+            <p style="margin: 0; color: #1e40af; font-size: 28px; font-weight: 700;">{reward_days} días Pro</p>
         </div>
 
         <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Sigue invitando amigos para acumular mas dias gratis.
+            Sigue invitando amigos para acumular más días gratis.
         </p>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es" style="display: inline-block; background-color: #f59e0b; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
-                Invitar mas amigos
+            <a href="https://xpedit.es" style="display: inline-block; background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);">
+                Invitar más amigos
             </a>
         </div>
     """
@@ -498,7 +532,7 @@ def send_referral_reward_email(to_email: str, user_name: str, referred_name: str
             "from": FROM_EMAIL,
             "to": [to_email],
             "reply_to": REPLY_TO,
-            "subject": f"🎉 Has ganado {reward_days} dias Pro gratis",
+            "subject": f"🎉 Has ganado {reward_days} días Pro gratis",
             "html": get_base_template(content, "Recompensa referido")
         })
         return {"success": True, "id": response["id"]}
@@ -522,7 +556,7 @@ def send_upcoming_email(
     if tracking_url:
         tracking_button = f"""
         <div style="text-align: center; margin: 30px 0;">
-            <a href="{tracking_url}" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+            <a href="{tracking_url}" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
                 Seguir mi pedido en vivo
             </a>
         </div>
@@ -544,14 +578,14 @@ def send_upcoming_email(
         </p>
 
         <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Tu repartidor <strong>{driver_name}</strong> esta a <strong>{stops_away} paradas</strong> de llegar a tu direccion.
+            Tu repartidor <strong>{driver_name}</strong> está a <strong>{stops_away} paradas</strong> de llegar a tu dirección.
         </p>
 
         {tracking_button}
 
         <div style="background-color: #f0fdf4; border-radius: 8px; padding: 15px; margin-top: 20px;">
             <p style="margin: 0; color: #166534; font-size: 14px;">
-                <strong>Consejo:</strong> Asegurate de estar disponible para recibir tu pedido.
+                <strong>Consejo:</strong> Asegúrate de estar disponible para recibir tu pedido.
             </p>
         </div>
     """
@@ -560,7 +594,7 @@ def send_upcoming_email(
         response = resend.Emails.send({
             "from": FROM_EMAIL,
             "to": [to_email],
-            "subject": f"📦 Tu pedido esta a {stops_away} paradas",
+            "subject": f"📦 Tu pedido está a {stops_away} paradas",
             "html": get_base_template(content, "Pedido en camino")
         })
         return {"success": True, "id": response["id"]}
@@ -593,18 +627,18 @@ def send_password_reset_email(to_email: str, user_name: str, new_password: str) 
 
         <div style="background-color: #fef3c7; border-radius: 8px; padding: 15px; margin: 20px 0;">
             <p style="margin: 0; color: #92400e; font-size: 14px;">
-                <strong>Importante:</strong> Cambia esta contraseña la proxima vez que inicies sesion.
+                <strong>Importante:</strong> Cambia esta contraseña la próxima vez que inicies sesión.
             </p>
         </div>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es" style="display: inline-block; background-color: #22c55e; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 8px; font-weight: 600; font-size: 16px;">
-                Iniciar sesion
+            <a href="https://xpedit.es" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
+                Iniciar sesión
             </a>
         </div>
 
         <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
-            Si no solicitaste este cambio, contacta con nosotros en info@xpedit.es
+            Si no solicitaste este cambio, contáctanos en <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none;">WhatsApp</a> o en info@xpedit.es
         </p>
     """
 
@@ -643,7 +677,7 @@ def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
 
 
 def send_alert_email(to_email: str, alert_title: str, details: str) -> dict:
-    """Email de alerta del sistema (health check, errores criticos)"""
+    """Email de alerta del sistema (health check, errores críticos)"""
     alert_title = html_escape(alert_title)
     details = html_escape(details)
     content = f"""
@@ -692,7 +726,7 @@ def send_alert_email(to_email: str, alert_title: str, details: str) -> dict:
 
 
 def send_broadcast_email(to_emails: List[str], subject: str, body_html: str) -> dict:
-    """Email masivo a multiples usuarios"""
+    """Email masivo a múltiples usuarios"""
     results = {"sent": 0, "failed": 0, "errors": []}
 
     for email in to_emails:
@@ -702,5 +736,125 @@ def send_broadcast_email(to_emails: List[str], subject: str, body_html: str) -> 
         else:
             results["failed"] += 1
             results["errors"].append({"email": email, "error": result.get("error", "unknown")})
+
+    return results
+
+
+def send_reengagement_email(to_email: str, user_name: str) -> dict:
+    """Email de re-engagement para traer de vuelta usuarios inactivos"""
+    user_name = html_escape(user_name or "repartidor")
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            ¡Hemos mejorado Xpedit!
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola <strong>{user_name}</strong>,
+        </p>
+
+        <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hace tiempo que no te pasas por Xpedit y queríamos contarte todo lo nuevo. Hemos estado trabajando duro para que tus rutas sean aún más fáciles y rápidas:
+        </p>
+
+        <!-- Novedades -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">🎤</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Asistente de voz</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Di "Oye copiloto" y controla la app sin manos mientras conduces.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">📍</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">20 paradas/día gratis</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Ahora puedes optimizar hasta 20 paradas al día en el plan gratuito.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">🚀</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Optimización mejorada</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Algoritmo más rápido y preciso con distancias reales por carretera.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 20px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">📸</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Prueba de entrega con foto</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Captura fotos y firmas como comprobante de cada entrega.</p>
+                </td>
+            </tr>
+        </table>
+
+        <!-- App screenshot -->
+        <div style="text-align: center; margin: 25px 0;">
+            <img src="https://xpedit.es/screenshots/route-optimized.png" alt="Ruta optimizada en Xpedit" style="max-width: 280px; width: 100%; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
+        </div>
+
+        <!-- LATAM mention -->
+        <div style="background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%); border-radius: 12px; padding: 16px; margin: 20px 0; text-align: center; border: 1px solid #e0e7ff;">
+            <p style="margin: 0; color: #1e40af; font-size: 14px; font-weight: 500;">
+                Disponible en España y toda Latinoamérica
+            </p>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://xpedit.es" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
+                Vuelve a probar Xpedit
+            </a>
+        </div>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            ¿Tienes dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escríbenos por WhatsApp</a>
+        </p>
+
+        <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Recibes este email porque tienes una cuenta en Xpedit. Si no quieres recibir más emails, responde con "cancelar".
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": "¡Hemos mejorado Xpedit! Mira las novedades",
+            "html": get_base_template(content, "Novedades de Xpedit")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_reengagement_broadcast(to_emails_with_names: List[dict]) -> dict:
+    """Envía email de re-engagement a múltiples usuarios. Cada item es {email, name}."""
+    results = {"sent": 0, "failed": 0, "errors": []}
+
+    for item in to_emails_with_names:
+        result = send_reengagement_email(item["email"], item.get("name", ""))
+        if result["success"]:
+            results["sent"] += 1
+        else:
+            results["failed"] += 1
+            results["errors"].append({"email": item["email"], "error": result.get("error", "unknown")})
 
     return results

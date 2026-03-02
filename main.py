@@ -49,6 +49,7 @@ from emails import (
     send_delivery_failed_email,
     send_delivery_started_email,
     send_plan_activated_email,
+    send_reengagement_broadcast,
     send_referral_reward_email,
     send_upcoming_email,
     send_welcome_email,
@@ -1700,6 +1701,50 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error enviando broadcast")
+
+
+@app.post("/admin/reengagement-broadcast", tags=["admin", "email"], summary="Re-engagement broadcast")
+async def admin_reengagement_broadcast(user=Depends(require_admin)):
+    """Envía email de re-engagement a todos los usuarios con email, excluyendo admin/test."""
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # direccion@taespack.com
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # migue995@gmail.com
+    ]
+    try:
+        drivers = supabase.table("drivers").select("id, email, name").not_.is_("email", "null").execute()
+        if not drivers.data:
+            return {"success": True, "sent": 0, "failed": 0, "total": 0}
+
+        targets = [d for d in drivers.data if d["id"] not in EXCLUDED_IDS and d.get("email")]
+        results = send_reengagement_broadcast(targets)
+
+        try:
+            email_logs = [
+                {
+                    "recipient_email": d["email"],
+                    "recipient_name": d.get("name"),
+                    "subject": "¡Hemos mejorado Xpedit! Mira las novedades",
+                    "body": "re-engagement broadcast",
+                    "sent_by": "broadcast:reengagement",
+                    "status": "sent",
+                }
+                for d in targets
+            ]
+            if email_logs:
+                supabase.table("email_log").insert(email_logs).execute()
+        except Exception:
+            pass
+
+        log_audit(user["id"], "reengagement_broadcast", "email", None, {"total": len(targets), "sent": results["sent"]})
+        return {
+            "success": True,
+            "total": len(targets),
+            "sent": results["sent"],
+            "failed": results["failed"],
+        }
+    except Exception as e:
+        logger.error(f"{type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error enviando re-engagement broadcast")
 
 
 @app.post("/admin/push-blast")
