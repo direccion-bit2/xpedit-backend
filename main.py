@@ -2114,22 +2114,26 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
 
 class AdminResetPasswordRequest(BaseModel):
     password: Optional[str] = None  # If None, generate random
+    quick: bool = False  # If True, set "123456" and skip validation
 
 
 @app.post("/admin/users/{user_id}/reset-password", tags=["admin"], summary="Resetear contraseña")
 async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest, user=Depends(require_admin)):
     """Resetea la contraseña de un usuario. Genera una aleatoria si no se proporciona. Solo admin."""
     try:
-        # Generate random password if not provided
-        chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#"
-        new_password = request.password or "".join(random.choices(chars, k=12))
+        if request.quick:
+            new_password = "123456"
+        else:
+            # Generate random password if not provided
+            chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#"
+            new_password = request.password or "".join(random.choices(chars, k=12))
 
-        if len(new_password) < 8:
-            raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
-        if not any(c.isupper() for c in new_password):
-            raise HTTPException(status_code=400, detail="La contraseña debe incluir al menos una mayúscula")
-        if not any(c.isdigit() for c in new_password):
-            raise HTTPException(status_code=400, detail="La contraseña debe incluir al menos un número")
+            if len(new_password) < 8:
+                raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+            if not any(c.isupper() for c in new_password):
+                raise HTTPException(status_code=400, detail="La contraseña debe incluir al menos una mayúscula")
+            if not any(c.isdigit() for c in new_password):
+                raise HTTPException(status_code=400, detail="La contraseña debe incluir al menos un número")
 
         # Update password via Supabase Admin API
         result = supabase.auth.admin.update_user_by_id(user_id, {"password": new_password})
