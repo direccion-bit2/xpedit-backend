@@ -140,9 +140,9 @@ def optimize_route(
 
     routing = pywrapcp.RoutingModel(manager)
 
-    # Use duration matrix as cost when available (minimize travel TIME, not distance)
-    # Duration matrix from OSRM is asymmetric → handles one-way streets
-    cost_matrix = duration_matrix if duration_matrix is not None else distance_matrix
+    # Use road distance matrix as cost (minimize km by road)
+    # OSRM distance matrix is asymmetric → handles one-way streets
+    cost_matrix = distance_matrix
 
     def distance_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
@@ -293,9 +293,8 @@ def solve_with_vroom(
     # Create VROOM problem instance
     problem = vroom.Input()
 
-    # Set matrices (pyvroom accepts list-of-lists directly)
-    # VROOM optimizes on durations (minimizes travel time)
-    problem.set_durations_matrix(profile="car", matrix_input=duration_matrix if duration_matrix is not None else distance_matrix)
+    # Set matrices — optimize on road distance (km), not travel time
+    problem.set_durations_matrix(profile="car", matrix_input=distance_matrix)
     problem.set_distances_matrix(profile="car", matrix_input=distance_matrix)
 
     # Add vehicle starting and ending at depot
@@ -378,10 +377,8 @@ def solve_with_pyvrp(
 
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
-    if duration_matrix is None:
-        duration_matrix = distance_matrix
 
-    # Build PyVRP model
+    # Build PyVRP model — optimize on road distance only
     model = PyVRPModel()
 
     # Position-based mapping: pyvrp_to_orig[pyvrp_idx] -> original location index
@@ -422,8 +419,7 @@ def solve_with_pyvrp(
     for i, frm in enumerate(all_locs):
         for j, to in enumerate(all_locs):
             dist = distance_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
-            dur = duration_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
-            model.add_edge(frm, to, distance=dist, duration=dur)
+            model.add_edge(frm, to, distance=dist, duration=dist)
 
     # Solve
     result = model.solve(stop=MaxRuntime(time_limit_s), display=False)
