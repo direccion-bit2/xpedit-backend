@@ -427,7 +427,13 @@ tags_metadata = [
         "name": "webhooks",
         "description": "Webhooks entrantes de servicios externos (Stripe, Resend).",
     },
+    {
+        "name": "fleet",
+        "description": "Fleet management: dashboard KPIs, driver performance, zones, chat, activity feed.",
+    },
 ]
+
+ADMIN_EXCLUDE_IDS = ["8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b", "e481de53-bb8c-4b76-8b56-04a7d00f9c6f"]
 
 _is_production = os.getenv("SENTRY_ENVIRONMENT") == "production"
 
@@ -444,7 +450,7 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://xpedit.es", "https://www.xpedit.es", "http://localhost:3000"],
+    allow_origins=["https://xpedit.es", "https://www.xpedit.es", "http://localhost:3000", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -691,6 +697,48 @@ class CustomerNotificationRequest(BaseModel):
 class HealthCheckResponse(BaseModel):
     status: str = Field(..., description="Estado general: 'healthy' o 'degraded'")
     checks: dict = Field(..., description="Detalle de cada servicio verificado")
+
+
+# -- Fleet Management Models --
+
+class FleetZonePoint(BaseModel):
+    lat: float
+    lng: float
+
+class FleetZoneCreate(BaseModel):
+    name: str
+    polygon: List[FleetZonePoint]
+    color: str = "#8b5cf6"
+    priority: int = 0
+
+class FleetZoneUpdate(BaseModel):
+    name: Optional[str] = None
+    polygon: Optional[List[FleetZonePoint]] = None
+    color: Optional[str] = None
+    priority: Optional[int] = None
+    active: Optional[bool] = None
+
+class FleetMessageCreate(BaseModel):
+    driver_id: str
+    message: str
+
+
+def _period_to_date_range(period: str) -> tuple[datetime, datetime]:
+    """Convert period string to (start, end) datetime range."""
+    now = datetime.now(timezone.utc)
+    if period == "week":
+        start = now - timedelta(days=7)
+    elif period == "month":
+        start = now - timedelta(days=30)
+    else:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, now
+
+
+async def _get_company_driver_ids(company_id: str) -> list[str]:
+    """Get all driver IDs for a company, excluding admin/test accounts."""
+    result = supabase.table("drivers").select("id").eq("company_id", company_id).eq("active", True).execute()
+    return [d["id"] for d in (result.data or []) if d["id"] not in ADMIN_EXCLUDE_IDS]
 
 
 # === ENDPOINTS BÁSICOS ===
@@ -5458,6 +5506,493 @@ async def parse_voice_command(req: VoiceCommandRequest, user=Depends(get_current
     except Exception as e:
         logger.error(f"Voice command error: {e}")
         raise HTTPException(status_code=500, detail="Error procesando comando de voz")
+
+
+# === FLEET MANAGEMENT ===
+
+
+@app.get("/fleet/dashboard", tags=["fleet"], summary="Fleet dashboard KPIs")
+async def fleet_dashboard_stats(user=Depends(require_admin_or_dispatcher)):
+    """Real-time fleet KPIs for dispatcher/admin dashboard."""
+    try:
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        five_min_ago = (now - timedelta(minutes=5)).isoformat()
+
+        company_id = user.get("company_id")
+
+        # Build base queries
+        routes_q = supabase.table("routes").select("id,status,started_at,completed_at,driver_id")
+        stops_q = supabase.table("stops").select("id,status,completed_at,time_window_start,time_window_end")
+        drivers_q = supabase.table("drivers").select("id,active")
+
+        if company_id:
+            routes_q = routes_q.eq("company_id", company_id)
+            drivers_q = drivers_q.eq("company_id", company_id)
+
+        # Today's routes
+        routes_today = routes_q.gte("created_at", today_start).execute()
+        routes_data = [r for r in (routes_today.data or []) if r.get("driver_id") not in ADMIN_EXCLUDE_IDS]
+
+        # All drivers
+        drivers_result = drivers_q.eq("active", True).execute()
+        driver_ids = [d["id"] for d in (drivers_result.data or []) if d["id"] not in ADMIN_EXCLUDE_IDS]
+        total_drivers = len(driver_ids)
+
+        # Active drivers (location update in last 5 min)
+        active_count = 0
+        if driver_ids:
+            for did in driver_ids:
+                loc = supabase.table("location_history").select("id").eq("driver_id", did).gte("recorded_at", five_min_ago).limit(1).execute()
+                if loc.data:
+                    active_count += 1
+
+        # Today's stops (from today's routes)
+        route_ids = [r["id"] for r in routes_data]
+        completed_stops = 0
+        failed_stops = 0
+        on_time_count = 0
+        total_with_window = 0
+        delivery_times = []
+
+        for rid in route_ids:
+            stops_result = stops_q.eq("route_id", rid).execute()
+            for s in (stops_result.data or []):
+                if s["status"] == "completed":
+                    completed_stops += 1
+                    if s.get("time_window_end") and s.get("completed_at"):
+                        total_with_window += 1
+                        completed_time = s["completed_at"][:5] if isinstance(s["completed_at"], str) else ""
+                        if completed_time <= s["time_window_end"]:
+                            on_time_count += 1
+                elif s["status"] == "failed":
+                    failed_stops += 1
+
+        # Route timing
+        for r in routes_data:
+            if r.get("started_at") and r.get("completed_at") and r["status"] == "completed":
+                try:
+                    started = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))
+                    completed = datetime.fromisoformat(r["completed_at"].replace("Z", "+00:00"))
+                    delivery_times.append((completed - started).total_seconds() / 60)
+                except Exception:
+                    pass
+
+        routes_in_progress = sum(1 for r in routes_data if r["status"] == "in_progress")
+        routes_pending = sum(1 for r in routes_data if r["status"] == "pending")
+        total_deliveries = completed_stops + failed_stops
+        success_rate = round((completed_stops / total_deliveries * 100) if total_deliveries > 0 else 100, 1)
+        avg_time = round(sum(delivery_times) / len(delivery_times), 1) if delivery_times else 0
+        on_time_pct = round((on_time_count / total_with_window * 100) if total_with_window > 0 else 100, 1)
+
+        return {
+            "deliveries_today": completed_stops,
+            "deliveries_failed_today": failed_stops,
+            "active_drivers": active_count,
+            "total_drivers": total_drivers,
+            "routes_in_progress": routes_in_progress,
+            "routes_pending": routes_pending,
+            "avg_delivery_time_min": avg_time,
+            "success_rate_pct": success_rate,
+            "on_time_pct": on_time_pct,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fleet dashboard error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error obteniendo estadísticas de flota")
+
+
+@app.get("/fleet/drivers/locations", tags=["fleet"], summary="Batch driver locations")
+async def fleet_driver_locations(user=Depends(require_admin_or_dispatcher)):
+    """Get latest locations for all company drivers at once."""
+    try:
+        now = datetime.now(timezone.utc)
+        two_min_ago = (now - timedelta(minutes=2)).isoformat()
+        company_id = user.get("company_id")
+
+        drivers_q = supabase.table("drivers").select("id,full_name,phone,active")
+        if company_id:
+            drivers_q = drivers_q.eq("company_id", company_id)
+        drivers_result = drivers_q.eq("active", True).execute()
+
+        locations = []
+        for driver in (drivers_result.data or []):
+            if driver["id"] in ADMIN_EXCLUDE_IDS:
+                continue
+            loc = supabase.table("location_history").select(
+                "lat,lng,speed,heading,accuracy,recorded_at"
+            ).eq("driver_id", driver["id"]).order("recorded_at", desc=True).limit(1).execute()
+
+            if loc.data:
+                loc_data = loc.data[0]
+                is_online = loc_data.get("recorded_at", "") >= two_min_ago
+                locations.append({
+                    "driver_id": driver["id"],
+                    "driver_name": driver.get("full_name") or driver.get("name", ""),
+                    "phone": driver.get("phone"),
+                    "lat": loc_data["lat"],
+                    "lng": loc_data["lng"],
+                    "speed": loc_data.get("speed"),
+                    "heading": loc_data.get("heading"),
+                    "accuracy": loc_data.get("accuracy"),
+                    "recorded_at": loc_data["recorded_at"],
+                    "is_online": is_online,
+                })
+
+        return {"drivers": locations}
+    except Exception as e:
+        logger.error(f"Fleet locations error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error obteniendo ubicaciones")
+
+
+@app.get("/fleet/drivers/{driver_id}/performance", tags=["fleet"], summary="Driver performance stats")
+async def fleet_driver_performance(driver_id: str, period: str = "today", user=Depends(require_admin_or_dispatcher)):
+    """Driver performance metrics for a given period."""
+    try:
+        start_dt, end_dt = _period_to_date_range(period)
+        start_str = start_dt.isoformat()
+
+        routes = supabase.table("routes").select(
+            "id,status,total_distance_km,started_at,completed_at"
+        ).eq("driver_id", driver_id).gte("created_at", start_str).execute()
+
+        completed_deliveries = 0
+        failed_deliveries = 0
+        total_distance = 0.0
+        delivery_times = []
+        on_time = 0
+        total_with_window = 0
+
+        for route in (routes.data or []):
+            total_distance += route.get("total_distance_km") or 0
+            if route.get("started_at") and route.get("completed_at") and route["status"] == "completed":
+                try:
+                    s = datetime.fromisoformat(route["started_at"].replace("Z", "+00:00"))
+                    c = datetime.fromisoformat(route["completed_at"].replace("Z", "+00:00"))
+                    delivery_times.append((c - s).total_seconds() / 60)
+                except Exception:
+                    pass
+
+            stops = supabase.table("stops").select(
+                "status,completed_at,time_window_end"
+            ).eq("route_id", route["id"]).execute()
+            for stop in (stops.data or []):
+                if stop["status"] == "completed":
+                    completed_deliveries += 1
+                    if stop.get("time_window_end") and stop.get("completed_at"):
+                        total_with_window += 1
+                        ct = stop["completed_at"][:5] if isinstance(stop["completed_at"], str) else ""
+                        if ct <= stop["time_window_end"]:
+                            on_time += 1
+                elif stop["status"] == "failed":
+                    failed_deliveries += 1
+
+        total = completed_deliveries + failed_deliveries
+        return {
+            "driver_id": driver_id,
+            "period": period,
+            "deliveries_completed": completed_deliveries,
+            "deliveries_failed": failed_deliveries,
+            "success_rate": round((completed_deliveries / total * 100) if total > 0 else 100, 1),
+            "avg_delivery_time_min": round(sum(delivery_times) / len(delivery_times), 1) if delivery_times else 0,
+            "total_distance_km": round(total_distance, 1),
+            "on_time_rate": round((on_time / total_with_window * 100) if total_with_window > 0 else 100, 1),
+            "routes_completed": sum(1 for r in (routes.data or []) if r["status"] == "completed"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Driver performance error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error obteniendo rendimiento del conductor")
+
+
+@app.get("/fleet/activity", tags=["fleet"], summary="Fleet activity feed")
+async def fleet_activity_feed(limit: int = Query(default=50, le=200), user=Depends(require_admin_or_dispatcher)):
+    """Recent fleet events: route starts, completions, failures."""
+    try:
+        company_id = user.get("company_id")
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=24)).isoformat()
+
+        # Recent routes with status changes
+        routes_q = supabase.table("routes").select(
+            "id,name,status,driver_id,started_at,completed_at,created_at"
+        ).gte("created_at", since).order("created_at", desc=True).limit(limit)
+        if company_id:
+            routes_q = routes_q.eq("company_id", company_id)
+        routes = routes_q.execute()
+
+        # Get driver names
+        driver_ids = list({r["driver_id"] for r in (routes.data or []) if r.get("driver_id")})
+        driver_names = {}
+        if driver_ids:
+            for did in driver_ids:
+                d = supabase.table("drivers").select("full_name").eq("id", did).limit(1).execute()
+                if d.data:
+                    driver_names[did] = d.data[0].get("full_name", "")
+
+        events = []
+        for r in (routes.data or []):
+            if r.get("driver_id") in ADMIN_EXCLUDE_IDS:
+                continue
+            dname = driver_names.get(r.get("driver_id", ""), "Sin asignar")
+
+            if r["status"] == "completed" and r.get("completed_at"):
+                events.append({
+                    "type": "route_completed",
+                    "message": f"{dname} completó la ruta '{r.get('name', '')}'",
+                    "timestamp": r["completed_at"],
+                    "driver_name": dname,
+                    "details": {"route_id": r["id"]},
+                })
+            elif r["status"] == "in_progress" and r.get("started_at"):
+                events.append({
+                    "type": "route_started",
+                    "message": f"{dname} inició la ruta '{r.get('name', '')}'",
+                    "timestamp": r["started_at"],
+                    "driver_name": dname,
+                    "details": {"route_id": r["id"]},
+                })
+            elif r["status"] == "pending":
+                events.append({
+                    "type": "route_created",
+                    "message": f"Nueva ruta '{r.get('name', '')}' creada",
+                    "timestamp": r["created_at"],
+                    "driver_name": dname,
+                    "details": {"route_id": r["id"]},
+                })
+
+        # Failed stops
+        for r in (routes.data or []):
+            if r.get("driver_id") in ADMIN_EXCLUDE_IDS:
+                continue
+            failed = supabase.table("stops").select(
+                "id,address,completed_at"
+            ).eq("route_id", r["id"]).eq("status", "failed").execute()
+            dname = driver_names.get(r.get("driver_id", ""), "")
+            for s in (failed.data or []):
+                events.append({
+                    "type": "delivery_failed",
+                    "message": f"Entrega fallida en {s.get('address', '')[:40]}",
+                    "timestamp": s.get("completed_at") or r["created_at"],
+                    "driver_name": dname,
+                    "details": {"stop_id": s["id"], "route_id": r["id"]},
+                })
+
+        events.sort(key=lambda e: e["timestamp"], reverse=True)
+        return {"events": events[:limit]}
+    except Exception as e:
+        logger.error(f"Fleet activity error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error obteniendo actividad de flota")
+
+
+# -- Fleet Zones CRUD --
+
+@app.get("/fleet/zones", tags=["fleet"], summary="List fleet zones")
+async def list_fleet_zones(user=Depends(require_admin_or_dispatcher)):
+    """List all fleet zones for the company."""
+    try:
+        company_id = user.get("company_id")
+        q = supabase.table("fleet_zones").select("*")
+        if company_id:
+            q = q.eq("company_id", company_id)
+        result = q.order("priority", desc=True).execute()
+        return {"zones": result.data or []}
+    except Exception as e:
+        logger.error(f"List zones error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error listando zonas")
+
+
+@app.post("/fleet/zones", tags=["fleet"], summary="Create fleet zone", status_code=201)
+async def create_fleet_zone(zone: FleetZoneCreate, user=Depends(require_admin_or_dispatcher)):
+    """Create a new fleet zone."""
+    try:
+        company_id = user.get("company_id")
+        if not company_id:
+            raise HTTPException(status_code=400, detail="Se requiere company_id")
+
+        data = {
+            "company_id": company_id,
+            "name": zone.name,
+            "polygon": [{"lat": p.lat, "lng": p.lng} for p in zone.polygon],
+            "color": zone.color,
+            "priority": zone.priority,
+        }
+        result = supabase.table("fleet_zones").insert(data).execute()
+        return result.data[0] if result.data else {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create zone error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error creando zona")
+
+
+@app.put("/fleet/zones/{zone_id}", tags=["fleet"], summary="Update fleet zone")
+async def update_fleet_zone(zone_id: str, zone: FleetZoneUpdate, user=Depends(require_admin_or_dispatcher)):
+    """Update a fleet zone."""
+    try:
+        update_data = {}
+        if zone.name is not None:
+            update_data["name"] = zone.name
+        if zone.polygon is not None:
+            update_data["polygon"] = [{"lat": p.lat, "lng": p.lng} for p in zone.polygon]
+        if zone.color is not None:
+            update_data["color"] = zone.color
+        if zone.priority is not None:
+            update_data["priority"] = zone.priority
+        if zone.active is not None:
+            update_data["active"] = zone.active
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        result = supabase.table("fleet_zones").update(update_data).eq("id", zone_id).execute()
+        return result.data[0] if result.data else {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update zone error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error actualizando zona")
+
+
+@app.delete("/fleet/zones/{zone_id}", tags=["fleet"], summary="Delete fleet zone")
+async def delete_fleet_zone(zone_id: str, user=Depends(require_admin_or_dispatcher)):
+    """Delete a fleet zone."""
+    try:
+        supabase.table("fleet_zones").delete().eq("id", zone_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Delete zone error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error eliminando zona")
+
+
+# -- Fleet Chat --
+
+@app.post("/fleet/messages", tags=["fleet"], summary="Send chat message")
+async def send_fleet_message(msg: FleetMessageCreate, user=Depends(require_admin_or_dispatcher)):
+    """Send a message from dispatcher to driver."""
+    try:
+        data = {
+            "company_id": user.get("company_id"),
+            "sender_id": user["id"],
+            "sender_role": user.get("role", "dispatcher"),
+            "recipient_id": msg.driver_id,
+            "message": msg.message,
+        }
+        result = supabase.table("chat_messages").insert(data).execute()
+
+        # Send push notification to driver
+        driver = supabase.table("drivers").select("push_token,full_name").eq("id", msg.driver_id).limit(1).execute()
+        if driver.data and driver.data[0].get("push_token"):
+            try:
+                sender_name = user.get("full_name") or user.get("email", "Despacho")
+                async with httpx.AsyncClient(timeout=5) as client:
+                    await client.post(
+                        "https://exp.host/--/api/v2/push/send",
+                        json={
+                            "to": driver.data[0]["push_token"],
+                            "title": f"Mensaje de {sender_name}",
+                            "body": msg.message[:100],
+                            "data": {"type": "chat", "sender_id": user["id"]},
+                            "sound": "default",
+                        },
+                    )
+            except Exception:
+                pass  # Non-critical
+
+        return result.data[0] if result.data else {}
+    except Exception as e:
+        logger.error(f"Send message error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error enviando mensaje")
+
+
+@app.get("/fleet/messages/{driver_id}", tags=["fleet"], summary="Get chat history")
+async def get_fleet_messages(driver_id: str, limit: int = Query(default=50, le=200), user=Depends(require_admin_or_dispatcher)):
+    """Get chat history between dispatcher and driver."""
+    try:
+        dispatcher_id = user["id"]
+        # Get messages where sender/recipient is either the dispatcher or driver
+        result = supabase.table("chat_messages").select("*").or_(
+            f"and(sender_id.eq.{dispatcher_id},recipient_id.eq.{driver_id}),and(sender_id.eq.{driver_id},recipient_id.eq.{dispatcher_id})"
+        ).order("created_at", desc=True).limit(limit).execute()
+
+        # Mark unread messages as read
+        supabase.table("chat_messages").update({"read": True}).eq(
+            "recipient_id", dispatcher_id
+        ).eq("sender_id", driver_id).eq("read", False).execute()
+
+        return {"messages": list(reversed(result.data or []))}
+    except Exception as e:
+        logger.error(f"Get messages error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error obteniendo mensajes")
+
+
+# -- Fleet Auth (login endpoint for fleet dashboard) --
+
+@app.post("/fleet/login", tags=["fleet"], summary="Fleet dashboard login")
+async def fleet_login(request: Request):
+    """Login for fleet dashboard - validates dispatcher/admin role."""
+    try:
+        body = await request.json()
+        email = body.get("email", "").strip().lower()
+        password = body.get("password", "")
+
+        if not email or not password:
+            raise HTTPException(status_code=400, detail="Email y contraseña requeridos")
+
+        # Authenticate via Supabase
+        SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+                json={"email": email, "password": password},
+                headers={"apikey": SUPABASE_KEY, "Content-Type": "application/json"},
+            )
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
+        auth_data = resp.json()
+        access_token = auth_data.get("access_token", "")
+        user_id = auth_data.get("user", {}).get("id", "")
+
+        # Check user role
+        user_result = supabase.table("users").select("id,email,full_name,role,company_id").eq("id", user_id).limit(1).execute()
+        if not user_result.data:
+            raise HTTPException(status_code=403, detail="Usuario no encontrado")
+
+        user_data = user_result.data[0]
+        if user_data.get("role") not in ("admin", "dispatcher"):
+            raise HTTPException(status_code=403, detail="Acceso restringido a dispatchers y administradores")
+
+        return {
+            "token": access_token,
+            "user": {
+                "id": user_data["id"],
+                "email": user_data.get("email", email),
+                "name": user_data.get("full_name", ""),
+                "role": user_data.get("role", ""),
+                "company_id": user_data.get("company_id"),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fleet login error: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error en el inicio de sesión")
 
 
 # === MAIN ===
