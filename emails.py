@@ -753,18 +753,30 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
         </p>
 
         <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Hace tiempo que no te pasas por Xpedit y queríamos contarte todo lo nuevo. Hemos estado trabajando duro para que tus rutas sean aún más fáciles y rápidas:
+            Hace tiempo que no te pasas por Xpedit y queríamos contarte todo lo que ha cambiado. Hemos estado trabajando duro para que planificar tus rutas sea aún más fácil y fiable:
         </p>
 
         <!-- Novedades -->
         <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
             <tr>
                 <td width="40" valign="top" style="padding-top: 2px;">
-                    <span style="font-size: 20px;">🎤</span>
+                    <span style="font-size: 20px;">🔍</span>
                 </td>
                 <td>
-                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Asistente de voz</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Di "Oye copiloto" y controla la app sin manos mientras conduces.</p>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Búsqueda de direcciones mejorada</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Autocompletado más rápido y preciso. Encuentra cualquier dirección al instante, incluso en zonas rurales.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">🚀</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Optimización más rápida y precisa</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Nuevo algoritmo con distancias reales por carretera. Rutas hasta un 30% más cortas.</p>
                 </td>
             </tr>
         </table>
@@ -776,7 +788,7 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
                 </td>
                 <td>
                     <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">20 paradas/día gratis</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Ahora puedes optimizar hasta 20 paradas al día en el plan gratuito.</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Hemos ampliado el plan gratuito: optimiza hasta 20 paradas al día sin coste.</p>
                 </td>
             </tr>
         </table>
@@ -784,11 +796,23 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
         <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
             <tr>
                 <td width="40" valign="top" style="padding-top: 2px;">
-                    <span style="font-size: 20px;">🚀</span>
+                    <span style="font-size: 20px;">📸</span>
                 </td>
                 <td>
-                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Optimización mejorada</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Algoritmo más rápido y preciso con distancias reales por carretera.</p>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Prueba de entrega con foto y firma</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Captura fotos y firmas como comprobante de cada entrega. Todo queda registrado.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">⚡</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Mayor estabilidad y rendimiento</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">App más ligera, arranque más rápido y navegación sin cortes. Hemos corregido decenas de errores.</p>
                 </td>
             </tr>
         </table>
@@ -796,11 +820,11 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
         <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 20px;">
             <tr>
                 <td width="40" valign="top" style="padding-top: 2px;">
-                    <span style="font-size: 20px;">📸</span>
+                    <span style="font-size: 20px;">🎤</span>
                 </td>
                 <td>
-                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Prueba de entrega con foto</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Captura fotos y firmas como comprobante de cada entrega.</p>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Asistente de voz <span style="background-color: #dbeafe; color: #1e40af; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; margin-left: 6px;">BETA</span></p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Di "Oye copiloto" y controla la app sin manos mientras conduces. Función en fase beta.</p>
                 </td>
             </tr>
         </table>
@@ -811,9 +835,12 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
         </div>
 
         <!-- LATAM mention -->
-        <div style="background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%); border-radius: 12px; padding: 16px; margin: 20px 0; text-align: center; border: 1px solid #e0e7ff;">
-            <p style="margin: 0; color: #1e40af; font-size: 14px; font-weight: 500;">
+        <div style="background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%); border-radius: 12px; padding: 20px; margin: 20px 0; text-align: center; border: 1px solid #e0e7ff;">
+            <p style="margin: 0 0 6px 0; color: #1e40af; font-size: 15px; font-weight: 600;">
                 Disponible en España y toda Latinoamérica
+            </p>
+            <p style="margin: 0; color: #64748b; font-size: 13px;">
+                México, Colombia, Argentina, Chile, Perú y más. Misma app, misma calidad, estés donde estés.
             </p>
         </div>
 
@@ -824,7 +851,7 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
         </div>
 
         <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
-            ¿Tienes dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escríbenos por WhatsApp</a>
+            ¿Tienes dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escríbenos por WhatsApp</a> — te respondemos en minutos.
         </p>
 
         <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
