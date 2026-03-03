@@ -885,3 +885,147 @@ def send_reengagement_broadcast(to_emails_with_names: List[dict]) -> dict:
             results["errors"].append({"email": item["email"], "error": result.get("error", "unknown")})
 
     return results
+
+
+def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
+    """Email cuando el trial de un usuario está a punto de expirar (3 días antes)."""
+    user_name = html_escape(user_name or "")
+    plan_name = html_escape(plan_name)
+
+    urgency_text = f"en {days_left} días" if days_left > 1 else "mañana" if days_left == 1 else "hoy"
+    plan_display = "Pro+" if "plus" in plan_name.lower() else "Pro"
+    price = "9,99€" if "plus" in plan_name.lower() else "4,99€"
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #fef3c7; border-radius: 50%; padding: 20px;">
+                <span style="font-size: 40px;">&#9200;</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            Tu prueba {plan_display} termina {urgency_text}
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Tu periodo de prueba de <strong>Xpedit {plan_display}</strong> termina {urgency_text}.
+            Cuando expire, perder&aacute;s acceso a las funciones avanzadas.
+        </p>
+
+        <div style="background-color: #fef2f2; border-radius: 12px; padding: 20px; margin: 25px 0; border: 1px solid #fecaca;">
+            <h3 style="margin: 0 0 12px 0; color: #991b1b; font-size: 15px;">Lo que perder&aacute;s:</h3>
+            <ul style="margin: 0; padding-left: 20px; color: #991b1b; font-size: 14px; line-height: 2;">
+                <li>Optimizaci&oacute;n de rutas con IA (ahorra hasta 30% en km)</li>
+                <li>Paradas ilimitadas por ruta</li>
+                <li>Prueba de entrega con foto y firma</li>
+                <li>Asistente de voz (beta)</li>
+            </ul>
+        </div>
+
+        <div style="background-color: #eff6ff; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center; border: 1px solid #bfdbfe;">
+            <p style="margin: 0 0 5px 0; color: #1e40af; font-size: 14px;">Contin&uacute;a con {plan_display} por solo</p>
+            <p style="margin: 0; color: #1e40af; font-size: 32px; font-weight: 700;">{price}<span style="font-size: 16px; font-weight: 400;">/mes</span></p>
+            <p style="margin: 8px 0 0 0; color: #3b82f6; font-size: 13px;">Cancela cuando quieras. Sin compromisos.</p>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://xpedit.es/#pricing" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 600; font-size: 18px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
+                Suscribirme a {plan_display}
+            </a>
+        </div>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escr&iacute;benos por WhatsApp</a> &mdash; te respondemos en minutos.
+        </p>
+
+        <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Recibes este email porque tienes una cuenta en Xpedit.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": f"Tu prueba {plan_display} termina {urgency_text}",
+            "html": get_base_template(content, f"Trial {plan_display} expira")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> dict:
+    """Email cuando el trial ha expirado y el usuario ha sido degradado a Free."""
+    user_name = html_escape(user_name or "")
+    plan_display = "Pro+" if "plus" in plan_name.lower() else "Pro"
+    price = "9,99€" if "plus" in plan_name.lower() else "4,99€"
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #fee2e2; border-radius: 50%; padding: 20px;">
+                <span style="font-size: 40px;">&#128274;</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            Tu prueba {plan_display} ha terminado
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Tu periodo de prueba de <strong>Xpedit {plan_display}</strong> ha terminado.
+            Tu cuenta ha vuelto al plan <strong>Gratis</strong> con funciones limitadas.
+        </p>
+
+        <div style="background-color: #f0fdf4; border-radius: 12px; padding: 20px; margin: 25px 0; border: 1px solid #bbf7d0;">
+            <h3 style="margin: 0 0 12px 0; color: #166534; font-size: 15px;">Recupera tus funciones {plan_display}:</h3>
+            <ul style="margin: 0; padding-left: 20px; color: #166534; font-size: 14px; line-height: 2;">
+                <li>Optimizaci&oacute;n IA &mdash; ahorra hasta 30% en km y combustible</li>
+                <li>Paradas ilimitadas por ruta</li>
+                <li>Prueba de entrega con foto y firma</li>
+                <li>Soporte prioritario</li>
+            </ul>
+            <p style="margin: 15px 0 0 0; color: #166534; font-size: 16px; font-weight: 600; text-align: center;">
+                Solo {price}/mes &mdash; cancela cuando quieras
+            </p>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://xpedit.es/#pricing" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 600; font-size: 18px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
+                Suscribirme ahora
+            </a>
+        </div>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            Mientras tanto, puedes seguir usando el plan Gratis con hasta 20 paradas por ruta.
+        </p>
+
+        <p style="margin: 15px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escr&iacute;benos por WhatsApp</a>
+        </p>
+
+        <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Recibes este email porque tienes una cuenta en Xpedit.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": f"Tu prueba {plan_display} ha terminado — suscríbete desde {price}/mes",
+            "html": get_base_template(content, f"Trial {plan_display} expirado")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}

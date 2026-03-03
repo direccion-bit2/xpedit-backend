@@ -51,6 +51,8 @@ from emails import (
     send_plan_activated_email,
     send_reengagement_broadcast,
     send_referral_reward_email,
+    send_trial_expired_email,
+    send_trial_expiring_email,
     send_upcoming_email,
     send_welcome_email,
 )
@@ -5014,6 +5016,105 @@ async def send_weekly_reengagement_push():
         logger.error(f"Weekly re-engagement push error: {e}")
 
 
+async def check_expiring_trials():
+    """Daily check for trials expiring in 3 days. Sends warning email. Runs 09:00 UTC."""
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+    ]
+    try:
+        now = datetime.now(timezone.utc)
+        # Window: expires between now and now+3 days (send email 3 days before)
+        window_start = now.isoformat()
+        window_end = (now + timedelta(days=3)).isoformat()
+
+        result = (
+            supabase.table("drivers")
+            .select("id, email, name, promo_plan, promo_plan_expires_at")
+            .in_("promo_plan", ["pro", "pro_plus"])
+            .eq("is_ambassador", False)
+            .not_.is_("email", "null")
+            .not_.is_("promo_plan_expires_at", "null")
+            .gte("promo_plan_expires_at", window_start)
+            .lte("promo_plan_expires_at", window_end)
+            .execute()
+        )
+
+        if not result.data:
+            logger.info("Trial expiry check: no trials expiring in next 3 days")
+            return
+
+        sent, failed = 0, 0
+        for driver in result.data:
+            if driver["id"] in EXCLUDED_IDS or not driver.get("email"):
+                continue
+            expires_at = datetime.fromisoformat(driver["promo_plan_expires_at"].replace("Z", "+00:00"))
+            days_left = max(0, (expires_at - now).days)
+            email_result = send_trial_expiring_email(
+                driver["email"], driver.get("name", ""), driver["promo_plan"], days_left
+            )
+            if email_result.get("success"):
+                sent += 1
+            else:
+                failed += 1
+
+        logger.info(f"Trial expiry check: {sent} emails sent, {failed} failed (of {len(result.data)} expiring)")
+    except Exception as e:
+        logger.error(f"Trial expiry check failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+
+
+async def degrade_expired_trials():
+    """Daily check for expired trials. Downgrades to Free and sends notification. Runs 09:05 UTC."""
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+    ]
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+
+        result = (
+            supabase.table("drivers")
+            .select("id, email, name, promo_plan, promo_plan_expires_at")
+            .in_("promo_plan", ["pro", "pro_plus"])
+            .eq("is_ambassador", False)
+            .not_.is_("promo_plan_expires_at", "null")
+            .lt("promo_plan_expires_at", now)
+            .execute()
+        )
+
+        if not result.data:
+            logger.info("Trial degrade: no expired trials found")
+            return
+
+        degraded, emailed = 0, 0
+        for driver in result.data:
+            if driver["id"] in EXCLUDED_IDS:
+                continue
+            old_plan = driver["promo_plan"]
+            # Downgrade to free
+            supabase.table("drivers").update({
+                "promo_plan": "free",
+                "promo_plan_expires_at": None,
+            }).eq("id", driver["id"]).execute()
+            degraded += 1
+
+            # Send notification email
+            if driver.get("email"):
+                email_result = send_trial_expired_email(
+                    driver["email"], driver.get("name", ""), old_plan
+                )
+                if email_result.get("success"):
+                    emailed += 1
+
+        logger.info(f"Trial degrade: {degraded} users downgraded to Free, {emailed} emails sent")
+    except Exception as e:
+        logger.error(f"Trial degrade failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+
+
 # Track server start time for uptime
 _server_start_time = datetime.now(timezone.utc)
 
@@ -5066,7 +5167,25 @@ async def start_monitoring_jobs():
         id="website_health",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC)")
+    # Trial expiry warning emails (daily 09:00 UTC)
+    social_scheduler.add_job(
+        check_expiring_trials,
+        "cron",
+        hour=9,
+        minute=0,
+        id="trial_expiry_check",
+        replace_existing=True,
+    )
+    # Degrade expired trials to Free (daily 09:05 UTC)
+    social_scheduler.add_job(
+        degrade_expired_trials,
+        "cron",
+        hour=9,
+        minute=5,
+        id="trial_degrade",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC)")
 
 
 async def periodic_health_check():
