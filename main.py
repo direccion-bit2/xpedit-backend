@@ -4062,8 +4062,7 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
         }
         if lat and lng:
             params["location"] = f"{lat},{lng}"
-            params["radius"] = "150000"
-            params["strictbounds"] = "true"
+            params["radius"] = "30000"
 
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -4979,6 +4978,10 @@ async def health_check():
     # Solver availability
     from optimizer import HAS_PYVRP, HAS_VROOM
     checks["solvers"] = {"vroom": HAS_VROOM, "pyvrp": HAS_PYVRP, "ortools": True}
+
+    # Min app version — set to >0 to force users on old builds to update from store
+    # e.g. {"android": 27, "ios": 38} to require builds 27+ and 38+
+    checks["min_app_version"] = {"android": 0, "ios": 0}
 
     status_code = 200 if healthy else 503
     from fastapi.responses import JSONResponse
