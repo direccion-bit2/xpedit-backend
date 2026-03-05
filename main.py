@@ -4062,7 +4062,8 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
         }
         if lat and lng:
             params["location"] = f"{lat},{lng}"
-            params["radius"] = "30000"
+            params["radius"] = "150000"
+            params["strictbounds"] = "true"
 
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
