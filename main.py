@@ -4009,62 +4009,98 @@ async def create_stripe_portal(user=Depends(get_current_user)):
 
 
 # === GOOGLE PLACES PROXY ===
-# Proxy to avoid API key restrictions on mobile clients
+# GOOGLE_API_KEY: server-side key (no referrer restriction). Separate from website key.
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+# Track Places API health — if Google is down, log it and alert once
+_places_api_healthy = True
+_places_api_last_alert: Optional[datetime] = None
 
 @app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
 async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
     """Proxy de Google Places Autocomplete con sesgo de ubicación. Fallback a Nominatim si falla."""
-    params = {
-        "input": input,
-        "language": "es",
-        "key": GOOGLE_API_KEY,
-    }
-    if lat and lng:
-        params["location"] = f"{lat},{lng}"
-        params["radius"] = "30000"  # 30km - sesgo fuerte hacia zona de paradas
+    global _places_api_healthy, _places_api_last_alert
+    import re
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
-        data = resp.json()
-
-    if data.get("status") != "OK":
-        # Fallback: Nominatim (OpenStreetMap) - free, no API key
-        import re
-        nom_query = input
-        nom_base_params = {
-            "format": "json",
-            "addressdetails": "1",
-            "limit": "5",
-            "accept-language": "es",
+    google_ok = False
+    if GOOGLE_API_KEY:
+        params = {
+            "input": input,
+            "language": "es",
+            "key": GOOGLE_API_KEY,
         }
         if lat and lng:
-            nom_base_params["viewbox"] = f"{lng-0.5},{lat+0.5},{lng+0.5},{lat-0.5}"
-            nom_base_params["bounded"] = "0"
+            params["location"] = f"{lat},{lng}"
+            params["radius"] = "30000"
 
-        # Try original query first, then stripped of street prefixes
-        street_prefixes = r"^(calle|avenida|avda|av|plaza|paseo|camino|carretera|ctra|ronda|travesia|urbanizacion|urb|poligono|pol)\s+"
-        stripped = re.sub(street_prefixes, "", nom_query, flags=re.IGNORECASE).strip()
-        queries = [nom_query] if stripped == nom_query else [nom_query, stripped]
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
+                data = resp.json()
 
-        nom_data = []
-        async with httpx.AsyncClient() as client:
-            for q in queries:
-                nom_resp = await client.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={**nom_base_params, "q": q},
-                    headers={"User-Agent": "Xpedit/1.1"}
+            if data.get("status") == "OK":
+                google_ok = True
+                if not _places_api_healthy:
+                    logger.info("Google Places API recovered")
+                    _places_api_healthy = True
+                return data
+            else:
+                error_msg = data.get("error_message", data.get("status", "unknown"))
+                logger.warning(f"Google Places failed: {error_msg} (query: {input[:30]})")
+        except Exception as e:
+            logger.warning(f"Google Places request error: {e}")
+
+    # Alert on first failure (then cooldown 1h)
+    if not google_ok and _places_api_healthy:
+        _places_api_healthy = False
+        now = datetime.now(timezone.utc)
+        if not _places_api_last_alert or (now - _places_api_last_alert).total_seconds() > 3600:
+            _places_api_last_alert = now
+            try:
+                send_alert_email(
+                    ALERT_EMAIL,
+                    "ALERTA: Google Places API caída - usando Nominatim",
+                    f"Google Places no responde. Autocomplete usa Nominatim como fallback.\n"
+                    f"Key configurada: {'Sí' if GOOGLE_API_KEY else 'NO (vacía!)'}\n"
+                    f"Timestamp: {now.isoformat()}Z\n"
+                    f"Acción: verificar GOOGLE_API_KEY en Railway y restricciones en Google Cloud Console.",
                 )
-                nom_data = nom_resp.json()
-                if nom_data:
-                    break
+            except Exception:
+                pass
+            if SENTRY_DSN:
+                sentry_sdk.capture_message("Google Places API down, using Nominatim fallback", level="warning")
 
-        if nom_data:
-            results = [{"place_id": None, "display_name": r["display_name"], "lat": r["lat"], "lon": r["lon"], "source": "nominatim"} for r in nom_data]
-            return {"status": "OK", "predictions": results, "source": "nominatim"}
-        return {"status": "ZERO_RESULTS", "predictions": []}
+    # Fallback: Nominatim (OpenStreetMap) - free, no API key
+    nom_query = input
+    nom_base_params = {
+        "format": "json",
+        "addressdetails": "1",
+        "limit": "5",
+        "accept-language": "es",
+    }
+    if lat and lng:
+        nom_base_params["viewbox"] = f"{lng-0.5},{lat+0.5},{lng+0.5},{lat-0.5}"
+        nom_base_params["bounded"] = "0"
 
-    return data
+    street_prefixes = r"^(calle|avenida|avda|av|plaza|paseo|camino|carretera|ctra|ronda|travesia|urbanizacion|urb|poligono|pol)\s+"
+    stripped = re.sub(street_prefixes, "", nom_query, flags=re.IGNORECASE).strip()
+    queries = [nom_query] if stripped == nom_query else [nom_query, stripped]
+
+    nom_data = []
+    async with httpx.AsyncClient() as client:
+        for q in queries:
+            nom_resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={**nom_base_params, "q": q},
+                headers={"User-Agent": "Xpedit/1.1"}
+            )
+            nom_data = nom_resp.json()
+            if nom_data:
+                break
+
+    if nom_data:
+        results = [{"place_id": None, "display_name": r["display_name"], "lat": r["lat"], "lon": r["lon"], "source": "nominatim"} for r in nom_data]
+        return {"status": "OK", "predictions": results, "source": "nominatim"}
+    return {"status": "ZERO_RESULTS", "predictions": []}
 
 
 @app.get("/places/details", tags=["places"], summary="Detalles de lugar")
@@ -5237,17 +5273,50 @@ async def start_monitoring_jobs():
 
 
 async def periodic_health_check():
-    """Health check periodico que reporta a Sentry Crons."""
+    """Health check periodico que reporta a Sentry Crons. Incluye verificación de Google Places."""
+    global _places_api_healthy, _places_api_last_alert
     try:
         result = supabase.table("drivers").select("id", count="exact").limit(1).execute()
         db_ok = result.count is not None
         scheduler_ok = social_scheduler.running if social_scheduler else False
 
-        if db_ok and scheduler_ok:
+        # Check Google Places API
+        places_ok = False
+        if GOOGLE_API_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(
+                        "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                        params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
+                    )
+                    places_data = resp.json()
+                    places_ok = places_data.get("status") in ("OK", "ZERO_RESULTS")
+            except Exception:
+                places_ok = False
+
+            if not places_ok and _places_api_healthy:
+                _places_api_healthy = False
+                now = datetime.now(timezone.utc)
+                if not _places_api_last_alert or (now - _places_api_last_alert).total_seconds() > 3600:
+                    _places_api_last_alert = now
+                    try:
+                        send_alert_email(
+                            ALERT_EMAIL,
+                            "ALERTA: Google Places API caída",
+                            f"Health check detectó que Google Places no funciona.\nTimestamp: {now.isoformat()}Z",
+                        )
+                    except Exception:
+                        pass
+            elif places_ok and not _places_api_healthy:
+                _places_api_healthy = True
+                logger.info("Google Places API recovered (detected by health check)")
+
+        all_ok = db_ok and scheduler_ok and (places_ok or not GOOGLE_API_KEY)
+        if all_ok:
             if SENTRY_DSN:
                 sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="ok")
         else:
-            logger.warning(f"Health check degraded: db={db_ok}, scheduler={scheduler_ok}")
+            logger.warning(f"Health check degraded: db={db_ok}, scheduler={scheduler_ok}, places={places_ok}")
             if SENTRY_DSN:
                 sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
     except Exception as e:

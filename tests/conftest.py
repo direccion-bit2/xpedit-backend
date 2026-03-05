@@ -29,6 +29,7 @@ os.environ.setdefault("TWITTER_CONSUMER_SECRET", "")
 os.environ.setdefault("TWITTER_ACCESS_TOKEN", "")
 os.environ.setdefault("TWITTER_ACCESS_TOKEN_SECRET", "")
 os.environ.setdefault("SENTRY_ENVIRONMENT", "test")
+os.environ.setdefault("GOOGLE_API_KEY", "fake-google-api-key")
 
 # ---------------------------------------------------------------------------
 # 2. Build a reusable mock Supabase client that behaves like the real one

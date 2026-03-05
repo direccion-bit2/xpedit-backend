@@ -531,10 +531,19 @@ class TestPeriodicHealthCheck:
         mock_scheduler = MagicMock()
         mock_scheduler.running = True
 
+        # Mock httpx for Places API health check
+        mock_places_resp = MagicMock()
+        mock_places_resp.json.return_value = {"status": "OK"}
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_places_resp
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
         with patch("main.supabase", mock_sb), \
              patch("main.social_scheduler", mock_scheduler), \
              patch("main.SENTRY_DSN", "https://sentry.io/fake"), \
-             patch("main.sentry_sdk") as mock_sentry:
+             patch("main.sentry_sdk") as mock_sentry, \
+             patch("main.httpx.AsyncClient", return_value=mock_http):
             from main import periodic_health_check
             await periodic_health_check()
 
