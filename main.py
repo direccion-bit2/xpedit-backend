@@ -13,6 +13,7 @@ import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 import jwt as pyjwt
@@ -2469,10 +2470,10 @@ async def get_audit_log(limit: int = 100, offset: int = 0, user=Depends(require_
 async def admin_stats(user=Depends(require_admin)):
     """Estadísticas globales: usuarios, rutas, entregas, fallos. Solo admin."""
     try:
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        now_madrid = datetime.now(ZoneInfo("Europe/Madrid"))
+        today_start = now_madrid.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+        week_start = (now_madrid - timedelta(days=now_madrid.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+        month_start = now_madrid.replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
 
         # Total drivers
         drivers_total = supabase.table("drivers").select("id", count="exact").execute()
