@@ -186,6 +186,10 @@ def enrich_stops_from_directory(company_id: str, stops: list[dict]) -> tuple[lis
 # Webhook idempotency (in-memory, ordered for LRU eviction)
 _processed_webhook_events: dict = {}
 
+# Stripe webhook monitoring
+_last_stripe_webhook_ok: Optional[datetime] = None
+_last_stripe_webhook_error: Optional[datetime] = None
+
 # Stripe
 import stripe
 
@@ -773,6 +777,7 @@ async def download_apk(request: Request):
         }).execute()
     except Exception as e:
         logger.error(f"Download tracking error: {e}")
+        sentry_sdk.capture_exception(e)
 
     return RedirectResponse(url=APK_DOWNLOAD_URL, status_code=302)
 
@@ -1326,6 +1331,7 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
                 logger.info(f"Enriched {enriched} stops from customer directory")
     except Exception as e:
         logger.warning(f"Stop enrichment failed: {e}")
+        sentry_sdk.capture_exception(e)
 
     supabase.table("stops").insert(stops_data).execute()
 
@@ -1593,6 +1599,7 @@ async def api_send_customer_notification(request: CustomerNotificationRequest, u
                 sent_via.append("email")
         except Exception as e:
             logger.warning(f"Failed to send customer email: {e}")
+            sentry_sdk.capture_exception(e)
 
     # Registrar en customer_notifications
     notification_id = None
@@ -1611,6 +1618,7 @@ async def api_send_customer_notification(request: CustomerNotificationRequest, u
                 notification_id = notif.data[0].get("id")
         except Exception as e:
             logger.warning(f"Failed to log customer notification: {e}")
+            sentry_sdk.capture_exception(e)
 
     return {"sent_via": sent_via, "notification_id": notification_id}
 
@@ -2188,6 +2196,7 @@ async def grant_plan(user_id: str, request: AdminGrantRequest, user=Depends(requ
                             pass
             except Exception as e:
                 logger.warning(f"Could not send plan email: {e}")
+                sentry_sdk.capture_exception(e)
 
         log_audit(user["id"], "grant_plan", "driver", user_id, {"plan": request.plan, "days": request.days, "permanent": request.permanent})
         return {
@@ -2254,6 +2263,7 @@ async def admin_reset_password(user_id: str, request: AdminResetPasswordRequest,
                 email_sent = email_result.get("success", False)
             except Exception as email_err:
                 logger.warning(f"Failed to send password reset email: {email_err}")
+                sentry_sdk.capture_exception(email_err)
 
         driver_name = driver.data[0].get("name", "") if driver.data else ""
         driver_email = driver.data[0].get("email", "") if driver.data else ""
@@ -2678,8 +2688,8 @@ async def redeem_referral(request: ReferralRedeemRequest, user=Depends(get_curre
                 send_referral_reward_email(referrer_email, referrer_name, referred_name, REWARD_DAYS)
             if referred_email:
                 send_plan_activated_email(referred_email, referred_name, "Pro", REWARD_DAYS, False)
-        except Exception:
-            pass  # Don't fail the referral if email fails
+        except Exception as email_err:
+            sentry_sdk.capture_exception(email_err)  # Don't fail the referral if email fails
 
         return {
             "success": True,
@@ -3841,6 +3851,7 @@ async def stripe_webhook(request: Request):
 
     logger.info(f"Stripe webhook received event: {event_type}")
 
+    global _last_stripe_webhook_ok
     try:
         data_obj = event.data.object
 
@@ -3903,12 +3914,32 @@ async def stripe_webhook(request: Request):
             customer_id = getattr(data_obj, "customer", None)
             attempt_count = getattr(data_obj, "attempt_count", None)
             logger.warning(f"Stripe payment failed for customer {customer_id}, attempt {attempt_count}")
+            sentry_sdk.capture_message(
+                f"Stripe payment failed: customer={customer_id}, attempt={attempt_count}",
+                level="warning",
+            )
+            if attempt_count and int(attempt_count) >= 2:
+                try:
+                    send_alert_email(
+                        ALERT_EMAIL,
+                        f"ALERTA: Pago Stripe fallido (intento {attempt_count})",
+                        f"Customer: {customer_id}\nIntento: {attempt_count}\n"
+                        f"Timestamp: {datetime.now(timezone.utc).isoformat()}Z\n\n"
+                        "Revisar en Stripe Dashboard: https://dashboard.stripe.com/payments",
+                    )
+                except Exception:
+                    pass
 
         else:
             logger.info(f"Stripe webhook unhandled event type: {event_type} (ignored)")
 
+        _last_stripe_webhook_ok = datetime.now(timezone.utc)
+
     except Exception as e:
+        global _last_stripe_webhook_error
+        _last_stripe_webhook_error = datetime.now(timezone.utc)
         logger.error(f"Stripe webhook error processing {event_type}: {type(e).__name__}: {e}")
+        sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail="Internal webhook error")
 
     return {"received": True}
@@ -3974,6 +4005,7 @@ async def resend_webhook(request: Request):
         logger.info(f"Resend webhook updated {updated} rows for {email_id} -> {event_type}")
     except Exception as e:
         logger.error(f"Resend webhook DB error: {type(e).__name__}: {e}")
+        sentry_sdk.capture_exception(e)
 
     return {"received": True}
 
@@ -4937,6 +4969,12 @@ async def health_check():
     checks["version"] = "1.1.4"
     checks["environment"] = os.getenv("SENTRY_ENVIRONMENT", "production")
 
+    # Stripe webhook status
+    checks["stripe"] = {
+        "last_webhook_ok": _last_stripe_webhook_ok.isoformat() if _last_stripe_webhook_ok else None,
+        "last_webhook_error": _last_stripe_webhook_error.isoformat() if _last_stripe_webhook_error else None,
+    }
+
     # Solver availability
     from optimizer import HAS_PYVRP, HAS_VROOM
     checks["solvers"] = {"vroom": HAS_VROOM, "pyvrp": HAS_PYVRP, "ortools": True}
@@ -5062,6 +5100,8 @@ async def send_weekly_reengagement_push():
     """Weekly push to drivers registered in last 30 days with 0 routes. Runs Monday 10:00 UTC."""
     import asyncio
 
+    if SENTRY_DSN:
+        sentry_sdk.capture_check_in(monitor_slug="weekly-reengagement-push", status="in_progress")
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         # Drivers registered in last 30 days with push tokens
@@ -5096,8 +5136,13 @@ async def send_weekly_reengagement_push():
         ])
         sent = sum(1 for r in results if r)
         logger.info(f"Weekly re-engagement: {sent}/{len(inactive)} pushes sent")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="weekly-reengagement-push", status="ok")
     except Exception as e:
         logger.error(f"Weekly re-engagement push error: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="weekly-reengagement-push", status="error")
+            sentry_sdk.capture_exception(e)
 
 
 async def check_expiring_trials():
@@ -5106,6 +5151,8 @@ async def check_expiring_trials():
         "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
     ]
+    if SENTRY_DSN:
+        sentry_sdk.capture_check_in(monitor_slug="check-expiring-trials", status="in_progress")
     try:
         now = datetime.now(timezone.utc)
         # Window: expires between now and now+3 days (send email 3 days before)
@@ -5143,9 +5190,12 @@ async def check_expiring_trials():
                 failed += 1
 
         logger.info(f"Trial expiry check: {sent} emails sent, {failed} failed (of {len(result.data)} expiring)")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="check-expiring-trials", status="ok")
     except Exception as e:
         logger.error(f"Trial expiry check failed: {e}")
         if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="check-expiring-trials", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -5155,6 +5205,8 @@ async def degrade_expired_trials():
         "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
     ]
+    if SENTRY_DSN:
+        sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="in_progress")
     try:
         now = datetime.now(timezone.utc).isoformat()
 
@@ -5193,9 +5245,12 @@ async def degrade_expired_trials():
                     emailed += 1
 
         logger.info(f"Trial degrade: {degraded} users downgraded to Free, {emailed} emails sent")
+        if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="ok")
     except Exception as e:
         logger.error(f"Trial degrade failed: {e}")
         if SENTRY_DSN:
+            sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -5299,17 +5354,26 @@ async def periodic_health_check():
                 now = datetime.now(timezone.utc)
                 if not _places_api_last_alert or (now - _places_api_last_alert).total_seconds() > 3600:
                     _places_api_last_alert = now
-                    try:
-                        send_alert_email(
-                            ALERT_EMAIL,
-                            "ALERTA: Google Places API caída",
-                            f"Health check detectó que Google Places no funciona.\nTimestamp: {now.isoformat()}Z",
-                        )
-                    except Exception:
-                        pass
+                    await alert_admin(
+                        "ALERTA: Google Places API caída",
+                        f"Health check detectó que Google Places no funciona.\nTimestamp: {now.isoformat()}Z",
+                    )
             elif places_ok and not _places_api_healthy:
                 _places_api_healthy = True
                 logger.info("Google Places API recovered (detected by health check)")
+
+        # Check Resend email activity (alert if 0 emails in 24h and there are active routes)
+        try:
+            yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            email_count = supabase.table("email_log").select("id", count="exact").gte("created_at", yesterday).limit(1).execute()
+            emails_24h = email_count.count or 0
+            if emails_24h == 0:
+                active_routes = supabase.table("routes").select("id", count="exact").eq("status", "in_progress").limit(1).execute()
+                if (active_routes.count or 0) > 0:
+                    logger.warning("Resend alert: 0 emails in 24h with active routes")
+                    sentry_sdk.capture_message("Resend may be down: 0 emails sent in 24h with active routes", level="warning")
+        except Exception:
+            pass  # Don't fail health check for email monitoring
 
         all_ok = db_ok and scheduler_ok and (places_ok or not GOOGLE_API_KEY)
         if all_ok:
@@ -5331,6 +5395,21 @@ _last_website_alert: Optional[datetime] = None
 WEBSITE_HEALTH_URL = "https://xpedit.es/api/health"
 ALERT_COOLDOWN_HOURS = 2
 ALERT_EMAIL = "direccion@taespack.com"
+ADMIN_DRIVER_ID = "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b"
+
+
+async def alert_admin(title: str, body: str):
+    """Send critical alert via email + push to admin. Fire and forget."""
+    try:
+        send_alert_email(ALERT_EMAIL, title, body)
+    except Exception:
+        pass
+    try:
+        admin = supabase.table("drivers").select("push_token").eq("id", ADMIN_DRIVER_ID).single().execute()
+        if admin.data and admin.data.get("push_token"):
+            await send_push_to_token(admin.data["push_token"], title, body[:200])
+    except Exception:
+        pass
 
 
 async def monitor_website_health():
@@ -5369,12 +5448,9 @@ async def monitor_website_health():
         else:
             details += f"Response: {json.dumps(body, indent=2)}"
 
-        result = send_alert_email(ALERT_EMAIL, "Web xpedit.es degradada", details)
-        if result.get("success"):
-            _last_website_alert = now
-            logger.info(f"Website alert email sent to {ALERT_EMAIL}")
-        else:
-            logger.error(f"Failed to send website alert: {result.get('error')}")
+        await alert_admin("Web xpedit.es degradada", details)
+        _last_website_alert = now
+        logger.info("Website alert sent to admin")
 
     except Exception as e:
         logger.error(f"Website health monitor failed: {e}")
@@ -5385,9 +5461,8 @@ async def monitor_website_health():
         # Also alert on connection failures (site completely down)
         now = datetime.now(timezone.utc)
         if not _last_website_alert or (now - _last_website_alert).total_seconds() >= ALERT_COOLDOWN_HOURS * 3600:
-            result = send_alert_email(ALERT_EMAIL, "Web xpedit.es NO responde", f"URL: {WEBSITE_HEALTH_URL}\nError: {e}\nTimestamp: {now.isoformat()}Z")
-            if result.get("success"):
-                _last_website_alert = now
+            await alert_admin("Web xpedit.es NO responde", f"URL: {WEBSITE_HEALTH_URL}\nError: {e}\nTimestamp: {now.isoformat()}Z")
+            _last_website_alert = now
 
 
 # === VOICE ASSISTANT (Gemini Flash) ===
