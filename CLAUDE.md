@@ -77,7 +77,7 @@ async def get_current_user(authorization: str = Header(default=None)) -> dict:
 - Haversine distance matrix
 
 ## Testing
-- 299 tests across 10 files
+- 94 tests across 6 files
 - All external services mocked (conftest.py sets fake env vars BEFORE importing main)
 - ChainableMock for Supabase: `.table().select().eq().execute()`
 - No real API calls in CI/CD
@@ -107,7 +107,7 @@ RESEND_API_KEY=         # Email service
 
 # Optional
 SENTRY_DSN=
-GOOGLE_API_KEY=         # Backend-only key (NO referrer restrictions!) — see warning below
+GOOGLE_API_KEY=         # Maps, geocoding
 GOOGLE_AI_API_KEY=      # Gemini for social AI
 STRIPE_SECRET_KEY=
 STRIPE_WEBHOOK_SECRET=
@@ -116,17 +116,6 @@ TWITTER_CONSUMER_KEY/SECRET=
 TWITTER_ACCESS_TOKEN/SECRET=
 LINKEDIN_ACCESS_TOKEN=  # Expires ~every 2 months
 ```
-
-## CRITICAL: Google API Key Separation
-**Backend and website use DIFFERENT Google API keys. NEVER share or mix them.**
-- Backend key: `GOOGLE_API_KEY` in Railway — NO referrer restrictions (server-to-server)
-- Website key: `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` in Vercel — HAS referrer restrictions
-- Adding referrer restrictions to the backend key BREAKS Places API and all Google services
-- If you need to change key restrictions, verify BOTH website AND backend still work
-- Backend has automatic fallback to Nominatim + email alert if Google Places fails
-- Health check (`periodic_health_check`) monitors Places API every 5 min
-- Google Cloud project: `trim-odyssey-465314-r2`
-- Full incident details: see `memory/incident-places-api-5mar.md`
 
 ## Conventions
 - Pydantic v2 models for all request/response validation

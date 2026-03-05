@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -622,40 +622,6 @@ class LocationUpdate(BaseModel):
     lng: float
     speed: Optional[float] = None
     accuracy: Optional[float] = None
-
-
-class AppEvent(BaseModel):
-    event_type: str = Field(..., min_length=1, max_length=100)
-    metadata: Optional[dict] = Field(default_factory=dict)
-    session_id: Optional[str] = Field(default=None, max_length=100)
-    app_version: Optional[str] = Field(default=None, max_length=50)
-    platform: Optional[str] = Field(default=None, max_length=20)
-    created_at: Optional[str] = None
-
-    @field_validator('metadata')
-    @classmethod
-    def metadata_size_limit(cls, v):
-        if v and len(json.dumps(v, default=str)) > 2048:
-            raise ValueError('metadata too large (max 2KB)')
-        return v
-
-    @field_validator('created_at')
-    @classmethod
-    def validate_created_at(cls, v):
-        if v is None:
-            return v
-        try:
-            dt = datetime.fromisoformat(v.replace('Z', '+00:00'))
-            now = datetime.now(timezone.utc)
-            if dt > now + timedelta(minutes=5) or dt < now - timedelta(days=7):
-                return None  # Out of range — use server time instead
-            return dt.isoformat()
-        except (ValueError, AttributeError):
-            return None  # Invalid format — use server time instead
-
-
-class EventBatch(BaseModel):
-    events: List[AppEvent] = Field(..., min_length=1, max_length=100)
 
 
 # -- Modelos de Email --
@@ -1540,38 +1506,6 @@ async def get_location_history(driver_id: str, route_id: Optional[str] = None, l
 
     result = query.order("recorded_at", desc=True).limit(limit).execute()
     return {"locations": result.data}
-
-
-# === ANALYTICS EVENTS ===
-
-@app.post("/events", tags=["analytics"], summary="Registrar eventos de la app")
-async def ingest_events(batch: EventBatch, user=Depends(get_current_user)):
-    """Bulk insert de eventos analytics desde la app. driver_id se extrae del JWT."""
-    check_rate_limit(f"events:{user['id']}", max_requests=10, window_seconds=60)
-    user_driver_id = await get_user_driver_id(user)
-    if not user_driver_id:
-        raise HTTPException(status_code=400, detail="No se encontró perfil de conductor")
-
-    rows = [
-        {
-            "driver_id": user_driver_id,
-            "event_type": e.event_type,
-            "metadata": e.metadata or {},
-            "session_id": e.session_id,
-            "app_version": e.app_version,
-            "platform": e.platform,
-            "created_at": e.created_at or datetime.now(timezone.utc).isoformat(),
-        }
-        for e in batch.events
-    ]
-
-    try:
-        supabase.table("app_events").insert(rows).execute()
-    except Exception as exc:
-        logger.error(f"Error inserting app_events: {exc}")
-        raise HTTPException(status_code=500, detail="Error al registrar eventos")
-
-    return {"success": True, "count": len(rows)}
 
 
 # === EMAILS ===
