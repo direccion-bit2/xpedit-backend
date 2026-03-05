@@ -2497,8 +2497,8 @@ async def admin_stats(user=Depends(require_admin)):
         stops_today = supabase.table("stops").select("id", count="exact").eq("status", "completed").gte("completed_at", today_start).execute()
         stops_week = supabase.table("stops").select("id", count="exact").eq("status", "completed").gte("completed_at", week_start).execute()
         stops_month = supabase.table("stops").select("id", count="exact").eq("status", "completed").gte("completed_at", month_start).execute()
-        failed_today = supabase.table("stops").select("id", count="exact").eq("status", "failed").gte("completed_at", today_start).execute()
-        failed_week = supabase.table("stops").select("id", count="exact").eq("status", "failed").gte("completed_at", week_start).execute()
+        failed_today = supabase.table("stops").select("id", count="exact").eq("status", "failed").gte("created_at", today_start).execute()
+        failed_week = supabase.table("stops").select("id", count="exact").eq("status", "failed").gte("created_at", week_start).execute()
 
         return {
             "success": True,
