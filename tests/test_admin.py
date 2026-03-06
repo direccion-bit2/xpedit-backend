@@ -399,7 +399,7 @@ class TestAdminResetPassword:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["password"] == "NewPass123!"
+        assert "password" not in data  # Password must not be exposed in response
         assert "email_sent" in data
 
     @pytest.mark.asyncio
