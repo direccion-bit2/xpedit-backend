@@ -52,6 +52,7 @@ from emails import (
     send_plan_activated_email,
     send_reengagement_broadcast,
     send_referral_reward_email,
+    send_social_login_broadcast,
     send_trial_expired_email,
     send_trial_expiring_email,
     send_upcoming_email,
@@ -197,6 +198,7 @@ import stripe
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
+SUPABASE_WEBHOOK_SECRET = os.getenv("SUPABASE_WEBHOOK_SECRET", "")
 stripe.api_key = STRIPE_SECRET_KEY
 
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
@@ -1804,6 +1806,50 @@ async def admin_reengagement_broadcast(user=Depends(require_admin)):
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error enviando re-engagement broadcast")
+
+
+@app.post("/admin/broadcast-social-login", tags=["admin", "email"], summary="Social login announcement broadcast")
+async def admin_broadcast_social_login(user=Depends(require_admin)):
+    """Envia email anunciando social login (Google + Apple) a todos los usuarios. Solo admin."""
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # direccion@taespack.com
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # migue995@gmail.com
+    ]
+    try:
+        drivers = supabase.table("drivers").select("id, email, name").not_.is_("email", "null").execute()
+        if not drivers.data:
+            return {"success": True, "sent": 0, "failed": 0, "total": 0}
+
+        targets = [d for d in drivers.data if d["id"] not in EXCLUDED_IDS and d.get("email")]
+        results = send_social_login_broadcast(targets)
+
+        try:
+            email_logs = [
+                {
+                    "recipient_email": d["email"],
+                    "recipient_name": d.get("name"),
+                    "subject": "Nuevo: inicia sesion con Google o Apple",
+                    "body": "social-login broadcast",
+                    "sent_by": "broadcast:social-login",
+                    "status": "sent",
+                }
+                for d in targets
+            ]
+            if email_logs:
+                supabase.table("email_log").insert(email_logs).execute()
+        except Exception:
+            pass
+
+        log_audit(user["id"], "social_login_broadcast", "email", None, {"total": len(targets), "sent": results["sent"]})
+        return {
+            "success": True,
+            "total": len(targets),
+            "sent": results["sent"],
+            "failed": results["failed"],
+        }
+    except Exception as e:
+        logger.error(f"{type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error enviando social login broadcast")
 
 
 @app.post("/admin/push-blast")
@@ -4004,6 +4050,78 @@ async def resend_webhook(request: Request):
         sentry_sdk.capture_exception(e)
 
     return {"received": True}
+
+
+# === SUPABASE AUTH WEBHOOK (Welcome email on signup) ===
+
+@app.post("/webhooks/supabase-auth", tags=["webhooks"], summary="Webhook de Supabase Auth")
+async def supabase_auth_webhook(request: Request):
+    """Envía welcome email automático cuando un usuario se registra en Supabase."""
+    import asyncio
+
+    # Verify webhook secret
+    webhook_secret = request.headers.get("x-supabase-webhook-secret", "")
+    if not SUPABASE_WEBHOOK_SECRET:
+        logger.error("SUPABASE_WEBHOOK_SECRET not configured - rejecting")
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    if webhook_secret != SUPABASE_WEBHOOK_SECRET:
+        logger.warning("Supabase auth webhook invalid secret - rejecting")
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event_type = payload.get("type", "")
+    record = payload.get("record", {})
+    email = record.get("email")
+
+    if not email:
+        logger.info(f"Supabase auth webhook: no email in payload, type={event_type}")
+        return {"received": True, "skipped": True}
+
+    if event_type != "INSERT":
+        logger.info(f"Supabase auth webhook: ignoring event type {event_type}")
+        return {"received": True, "skipped": True}
+
+    logger.info(f"Supabase auth webhook: new user signup - {email}")
+
+    # Wait for DB trigger to create driver row
+    await asyncio.sleep(3)
+
+    # Look up user name from drivers table
+    name = ""
+    try:
+        driver = supabase.table("drivers").select("name").eq("email", email).execute()
+        if driver.data:
+            name = driver.data[0].get("name", "")
+    except Exception as e:
+        logger.warning(f"Supabase auth webhook: could not fetch driver name for {email}: {e}")
+
+    if not name:
+        name = email.split("@")[0].replace(".", " ").replace("_", " ").title()
+
+    # Send welcome email
+    result = send_welcome_email(email, name)
+    if result["success"]:
+        logger.info(f"Welcome email sent to {email}")
+        # Log in email_log
+        try:
+            supabase.table("email_log").insert({
+                "to_email": email,
+                "subject": "Bienvenido a Xpedit",
+                "body": "welcome email (auto)",
+                "message_id": result.get("id"),
+                "status": "sent",
+                "sent_by": "webhook:supabase-auth",
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Could not log welcome email: {e}")
+    else:
+        logger.error(f"Failed to send welcome email to {email}: {result.get('error')}")
+
+    return {"received": True, "email_sent": result["success"]}
 
 
 @app.post("/stripe/portal", tags=["stripe"], summary="Portal de cliente Stripe")

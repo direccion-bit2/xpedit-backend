@@ -887,6 +887,102 @@ def send_reengagement_broadcast(to_emails_with_names: List[dict]) -> dict:
     return results
 
 
+def send_social_login_announcement(to_email: str, user_name: str) -> dict:
+    """Email anunciando social login (Google + Apple) a usuarios existentes"""
+    user_name = html_escape(user_name or "repartidor")
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            Nuevo: inicia sesion con Google o Apple
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola <strong>{user_name}</strong>,
+        </p>
+
+        <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Ahora puedes iniciar sesion en Xpedit con tu cuenta de Google o Apple. Sin recordar contrasenas, sin formularios. Un toque y estas dentro.
+        </p>
+
+        <!-- Features -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">&#127758;</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Google Login</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Inicia sesion con tu cuenta de Google en un toque. Funciona en la app y en la web.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">&#63743;</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Apple Login</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Si usas iPhone, inicia sesion con Face ID o Touch ID. Rapido, seguro y privado.</p>
+                </td>
+            </tr>
+        </table>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+            <tr>
+                <td width="40" valign="top" style="padding-top: 2px;">
+                    <span style="font-size: 20px;">&#128274;</span>
+                </td>
+                <td>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Tu cuenta no cambia</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Tus rutas, paradas e historial siguen igual. Solo cambia como entras — todo lo demas se mantiene.</p>
+                </td>
+            </tr>
+        </table>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://www.xpedit.es/login" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
+                Probar Social Login
+            </a>
+        </div>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escribenos por WhatsApp</a> — te respondemos en minutos.
+        </p>
+
+        <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Recibes este email porque tienes una cuenta en Xpedit. Si no quieres recibir mas emails, responde con &quot;cancelar&quot;.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": "Nuevo: inicia sesion con Google o Apple",
+            "html": get_base_template(content, "Social Login en Xpedit")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_social_login_broadcast(to_emails_with_names: List[dict]) -> dict:
+    """Envia el anuncio de social login a multiples usuarios."""
+    results = {"sent": 0, "failed": 0, "errors": []}
+
+    for item in to_emails_with_names:
+        result = send_social_login_announcement(item["email"], item.get("name", ""))
+        if result["success"]:
+            results["sent"] += 1
+        else:
+            results["failed"] += 1
+            results["errors"].append({"email": item["email"], "error": result.get("error", "unknown")})
+
+    return results
+
+
 def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
     """Email cuando el trial de un usuario está a punto de expirar (3 días antes)."""
     user_name = html_escape(user_name or "")
