@@ -4115,7 +4115,7 @@ async def supabase_auth_webhook(request: Request):
         # Log in email_log
         try:
             supabase.table("email_log").insert({
-                "to_email": email,
+                "recipient_email": email,
                 "subject": "Bienvenido a Xpedit",
                 "body": "welcome email (auto)",
                 "message_id": result.get("id"),
