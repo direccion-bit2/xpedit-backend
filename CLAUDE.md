@@ -8,7 +8,7 @@ uvicorn main:app --host 0.0.0.0 --port 8004 --reload
 # Lint
 ruff check . --config ruff.toml
 
-# Tests (94 tests)
+# Tests (397 tests, 80% coverage)
 pytest tests/ -v --tb=short
 
 # Fix lint issues
@@ -21,6 +21,7 @@ ruff check . --config ruff.toml --fix
 - URL prod: https://web-production-94783.up.railway.app
 - URL staging: https://web-staging-5f41.up.railway.app
 - Uses NIXPACKS builder (cmake + g++ for route solvers)
+- Manual deploy: `railway up` (requires `railway link` first)
 
 ## Architecture
 **Monolithic** - All routes in `main.py` (4,631 lines). Not ideal but works.
@@ -60,9 +61,11 @@ async def get_current_user(authorization: str = Header(default=None)) -> dict:
 
 ### Rate Limiting (in-memory)
 - `/admin/*`: 60 req/min
-- `/auth/*`, `/promo/redeem`: 20 req/min
+- `/auth/*`, `/promo/redeem`, `/fleet/login`: 20 req/min
 - `/places/*`: 30 req/min
 - `/optimize`: 10 req/min
+- `/email/*`: 10 req/min
+- **Gotcha**: Behind Railway proxy, use `X-Forwarded-For` header for real client IP, NOT `request.client.host`
 
 ### Background Jobs (APScheduler)
 - Social scheduler: every 60s (check_scheduled_posts)
@@ -77,7 +80,7 @@ async def get_current_user(authorization: str = Header(default=None)) -> dict:
 - Haversine distance matrix
 
 ## Testing
-- 94 tests across 6 files
+- 397 tests across 10 files (80% coverage, main.py at 56%)
 - All external services mocked (conftest.py sets fake env vars BEFORE importing main)
 - ChainableMock for Supabase: `.table().select().eq().execute()`
 - No real API calls in CI/CD
