@@ -6060,11 +6060,16 @@ async def list_fleet_zones(user=Depends(require_admin_or_dispatcher)):
     """List all fleet zones for the company."""
     try:
         company_id = user.get("company_id")
+        is_admin = user.get("role") == "admin"
+        if not company_id and not is_admin:
+            raise HTTPException(status_code=403, detail="No tiene empresa asignada")
         q = supabase.table("fleet_zones").select("*")
         if company_id:
             q = q.eq("company_id", company_id)
         result = q.order("priority", desc=True).execute()
         return {"zones": result.data or []}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"List zones error: {e}")
         sentry_sdk.capture_exception(e)
@@ -6100,6 +6105,19 @@ async def create_fleet_zone(zone: FleetZoneCreate, user=Depends(require_admin_or
 async def update_fleet_zone(zone_id: str, zone: FleetZoneUpdate, user=Depends(require_admin_or_dispatcher)):
     """Update a fleet zone."""
     try:
+        company_id = user.get("company_id")
+        is_admin = user.get("role") == "admin"
+        if not company_id and not is_admin:
+            raise HTTPException(status_code=403, detail="No tiene empresa asignada")
+
+        # Verify zone belongs to user's company (admins can update any zone)
+        if company_id:
+            existing = supabase.table("fleet_zones").select("id, company_id").eq("id", zone_id).single().execute()
+            if not existing.data:
+                raise HTTPException(status_code=404, detail="Zona no encontrada")
+            if existing.data.get("company_id") != company_id:
+                raise HTTPException(status_code=403, detail="No tiene acceso a esta zona")
+
         update_data = {}
         if zone.name is not None:
             update_data["name"] = zone.name
@@ -6129,8 +6147,23 @@ async def update_fleet_zone(zone_id: str, zone: FleetZoneUpdate, user=Depends(re
 async def delete_fleet_zone(zone_id: str, user=Depends(require_admin_or_dispatcher)):
     """Delete a fleet zone."""
     try:
+        company_id = user.get("company_id")
+        is_admin = user.get("role") == "admin"
+        if not company_id and not is_admin:
+            raise HTTPException(status_code=403, detail="No tiene empresa asignada")
+
+        # Verify zone belongs to user's company (admins can delete any zone)
+        if company_id:
+            existing = supabase.table("fleet_zones").select("id, company_id").eq("id", zone_id).single().execute()
+            if not existing.data:
+                raise HTTPException(status_code=404, detail="Zona no encontrada")
+            if existing.data.get("company_id") != company_id:
+                raise HTTPException(status_code=403, detail="No tiene acceso a esta zona")
+
         supabase.table("fleet_zones").delete().eq("id", zone_id).execute()
         return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Delete zone error: {e}")
         sentry_sdk.capture_exception(e)
