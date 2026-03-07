@@ -525,6 +525,12 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"routes:{client_ip}", max_requests=30, window_seconds=60)
         elif path.startswith("/stops"):
             check_rate_limit(f"stops:{client_ip}", max_requests=30, window_seconds=60)
+        elif path == "/fleet/login":
+            check_rate_limit(f"fleet_login:{client_ip}", max_requests=5, window_seconds=60)
+        elif path.startswith("/fleet"):
+            check_rate_limit(f"fleet:{client_ip}", max_requests=30, window_seconds=60)
+        elif path.startswith("/stripe"):
+            check_rate_limit(f"stripe:{client_ip}", max_requests=20, window_seconds=60)
     except HTTPException as e:
         from starlette.responses import JSONResponse
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
