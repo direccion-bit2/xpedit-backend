@@ -503,7 +503,7 @@ def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60)
 async def rate_limit_middleware(request: Request, call_next):
     """Apply rate limiting to sensitive endpoints"""
     path = request.url.path
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     try:
         if path.startswith("/admin"):
             check_rate_limit(f"admin:{client_ip}", max_requests=60, window_seconds=60)
