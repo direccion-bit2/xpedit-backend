@@ -320,9 +320,12 @@ class TestRoutesCreate:
                 ],
             })]
 
-            # Insert stops result
+            # Insert stops result (non-empty = success)
             stops_insert_result = MagicMock()
-            stops_insert_result.data = []
+            stops_insert_result.data = [
+                {"id": "s1", "address": "Calle Gran Via 1"},
+                {"id": "s2", "address": "Calle Alcala 50"},
+            ]
 
             # Final route fetch with stops
             final_route = MagicMock()

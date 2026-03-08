@@ -89,6 +89,14 @@ def safe_first(result) -> Optional[dict]:
     return result.data[0] if result.data else None
 
 
+def mask_email(email: str) -> str:
+    """Mask email for safe logging: jo***@gmail.com"""
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    return f"{local[:2]}***@{domain}"
+
+
 async def send_push_to_token(token: str, title: str, body: str, data: dict = None) -> bool:
     """Send an Expo push notification to a single token. Returns True on success."""
     if not token or not token.startswith("ExponentPushToken["):
@@ -227,7 +235,7 @@ async def get_current_user(authorization: str = Header(default=None)):
         ALLOWED_ALGORITHMS = ["HS256", "ES256"]
         header = pyjwt.get_unverified_header(token)
         alg = header.get("alg", "HS256")
-        logger.info(f"JWT alg={alg}, token_len={len(token)}")
+        logger.debug(f"JWT alg={alg}, token_len={len(token)}")
 
         if alg not in ALLOWED_ALGORITHMS:
             raise HTTPException(status_code=401, detail=f"Algorithm {alg} not allowed")
@@ -1342,7 +1350,10 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
         logger.warning(f"Stop enrichment failed: {e}")
         sentry_sdk.capture_exception(e)
 
-    supabase.table("stops").insert(stops_data).execute()
+    stops_insert = supabase.table("stops").insert(stops_data).execute()
+    if not stops_insert.data:
+        logger.error(f"Failed to insert stops for route {route_id}")
+        raise HTTPException(status_code=500, detail="Error al crear las paradas de la ruta")
 
     # Devolver ruta completa
     result = supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
@@ -4091,7 +4102,7 @@ async def supabase_auth_webhook(request: Request):
         logger.info(f"Supabase auth webhook: ignoring event type {event_type}")
         return {"received": True, "skipped": True}
 
-    logger.info(f"Supabase auth webhook: new user signup - {email}")
+    logger.info(f"Supabase auth webhook: new user signup - {mask_email(email)}")
 
     # Wait for DB trigger to create driver row
     await asyncio.sleep(3)
@@ -4103,7 +4114,7 @@ async def supabase_auth_webhook(request: Request):
         if driver.data:
             name = driver.data[0].get("name", "")
     except Exception as e:
-        logger.warning(f"Supabase auth webhook: could not fetch driver name for {email}: {e}")
+        logger.warning(f"Supabase auth webhook: could not fetch driver name for {mask_email(email)}: {e}")
 
     if not name:
         name = email.split("@")[0].replace(".", " ").replace("_", " ").title()
@@ -4111,7 +4122,7 @@ async def supabase_auth_webhook(request: Request):
     # Send welcome email
     result = send_welcome_email(email, name)
     if result["success"]:
-        logger.info(f"Welcome email sent to {email}")
+        logger.info(f"Welcome email sent to {mask_email(email)}")
         # Log in email_log
         try:
             supabase.table("email_log").insert({
@@ -4125,7 +4136,7 @@ async def supabase_auth_webhook(request: Request):
         except Exception as e:
             logger.warning(f"Could not log welcome email: {e}")
     else:
-        logger.error(f"Failed to send welcome email to {email}: {result.get('error')}")
+        logger.error(f"Failed to send welcome email to {mask_email(email)}: {result.get('error')}")
 
     return {"received": True, "email_sent": result["success"]}
 
@@ -4326,6 +4337,7 @@ async def places_directions(
 async def delete_account(user=Depends(get_current_user)):
     """Elimina la cuenta del usuario y todos sus datos asociados (rutas, paradas, ubicaciones, conductor, etc.). Requerido por Apple y GDPR."""
     user_id = user["id"]
+    deletion_errors = []
     try:
         # First, find the driver_id for this user
         driver_result = supabase.table("drivers").select("id").eq("user_id", user_id).execute()
@@ -4338,44 +4350,42 @@ async def delete_account(user=Depends(get_current_user)):
             route_ids = [r["id"] for r in (routes_result.data or [])]
 
             if route_ids:
-                # Collect all stop IDs across all routes in one query per route
-                all_stop_ids = []
-                for route_id in route_ids:
-                    try:
-                        stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
-                        all_stop_ids.extend([s["id"] for s in (stops_result.data or [])])
-                    except Exception:
-                        pass
+                # Collect all stop IDs — batch query instead of N+1
+                try:
+                    stops_result = supabase.table("stops").select("id").in_("route_id", route_ids).execute()
+                    all_stop_ids = [s["id"] for s in (stops_result.data or [])]
+                except Exception as e:
+                    all_stop_ids = []
+                    deletion_errors.append(f"stops select: {e}")
 
                 # Batch delete delivery_proofs for all stops at once
                 if all_stop_ids:
                     try:
                         supabase.table("delivery_proofs").delete().in_("stop_id", all_stop_ids).execute()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        deletion_errors.append(f"delivery_proofs: {e}")
 
-                # Batch delete tracking_links and stops per route
-                for route_id in route_ids:
-                    try:
-                        supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
-                    except Exception:
-                        pass
-                    try:
-                        supabase.table("stops").delete().eq("route_id", route_id).execute()
-                    except Exception:
-                        pass
+                # Batch delete tracking_links and stops for all routes at once
+                try:
+                    supabase.table("tracking_links").delete().in_("route_id", route_ids).execute()
+                except Exception as e:
+                    deletion_errors.append(f"tracking_links: {e}")
+                try:
+                    supabase.table("stops").delete().in_("route_id", route_ids).execute()
+                except Exception as e:
+                    deletion_errors.append(f"stops delete: {e}")
 
                 # Delete all routes
                 try:
                     supabase.table("routes").delete().eq("driver_id", driver_id).execute()
-                except Exception:
-                    pass
+                except Exception as e:
+                    deletion_errors.append(f"routes: {e}")
 
             # Delete recurring_places by user_id (created_by stores auth.uid())
             try:
                 supabase.table("recurring_places").delete().eq("created_by", user_id).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                deletion_errors.append(f"recurring_places: {e}")
 
             # Delete other driver-specific data
             tables_driver = [
@@ -4387,14 +4397,14 @@ async def delete_account(user=Depends(get_current_user)):
             for table, column in tables_driver:
                 try:
                     supabase.table(table).delete().eq(column, driver_id).execute()
-                except Exception:
-                    pass
+                except Exception as e:
+                    deletion_errors.append(f"{table}.{column}: {e}")
 
             # Delete the driver record
             try:
                 supabase.table("drivers").delete().eq("id", driver_id).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                deletion_errors.append(f"drivers: {e}")
 
         # Delete user-level data
         tables_user = [
@@ -4405,20 +4415,30 @@ async def delete_account(user=Depends(get_current_user)):
         for table, column in tables_user:
             try:
                 supabase.table(table).delete().eq(column, user_id).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                deletion_errors.append(f"{table}: {e}")
 
         # Delete user profile
         try:
             supabase.table("users").delete().eq("id", user_id).execute()
-        except Exception:
-            pass
+        except Exception as e:
+            deletion_errors.append(f"users: {e}")
 
-        # Delete auth user via Supabase Admin API
+        # Delete auth user via Supabase Admin API — CRITICAL step
         try:
             supabase.auth.admin.delete_user(user_id)
-        except Exception:
-            pass
+        except Exception as e:
+            deletion_errors.append(f"auth.admin.delete_user: {e}")
+            logger.error(f"CRITICAL: Failed to delete auth user {user_id}: {e}")
+            sentry_sdk.capture_exception(e)
+
+        # Log any partial failures for GDPR audit trail
+        if deletion_errors:
+            logger.warning(f"Account deletion partial errors for {user_id}: {deletion_errors}")
+            sentry_sdk.capture_message(
+                f"Account deletion had {len(deletion_errors)} errors for user {user_id}",
+                level="warning",
+            )
 
         return {"status": "deleted", "message": "Cuenta eliminada correctamente"}
     except Exception as e:
@@ -5807,15 +5827,14 @@ async def fleet_dashboard_stats(user=Depends(require_admin_or_dispatcher)):
         driver_ids = [d["id"] for d in (drivers_result.data or []) if d["id"] not in ADMIN_EXCLUDE_IDS]
         total_drivers = len(driver_ids)
 
-        # Active drivers (location update in last 5 min)
+        # Active drivers (location update in last 5 min) — batch query instead of N+1
         active_count = 0
         if driver_ids:
-            for did in driver_ids:
-                loc = supabase.table("location_history").select("id").eq("driver_id", did).gte("recorded_at", five_min_ago).limit(1).execute()
-                if loc.data:
-                    active_count += 1
+            locs = supabase.table("location_history").select("driver_id").in_("driver_id", driver_ids).gte("recorded_at", five_min_ago).execute()
+            active_driver_ids = set(loc["driver_id"] for loc in (locs.data or []))
+            active_count = len(active_driver_ids)
 
-        # Today's stops (from today's routes)
+        # Today's stops (from today's routes) — batch query instead of N+1
         route_ids = [r["id"] for r in routes_data]
         completed_stops = 0
         failed_stops = 0
@@ -5823,9 +5842,9 @@ async def fleet_dashboard_stats(user=Depends(require_admin_or_dispatcher)):
         total_with_window = 0
         delivery_times = []
 
-        for rid in route_ids:
-            stops_result = stops_q.eq("route_id", rid).execute()
-            for s in (stops_result.data or []):
+        if route_ids:
+            all_stops = stops_q.in_("route_id", route_ids).execute()
+            for s in (all_stops.data or []):
                 if s["status"] == "completed":
                     completed_stops += 1
                     if s.get("time_window_end") and s.get("completed_at"):
@@ -5885,16 +5904,28 @@ async def fleet_driver_locations(user=Depends(require_admin_or_dispatcher)):
             drivers_q = drivers_q.eq("company_id", company_id)
         drivers_result = drivers_q.eq("active", True).execute()
 
-        locations = []
-        for driver in (drivers_result.data or []):
-            if driver["id"] in ADMIN_EXCLUDE_IDS:
-                continue
-            loc = supabase.table("location_history").select(
-                "lat,lng,speed,heading,accuracy,recorded_at"
-            ).eq("driver_id", driver["id"]).order("recorded_at", desc=True).limit(1).execute()
+        # Filter out admin drivers
+        valid_drivers = [d for d in (drivers_result.data or []) if d["id"] not in ADMIN_EXCLUDE_IDS]
+        valid_driver_ids = [d["id"] for d in valid_drivers]
 
-            if loc.data:
-                loc_data = loc.data[0]
+        # Fetch latest location per driver — one query per driver but with limit(1)
+        # Using individual queries because batch would return 49K+ rows from location_history
+        # and Supabase caps responses at 1000 rows by default
+        latest_by_driver = {}
+        for did in valid_driver_ids:
+            try:
+                loc = supabase.table("location_history").select(
+                    "driver_id,lat,lng,speed,heading,accuracy,recorded_at"
+                ).eq("driver_id", did).order("recorded_at", desc=True).limit(1).execute()
+                if loc.data:
+                    latest_by_driver[did] = loc.data[0]
+            except Exception:
+                pass
+
+        locations = []
+        for driver in valid_drivers:
+            loc_data = latest_by_driver.get(driver["id"])
+            if loc_data:
                 is_online = loc_data.get("recorded_at", "") >= two_min_ago
                 locations.append({
                     "driver_id": driver["id"],
