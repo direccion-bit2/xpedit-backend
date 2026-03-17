@@ -5361,6 +5361,8 @@ async def degrade_expired_trials():
     EXCLUDED_IDS = [
         "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",  # Demo Xpedit (demo@xpedit.es)
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",  # Apple Reviewer (appledemo@xpedit.es)
     ]
     if SENTRY_DSN:
         sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="in_progress")
@@ -5377,8 +5379,10 @@ async def degrade_expired_trials():
             .execute()
         )
 
+        logger.info(f"Trial degrade: found {len(result.data) if result.data else 0} expired trials to process")
         if not result.data:
-            logger.info("Trial degrade: no expired trials found")
+            if SENTRY_DSN:
+                sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="ok")
             return
 
         degraded, emailed = 0, 0
