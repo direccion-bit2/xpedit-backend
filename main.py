@@ -5390,9 +5390,9 @@ async def degrade_expired_trials():
             if driver["id"] in EXCLUDED_IDS:
                 continue
             old_plan = driver["promo_plan"]
-            # Downgrade to free
+            # Downgrade to free (NULL = free in the system)
             supabase.table("drivers").update({
-                "promo_plan": "free",
+                "promo_plan": None,
                 "promo_plan_expires_at": None,
             }).eq("id", driver["id"]).execute()
             degraded += 1
