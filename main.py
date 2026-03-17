@@ -4195,22 +4195,35 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
             params["location"] = f"{lat},{lng}"
             params["radius"] = "30000"
 
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
-                data = resp.json()
+        # Retry once on timeout/error before falling back to Nominatim
+        for attempt in range(2):
+            try:
+                timeout = 8.0 if attempt == 0 else 10.0
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
+                    data = resp.json()
 
-            if data.get("status") == "OK":
-                google_ok = True
-                if not _places_api_healthy:
-                    logger.info("Google Places API recovered")
-                    _places_api_healthy = True
-                return data
-            else:
-                error_msg = data.get("error_message", data.get("status", "unknown"))
-                logger.warning(f"Google Places failed: {error_msg} (query: {input[:30]})")
-        except Exception as e:
-            logger.warning(f"Google Places request error: {e}")
+                if data.get("status") == "OK":
+                    google_ok = True
+                    if not _places_api_healthy:
+                        logger.info("Google Places API recovered")
+                        _places_api_healthy = True
+                    return data
+                elif data.get("status") == "OVER_QUERY_LIMIT":
+                    logger.warning(f"Google Places rate limited (attempt {attempt + 1})")
+                    if attempt == 0:
+                        import asyncio
+                        await asyncio.sleep(1)
+                        continue
+                    break
+                else:
+                    error_msg = data.get("error_message", data.get("status", "unknown"))
+                    logger.warning(f"Google Places failed: {error_msg} (query: {input[:30]})")
+                    break
+            except Exception as e:
+                logger.warning(f"Google Places request error (attempt {attempt + 1}): {e}")
+                if attempt == 0:
+                    continue
 
     # Alert on first failure (then cooldown 1h)
     if not google_ok and _places_api_healthy:
@@ -5479,19 +5492,22 @@ async def periodic_health_check():
         db_ok = result.count is not None
         scheduler_ok = social_scheduler.running if social_scheduler else False
 
-        # Check Google Places API
+        # Check Google Places API (2 attempts to avoid false alarms from transient timeouts)
         places_ok = False
         if GOOGLE_API_KEY:
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(
-                        "https://maps.googleapis.com/maps/api/place/autocomplete/json",
-                        params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
-                    )
-                    places_data = resp.json()
-                    places_ok = places_data.get("status") in ("OK", "ZERO_RESULTS")
-            except Exception:
-                places_ok = False
+            for _hc_attempt in range(2):
+                try:
+                    async with httpx.AsyncClient(timeout=8.0) as client:
+                        resp = await client.get(
+                            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                            params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
+                        )
+                        places_data = resp.json()
+                        places_ok = places_data.get("status") in ("OK", "ZERO_RESULTS")
+                except Exception:
+                    places_ok = False
+                if places_ok:
+                    break
 
             if not places_ok and _places_api_healthy:
                 _places_api_healthy = False
