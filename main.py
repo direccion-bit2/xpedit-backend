@@ -207,6 +207,7 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
 SUPABASE_WEBHOOK_SECRET = os.getenv("SUPABASE_WEBHOOK_SECRET", "")
+REVENUECAT_WEBHOOK_SECRET = os.getenv("REVENUECAT_WEBHOOK_SECRET", "")
 stripe.api_key = STRIPE_SECRET_KEY
 
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
@@ -4004,6 +4005,116 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
+# === REVENUECAT WEBHOOK (In-app subscriptions) ===
+
+_last_revenuecat_webhook_ok: Optional[datetime] = None
+_last_revenuecat_webhook_error: Optional[datetime] = None
+
+
+@app.post("/revenuecat/webhook", tags=["webhooks"], summary="Webhook de RevenueCat")
+async def revenuecat_webhook(request: Request):
+    """Procesa eventos de RevenueCat (compra, renovación, cancelación, expiración).
+    app_user_id = driver_id. Entitlements: 'pro', 'pro_plus'."""
+    # Auth: RevenueCat sends Authorization header with the shared secret
+    auth_header = request.headers.get("authorization", "")
+    if REVENUECAT_WEBHOOK_SECRET and auth_header != f"Bearer {REVENUECAT_WEBHOOK_SECRET}":
+        logger.warning("RevenueCat webhook: invalid authorization")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = body.get("event", {})
+    event_type = event.get("type", "")
+    app_user_id = event.get("app_user_id", "")  # This is the driver_id
+    product_id = event.get("product_id", "")
+    entitlement_ids = event.get("entitlement_ids", [])
+    expiration_at = event.get("expiration_at_ms")
+
+    # Idempotency
+    event_id = event.get("id", "")
+    if event_id and event_id in _processed_webhook_events:
+        return {"received": True, "status": "already_processed"}
+    if event_id:
+        _processed_webhook_events[event_id] = True
+
+    logger.info(f"RevenueCat webhook: type={event_type}, driver_id={app_user_id}, product={product_id}, entitlements={entitlement_ids}")
+
+    global _last_revenuecat_webhook_ok
+    try:
+        if not app_user_id:
+            logger.warning("RevenueCat webhook: missing app_user_id")
+            return {"received": True, "status": "no_user"}
+
+        # Determine plan from entitlements
+        plan = None
+        if "pro_plus" in entitlement_ids:
+            plan = "pro_plus"
+        elif "pro" in entitlement_ids:
+            plan = "pro"
+
+        # Events that grant access
+        if event_type in ("INITIAL_PURCHASE", "RENEWAL", "UNCANCELLATION", "NON_RENEWING_PURCHASE"):
+            if plan:
+                expires_at = None
+                if expiration_at:
+                    from datetime import datetime as dt
+                    expires_at = dt.fromtimestamp(expiration_at / 1000, tz=timezone.utc).isoformat()
+                else:
+                    expires_at = (datetime.now(timezone.utc) + timedelta(days=35)).isoformat()
+
+                result = supabase.table("drivers").update({
+                    "promo_plan": plan,
+                    "promo_plan_expires_at": expires_at,
+                }).eq("id", app_user_id).execute()
+
+                # Also update users table via driver's user_id
+                driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()
+                if driver.data and driver.data.get("user_id"):
+                    supabase.table("users").update({
+                        "promo_plan": plan,
+                        "promo_plan_expires_at": expires_at,
+                    }).eq("id", driver.data["user_id"]).execute()
+
+                logger.info(f"RevenueCat: {plan} activated for driver {app_user_id}, expires {expires_at}")
+
+        # Events that revoke access
+        elif event_type in ("EXPIRATION", "BILLING_ISSUE"):
+            supabase.table("drivers").update({
+                "promo_plan": None,
+                "promo_plan_expires_at": None,
+            }).eq("id", app_user_id).execute()
+
+            driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()
+            if driver.data and driver.data.get("user_id"):
+                supabase.table("users").update({
+                    "promo_plan": None,
+                    "promo_plan_expires_at": None,
+                }).eq("id", driver.data["user_id"]).execute()
+
+            logger.info(f"RevenueCat: plan revoked for driver {app_user_id} ({event_type})")
+
+        # CANCELLATION = will not renew, but still active until expiration
+        elif event_type == "CANCELLATION":
+            logger.info(f"RevenueCat: driver {app_user_id} cancelled (still active until expiration)")
+
+        else:
+            logger.info(f"RevenueCat webhook unhandled: {event_type}")
+
+        _last_revenuecat_webhook_ok = datetime.now(timezone.utc)
+
+    except Exception as e:
+        global _last_revenuecat_webhook_error
+        _last_revenuecat_webhook_error = datetime.now(timezone.utc)
+        logger.error(f"RevenueCat webhook error: {type(e).__name__}: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Internal webhook error")
+
+    return {"received": True}
+
+
 # === RESEND WEBHOOK (Email tracking) ===
 
 @app.post("/webhooks/resend", tags=["webhooks"], summary="Webhook de Resend")
@@ -5126,6 +5237,12 @@ async def health_check():
     checks["stripe"] = {
         "last_webhook_ok": _last_stripe_webhook_ok.isoformat() if _last_stripe_webhook_ok else None,
         "last_webhook_error": _last_stripe_webhook_error.isoformat() if _last_stripe_webhook_error else None,
+    }
+
+    # RevenueCat webhook status
+    checks["revenuecat"] = {
+        "last_webhook_ok": _last_revenuecat_webhook_ok.isoformat() if _last_revenuecat_webhook_ok else None,
+        "last_webhook_error": _last_revenuecat_webhook_error.isoformat() if _last_revenuecat_webhook_error else None,
     }
 
     # Solver availability
