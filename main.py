@@ -540,6 +540,8 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"fleet:{client_ip}", max_requests=30, window_seconds=60)
         elif path.startswith("/stripe"):
             check_rate_limit(f"stripe:{client_ip}", max_requests=20, window_seconds=60)
+        elif path.startswith("/revenuecat"):
+            check_rate_limit(f"revenuecat:{client_ip}", max_requests=20, window_seconds=60)
     except HTTPException as e:
         from starlette.responses import JSONResponse
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
@@ -1248,6 +1250,60 @@ async def get_drivers(user=Depends(get_current_user)):
         query = query.eq("user_id", user["id"])
     result = query.execute()
     return {"drivers": result.data}
+
+
+@app.post("/drivers/claim-trial", tags=["drivers"], summary="Reclamar trial gratuito")
+async def claim_trial(request: Request, user=Depends(get_current_user)):
+    """Grants 14-day Pro trial if device_id hasn't claimed one before.
+    Called from app after registration/first login."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    device_id = (body.get("device_id") or "").strip()
+    if not device_id or len(device_id) < 8:
+        raise HTTPException(status_code=400, detail="Invalid device_id")
+
+    # Get driver for this user
+    driver_result = supabase.table("drivers").select("id, promo_plan").eq("user_id", user["id"]).single().execute()
+    if not driver_result.data:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    driver_id = driver_result.data["id"]
+
+    # Already has a plan? Don't overwrite
+    if driver_result.data.get("promo_plan"):
+        return {"granted": False, "reason": "already_has_plan"}
+
+    # Check if this device already claimed a trial
+    existing = supabase.table("trial_claims").select("id, driver_id").eq("device_id", device_id).execute()
+    if existing.data and len(existing.data) > 0:
+        logger.info(f"Trial denied: device {device_id[:12]}... already claimed by driver {existing.data[0]['driver_id']}")
+        return {"granted": False, "reason": "device_already_claimed"}
+
+    # Grant 14-day Pro trial
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+    supabase.table("drivers").update({
+        "promo_plan": "pro",
+        "promo_plan_expires_at": expires_at,
+        "device_id": device_id,
+    }).eq("id", driver_id).execute()
+
+    # Record the claim
+    supabase.table("trial_claims").insert({
+        "device_id": device_id,
+        "driver_id": driver_id,
+    }).execute()
+
+    # Also update users table
+    supabase.table("users").update({
+        "promo_plan": "pro",
+        "promo_plan_expires_at": expires_at,
+    }).eq("id", user["id"]).execute()
+
+    logger.info(f"Trial granted: driver {driver_id}, device {device_id[:12]}..., expires {expires_at}")
+    return {"granted": True, "plan": "pro", "expires_at": expires_at}
 
 
 @app.get("/drivers/{driver_id}", tags=["drivers"], summary="Obtener conductor")
@@ -4017,7 +4073,10 @@ async def revenuecat_webhook(request: Request):
     app_user_id = driver_id. Entitlements: 'pro', 'pro_plus'."""
     # Auth: RevenueCat sends Authorization header with the shared secret
     auth_header = request.headers.get("authorization", "")
-    if REVENUECAT_WEBHOOK_SECRET and auth_header != f"Bearer {REVENUECAT_WEBHOOK_SECRET}":
+    if not REVENUECAT_WEBHOOK_SECRET:
+        logger.error("REVENUECAT_WEBHOOK_SECRET not configured")
+        raise HTTPException(status_code=503, detail="Webhook not configured")
+    if auth_header != f"Bearer {REVENUECAT_WEBHOOK_SECRET}":
         logger.warning("RevenueCat webhook: invalid authorization")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -4030,15 +4089,19 @@ async def revenuecat_webhook(request: Request):
     event_type = event.get("type", "")
     app_user_id = event.get("app_user_id", "")  # This is the driver_id
     product_id = event.get("product_id", "")
-    entitlement_ids = event.get("entitlement_ids", [])
+    entitlement_ids = event.get("entitlement_ids") or []
     expiration_at = event.get("expiration_at_ms")
 
-    # Idempotency
+    # Idempotency (with LRU eviction to prevent memory growth)
     event_id = event.get("id", "")
     if event_id and event_id in _processed_webhook_events:
         return {"received": True, "status": "already_processed"}
     if event_id:
         _processed_webhook_events[event_id] = True
+        if len(_processed_webhook_events) > 10000:
+            to_remove = list(_processed_webhook_events.keys())[:5000]
+            for k in to_remove:
+                del _processed_webhook_events[k]
 
     logger.info(f"RevenueCat webhook: type={event_type}, driver_id={app_user_id}, product={product_id}, entitlements={entitlement_ids}")
 
@@ -4063,11 +4126,12 @@ async def revenuecat_webhook(request: Request):
                     from datetime import datetime as dt
                     expires_at = dt.fromtimestamp(expiration_at / 1000, tz=timezone.utc).isoformat()
                 else:
-                    expires_at = (datetime.now(timezone.utc) + timedelta(days=35)).isoformat()
+                    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
                 result = supabase.table("drivers").update({
                     "promo_plan": plan,
                     "promo_plan_expires_at": expires_at,
+                    "subscription_source": "revenuecat",
                 }).eq("id", app_user_id).execute()
 
                 # Also update users table via driver's user_id
@@ -4085,6 +4149,7 @@ async def revenuecat_webhook(request: Request):
             supabase.table("drivers").update({
                 "promo_plan": None,
                 "promo_plan_expires_at": None,
+                "subscription_source": None,
             }).eq("id", app_user_id).execute()
 
             driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()
@@ -4314,13 +4379,21 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
                     resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
                     data = resp.json()
 
-                if data.get("status") == "OK":
+                status = data.get("status")
+                if status == "OK":
                     google_ok = True
                     if not _places_api_healthy:
                         logger.info("Google Places API recovered")
                         _places_api_healthy = True
                     return data
-                elif data.get("status") == "OVER_QUERY_LIMIT":
+                elif status == "ZERO_RESULTS":
+                    # API is working fine, just no matches — NOT a failure
+                    google_ok = True
+                    if not _places_api_healthy:
+                        logger.info("Google Places API recovered")
+                        _places_api_healthy = True
+                    break  # Fall through to Nominatim for better results
+                elif status == "OVER_QUERY_LIMIT":
                     logger.warning(f"Google Places rate limited (attempt {attempt + 1})")
                     if attempt == 0:
                         import asyncio
@@ -4328,8 +4401,8 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
                         continue
                     break
                 else:
-                    error_msg = data.get("error_message", data.get("status", "unknown"))
-                    logger.warning(f"Google Places failed: {error_msg} (query: {input[:30]})")
+                    error_msg = data.get("error_message", status or "unknown")
+                    logger.warning(f"Google Places failed: status={status}, http={resp.status_code}, error={error_msg} (query: {input[:30]})")
                     break
             except Exception as e:
                 logger.warning(f"Google Places request error (attempt {attempt + 1}): {e}")
