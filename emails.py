@@ -132,7 +132,7 @@ def send_welcome_email(to_email: str, user_name: str) -> dict:
         <!-- Trial callout -->
         <div style="background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%); border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center; border: 1px solid #e0e7ff;">
             <p style="margin: 0 0 6px 0; color: #1e40af; font-size: 14px; font-weight: 600;">REGALO DE BIENVENIDA</p>
-            <p style="margin: 0 0 4px 0; color: #111827; font-size: 22px; font-weight: 700;">14 días de Pro+ gratis</p>
+            <p style="margin: 0 0 4px 0; color: #111827; font-size: 22px; font-weight: 700;">7 días de Pro gratis</p>
             <p style="margin: 0; color: #6b7280; font-size: 14px;">Paradas ilimitadas, optimización avanzada y más.</p>
         </div>
 

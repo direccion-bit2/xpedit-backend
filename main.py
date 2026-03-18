@@ -1254,7 +1254,7 @@ async def get_drivers(user=Depends(get_current_user)):
 
 @app.post("/drivers/claim-trial", tags=["drivers"], summary="Reclamar trial gratuito")
 async def claim_trial(request: Request, user=Depends(get_current_user)):
-    """Grants 14-day Pro trial if device_id hasn't claimed one before.
+    """Grants 7-day Pro trial if device_id hasn't claimed one before.
     Called from app after registration/first login."""
     try:
         body = await request.json()
@@ -1282,8 +1282,8 @@ async def claim_trial(request: Request, user=Depends(get_current_user)):
         logger.info(f"Trial denied: device {device_id[:12]}... already claimed by driver {existing.data[0]['driver_id']}")
         return {"granted": False, "reason": "device_already_claimed"}
 
-    # Grant 14-day Pro trial
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+    # Grant 7-day Pro trial
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
     supabase.table("drivers").update({
         "promo_plan": "pro",
         "promo_plan_expires_at": expires_at,
@@ -2408,7 +2408,7 @@ class AdminCreateCompanyRequest(BaseModel):
 
 @app.post("/admin/companies", tags=["admin", "company"], summary="Crear empresa (admin)")
 async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(require_admin)):
-    """Crea una empresa desde el panel de admin con suscripción trial de 14 días."""
+    """Crea una empresa desde el panel de admin con suscripción trial de 7 días."""
     try:
         result = supabase.table("companies").insert({
             "name": request.name,
@@ -2429,9 +2429,9 @@ async def admin_create_company(request: AdminCreateCompanyRequest, user=Depends(
             "max_drivers": 15,
             "price_per_month": 0,
             "status": "trialing",
-            "trial_ends_at": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+            "trial_ends_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
             "current_period_start": datetime.now(timezone.utc).isoformat(),
-            "current_period_end": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+            "current_period_end": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
         }).execute()
 
         log_audit(user["id"], "create_company", "company", company["id"], {"name": request.name, "payment_model": request.payment_model})
@@ -2911,7 +2911,7 @@ def _generate_invite_code() -> str:
 # 1. POST /company/register
 @app.post("/company/register", tags=["company"], summary="Registrar empresa")
 async def register_company(request: CompanyRegisterRequest, user=Depends(get_current_user)):
-    """Registra una nueva empresa, configura al propietario como admin y crea suscripción trial de 14 días."""
+    """Registra una nueva empresa, configura al propietario como admin y crea suscripción trial de 7 días."""
     # SECURITY: owner_user_id must be the authenticated user (prevent privilege escalation)
     if request.owner_user_id != user["id"]:
         raise HTTPException(status_code=403, detail="Solo puedes registrar una empresa para tu propia cuenta")
@@ -2948,9 +2948,9 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
             "company_id": company_id,
         }).eq("user_id", user["id"]).execute()
 
-        # Create subscription with 14-day trial
+        # Create subscription with 7-day trial
         now = datetime.now(timezone.utc)
-        trial_end = now + timedelta(days=14)
+        trial_end = now + timedelta(days=7)
         subscription_data = {
             "company_id": company_id,
             "plan": "free",
