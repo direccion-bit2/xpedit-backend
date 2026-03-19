@@ -5666,11 +5666,10 @@ async def start_monitoring_jobs():
         id="trial_expiry_check",
         replace_existing=True,
     )
-    # Degrade expired trials to Free (daily 09:05 UTC)
+    # Degrade expired trials to Free (every hour at :05)
     social_scheduler.add_job(
         degrade_expired_trials,
         "cron",
-        hour=9,
         minute=5,
         id="trial_degrade",
         replace_existing=True,
