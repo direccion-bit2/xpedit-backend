@@ -838,7 +838,7 @@ async def _osrm_table_request(
                 logger.info(f"OSRM: waiting {delay}s before retry {attempt+1}/{OSRM_MAX_RETRIES} ({n_label} locs)")
                 await asyncio.sleep(delay)
 
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url, timeout=30.0, headers={"User-Agent": "Xpedit/1.0"})
 
                 if resp.status_code == 429:
@@ -1052,7 +1052,7 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
 @app.post("/geocode", tags=["optimize"], summary="Geocodificar dirección")
 async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
     """Convierte una dirección de texto en coordenadas (lat/lng) usando Nominatim."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         try:
             response = await client.get(
                 "https://nominatim.openstreetmap.org/search",
@@ -4360,11 +4360,12 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 # Track Places API health — if Google is down, log it and alert once
 _places_api_healthy = True
 _places_api_last_alert: Optional[datetime] = None
+_places_api_last_check: Optional[datetime] = None
 
 @app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
 async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
     """Proxy de Google Places Autocomplete con sesgo de ubicación. Fallback a Nominatim si falla."""
-    global _places_api_healthy, _places_api_last_alert
+    global _places_api_healthy, _places_api_last_alert, _places_api_last_check
     import re
 
     google_ok = False
@@ -4453,7 +4454,7 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
     queries = [nom_query] if stripped == nom_query else [nom_query, stripped]
 
     nom_data = []
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         for q in queries:
             nom_resp = await client.get(
                 "https://nominatim.openstreetmap.org/search",
@@ -4479,7 +4480,7 @@ async def places_details(place_id: str, user=Depends(get_current_user)):
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/place/details/json", params=params)
     return resp.json()
 
@@ -4493,7 +4494,7 @@ async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/geocode/json", params=params)
         data = resp.json()
     if data.get("status") == "OK" and data.get("results"):
@@ -4527,7 +4528,7 @@ async def places_directions(
         params["waypoints"] = waypoints
     if avoid:
         params["avoid"] = avoid
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/directions/json", params=params)
     return resp.json()
 
@@ -4704,7 +4705,7 @@ async def publish_to_twitter(content: str, image_urls: list = None) -> dict:
         api_v1 = get_twitter_api_v1()
         for img_url in image_urls[:4]:  # X allows max 4 images
             try:
-                async with httpx.AsyncClient() as http:
+                async with httpx.AsyncClient(timeout=15) as http:
                     resp = await http.get(img_url)
                     if resp.status_code == 200:
                         import tempfile
@@ -4760,7 +4761,7 @@ async def publish_post(post_id: str):
             linkedin_member_sub = os.getenv("LINKEDIN_MEMBER_SUB", "")
             if linkedin_token and linkedin_member_sub:
                 try:
-                    async with httpx.AsyncClient() as http:
+                    async with httpx.AsyncClient(timeout=15) as http:
                         headers = {"Authorization": f"Bearer {linkedin_token}", "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json"}
                         payload = {
                             "author": f"urn:li:person:{linkedin_member_sub}",
@@ -5686,15 +5687,16 @@ async def start_monitoring_jobs():
 
 async def periodic_health_check():
     """Health check periodico que reporta a Sentry Crons. Incluye verificación de Google Places."""
-    global _places_api_healthy, _places_api_last_alert
+    global _places_api_healthy, _places_api_last_alert, _places_api_last_check
     try:
         result = supabase.table("drivers").select("id", count="exact").limit(1).execute()
         db_ok = result.count is not None
         scheduler_ok = social_scheduler.running if social_scheduler else False
 
-        # Check Google Places API (2 attempts to avoid false alarms from transient timeouts)
-        places_ok = False
-        if GOOGLE_API_KEY:
+        # Check Google Places API — only once per hour to save API quota (was 288 calls/day)
+        places_ok = _places_api_healthy  # Use cached value by default
+        if GOOGLE_API_KEY and (not _places_api_last_check or (datetime.now(timezone.utc) - _places_api_last_check).total_seconds() > 3600):
+            places_ok = False
             for _hc_attempt in range(2):
                 try:
                     async with httpx.AsyncClient(timeout=8.0) as client:
@@ -5708,6 +5710,7 @@ async def periodic_health_check():
                     places_ok = False
                 if places_ok:
                     break
+            _places_api_last_check = datetime.now(timezone.utc)
 
             if not places_ok and _places_api_healthy:
                 _places_api_healthy = False
