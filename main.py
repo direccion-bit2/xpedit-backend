@@ -20,6 +20,7 @@ import jwt as pyjwt
 import sentry_sdk
 from dotenv import load_dotenv
 
+
 # Safe wrapper — capture_check_in doesn't exist in all sentry_sdk versions
 def sentry_check_in(monitor_slug: str, status: str):
     try:

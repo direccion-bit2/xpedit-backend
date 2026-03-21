@@ -6,14 +6,12 @@ Tests for the in-memory rate limiting system:
   - Middleware applies rate limits to different endpoint groups
 """
 
-import time
 from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
 
 from main import _rate_limits, check_rate_limit
-
 
 # ==========================================================================
 # Unit tests for check_rate_limit function

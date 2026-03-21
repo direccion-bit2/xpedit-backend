@@ -13,7 +13,6 @@ from httpx import ASGITransport, AsyncClient
 
 from main import app, get_current_user, require_admin_or_dispatcher
 
-
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------

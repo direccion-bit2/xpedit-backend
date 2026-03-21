@@ -7,11 +7,9 @@ non-INSERT events are skipped, missing email is skipped, email log insertion,
 driver name lookup, and error handling.
 """
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # ===================== POST /webhooks/supabase-auth =====================
 

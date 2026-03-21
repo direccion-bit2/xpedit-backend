@@ -12,8 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests.conftest import FAKE_DRIVER_ID, FAKE_USER_ID
-
+from tests.conftest import FAKE_DRIVER_ID
 
 # ===================== GET /referral/code =====================
 

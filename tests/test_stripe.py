@@ -14,7 +14,6 @@ import pytest
 
 from tests.conftest import FAKE_USER_ID
 
-
 # ===================== /stripe/create-checkout =====================
 
 
