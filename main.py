@@ -5756,7 +5756,7 @@ async def periodic_health_check():
 
 # Website health monitor - cooldown timestamp
 _last_website_alert: Optional[datetime] = None
-WEBSITE_HEALTH_URL = "https://xpedit.es/api/health"
+WEBSITE_HEALTH_URL = "https://www.xpedit.es/api/health"
 ALERT_COOLDOWN_HOURS = 2
 ALERT_EMAIL = "direccion@taespack.com"
 ADMIN_DRIVER_ID = "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b"
