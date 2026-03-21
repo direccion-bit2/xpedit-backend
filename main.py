@@ -19,6 +19,13 @@ import httpx
 import jwt as pyjwt
 import sentry_sdk
 from dotenv import load_dotenv
+
+# Safe wrapper — capture_check_in doesn't exist in all sentry_sdk versions
+def sentry_check_in(monitor_slug: str, status: str):
+    try:
+        sentry_check_in(monitor_slug=monitor_slug, status=status)
+    except AttributeError:
+        pass  # sentry_sdk version doesn't support cron monitoring
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
@@ -5341,7 +5348,7 @@ async def backup_critical_tables():
     try:
         # Sentry cron check-in
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(
+            sentry_check_in(
                 monitor_slug="daily-backup",
                 status="in_progress",
             )
@@ -5380,7 +5387,7 @@ async def backup_critical_tables():
 
         # Sentry cron OK
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(
+            sentry_check_in(
                 monitor_slug="daily-backup",
                 status="ok",
             )
@@ -5388,7 +5395,7 @@ async def backup_critical_tables():
     except Exception as e:
         logger.error(f"Backup failed: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(
+            sentry_check_in(
                 monitor_slug="daily-backup",
                 status="error",
             )
@@ -5399,7 +5406,7 @@ async def run_retention_cleanup():
     """Ejecutar limpieza de datos antiguos (semanal)."""
     try:
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(
+            sentry_check_in(
                 monitor_slug="weekly-retention-cleanup",
                 status="in_progress",
             )
@@ -5429,14 +5436,14 @@ async def run_retention_cleanup():
             logger.info(f"Retention cleanup: location_history={r1.status_code}, email_log={r2.status_code}")
 
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(
+            sentry_check_in(
                 monitor_slug="weekly-retention-cleanup",
                 status="ok",
             )
     except Exception as e:
         logger.error(f"Retention cleanup failed: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(
+            sentry_check_in(
                 monitor_slug="weekly-retention-cleanup",
                 status="error",
             )
@@ -5448,7 +5455,7 @@ async def send_weekly_reengagement_push():
     import asyncio
 
     if SENTRY_DSN:
-        sentry_sdk.capture_check_in(monitor_slug="weekly-reengagement-push", status="in_progress")
+        sentry_check_in(monitor_slug="weekly-reengagement-push", status="in_progress")
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         # Drivers registered in last 30 days with push tokens
@@ -5484,11 +5491,11 @@ async def send_weekly_reengagement_push():
         sent = sum(1 for r in results if r)
         logger.info(f"Weekly re-engagement: {sent}/{len(inactive)} pushes sent")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="weekly-reengagement-push", status="ok")
+            sentry_check_in(monitor_slug="weekly-reengagement-push", status="ok")
     except Exception as e:
         logger.error(f"Weekly re-engagement push error: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="weekly-reengagement-push", status="error")
+            sentry_check_in(monitor_slug="weekly-reengagement-push", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -5499,7 +5506,7 @@ async def check_expiring_trials():
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
     ]
     if SENTRY_DSN:
-        sentry_sdk.capture_check_in(monitor_slug="check-expiring-trials", status="in_progress")
+        sentry_check_in(monitor_slug="check-expiring-trials", status="in_progress")
     try:
         now = datetime.now(timezone.utc)
         # Window: expires between now and now+3 days (send email 3 days before)
@@ -5538,11 +5545,11 @@ async def check_expiring_trials():
 
         logger.info(f"Trial expiry check: {sent} emails sent, {failed} failed (of {len(result.data)} expiring)")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="check-expiring-trials", status="ok")
+            sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
     except Exception as e:
         logger.error(f"Trial expiry check failed: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="check-expiring-trials", status="error")
+            sentry_check_in(monitor_slug="check-expiring-trials", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -5555,7 +5562,7 @@ async def degrade_expired_trials():
         "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",  # Apple Reviewer (appledemo@xpedit.es)
     ]
     if SENTRY_DSN:
-        sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="in_progress")
+        sentry_check_in(monitor_slug="degrade-expired-trials", status="in_progress")
     try:
         now = datetime.now(timezone.utc).isoformat()
 
@@ -5572,7 +5579,7 @@ async def degrade_expired_trials():
         logger.info(f"Trial degrade: found {len(result.data) if result.data else 0} expired trials to process")
         if not result.data:
             if SENTRY_DSN:
-                sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="ok")
+                sentry_check_in(monitor_slug="degrade-expired-trials", status="ok")
             return
 
         degraded, emailed = 0, 0
@@ -5597,11 +5604,11 @@ async def degrade_expired_trials():
 
         logger.info(f"Trial degrade: {degraded} users downgraded to Free, {emailed} emails sent")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="ok")
+            sentry_check_in(monitor_slug="degrade-expired-trials", status="ok")
     except Exception as e:
         logger.error(f"Trial degrade failed: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="degrade-expired-trials", status="error")
+            sentry_check_in(monitor_slug="degrade-expired-trials", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -5731,15 +5738,15 @@ async def periodic_health_check():
         all_ok = db_ok and scheduler_ok and (places_ok or not GOOGLE_API_KEY)
         if all_ok:
             if SENTRY_DSN:
-                sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="ok")
+                sentry_check_in(monitor_slug="backend-health-check", status="ok")
         else:
             logger.warning(f"Health check degraded: db={db_ok}, scheduler={scheduler_ok}, places={places_ok}")
             if SENTRY_DSN:
-                sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
+                sentry_check_in(monitor_slug="backend-health-check", status="error")
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="backend-health-check", status="error")
+            sentry_check_in(monitor_slug="backend-health-check", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -5774,7 +5781,7 @@ async def monitor_website_health():
 
         if resp.status_code == 200:
             if SENTRY_DSN:
-                sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="ok")
+                sentry_check_in(monitor_slug="website-health-monitor", status="ok")
             return
 
         # Degraded or error
@@ -5786,7 +5793,7 @@ async def monitor_website_health():
         logger.warning(f"Website health degraded: status={resp.status_code} body={body}")
 
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="error")
+            sentry_check_in(monitor_slug="website-health-monitor", status="error")
 
         # Check cooldown before sending alert email
         now = datetime.now(timezone.utc)
@@ -5808,7 +5815,7 @@ async def monitor_website_health():
     except Exception as e:
         logger.error(f"Website health monitor failed: {e}")
         if SENTRY_DSN:
-            sentry_sdk.capture_check_in(monitor_slug="website-health-monitor", status="error")
+            sentry_check_in(monitor_slug="website-health-monitor", status="error")
             sentry_sdk.capture_exception(e)
 
         # Also alert on connection failures (site completely down)
