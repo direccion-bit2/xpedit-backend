@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 # Safe wrapper — capture_check_in doesn't exist in all sentry_sdk versions
 def sentry_check_in(monitor_slug: str, status: str):
     try:
-        sentry_check_in(monitor_slug=monitor_slug, status=status)
+        sentry_sdk.capture_check_in(monitor_slug=monitor_slug, status=status)
     except AttributeError:
         pass  # sentry_sdk version doesn't support cron monitoring
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
