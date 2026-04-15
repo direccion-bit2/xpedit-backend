@@ -4477,7 +4477,7 @@ async def places_details(place_id: str, user=Depends(get_current_user)):
     """Proxy de Google Places Details. Devuelve geometría, componentes de dirección y dirección formateada."""
     params = {
         "place_id": place_id,
-        "fields": "geometry,address_components,formatted_address",
+        "fields": "geometry,address_components,formatted_address,name,opening_hours,types",
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
