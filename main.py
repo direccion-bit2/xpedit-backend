@@ -1260,10 +1260,34 @@ async def get_drivers(user=Depends(get_current_user)):
     return {"drivers": result.data}
 
 
+# Disposable email domains blocklist — prevent trial abuse with throwaway accounts
+DISPOSABLE_EMAIL_DOMAINS = {
+    "tempmail.com", "temp-mail.org", "guerrillamail.com", "guerrillamail.info",
+    "guerrillamail.net", "guerrillamail.org", "sharklasers.com", "grr.la",
+    "guerrillamailblock.com", "throwaway.email", "mailinator.com", "maildrop.cc",
+    "dispostable.com", "yopmail.com", "yopmail.fr", "trashmail.com", "trashmail.net",
+    "trashmail.me", "mailnesia.com", "mailnull.com", "tempail.com",
+    "fakeinbox.com", "devnull.email", "discard.email", "discardmail.com",
+    "emailondeck.com", "getnada.com", "harakirimail.com", "jetable.org",
+    "mailcatch.com", "mailexpire.com", "mailforspam.com", "mohmal.com",
+    "mytemp.email", "nomail.xl.cx", "spamgourmet.com", "tempmailaddress.com",
+    "throwam.com", "tmpmail.net", "tmpmail.org", "trash-mail.com",
+    "trashmail.ws", "uglymail.com", "wegwerfmail.de", "10minutemail.com",
+    "20minutemail.com", "crazymailing.com", "disposableaddress.com",
+    "emailisvalid.com", "inboxbear.com", "mailsac.com", "mintemail.com",
+    "mt2015.com", "mx0.wwwnew.eu", "objectmail.com", "proxymail.eu",
+    "rcpt.at", "rmqkr.net", "sharklasers.com", "spambox.us", "spamcero.com",
+    "spamex.com", "spamspot.com", "superrito.com", "suremail.info",
+    "thankyou2010.com", "thisisnotmyrealemail.com", "trashymail.com",
+    "trashymail.net", "mailtemp.info", "tempinbox.com", "tempomail.fr",
+    "temporarymail.org", "tempsky.com", "meltmail.com", "getairmail.com",
+}
+
+
 @app.post("/drivers/claim-trial", tags=["drivers"], summary="Reclamar trial gratuito")
 async def claim_trial(request: Request, user=Depends(get_current_user)):
     """Grants 7-day Pro trial if device_id hasn't claimed one before.
-    Called from app after registration/first login."""
+    Checks device_id, IP abuse, and disposable email domains."""
     try:
         body = await request.json()
     except Exception:
@@ -1272,6 +1296,16 @@ async def claim_trial(request: Request, user=Depends(get_current_user)):
     device_id = (body.get("device_id") or "").strip()
     if not device_id or len(device_id) < 8:
         raise HTTPException(status_code=400, detail="Invalid device_id")
+
+    # Get client IP (behind Railway proxy)
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else ""
+
+    # Block disposable email domains
+    user_email = user.get("email", "")
+    email_domain = user_email.split("@")[-1].lower() if "@" in user_email else ""
+    if email_domain in DISPOSABLE_EMAIL_DOMAINS:
+        logger.warning(f"Trial denied: disposable email domain {email_domain} for user {user['id']}")
+        return {"granted": False, "reason": "disposable_email"}
 
     # Get driver for this user
     driver_result = supabase.table("drivers").select("id, promo_plan").eq("user_id", user["id"]).single().execute()
@@ -1290,6 +1324,14 @@ async def claim_trial(request: Request, user=Depends(get_current_user)):
         logger.info(f"Trial denied: device {device_id[:12]}... already claimed by driver {existing.data[0]['driver_id']}")
         return {"granted": False, "reason": "device_already_claimed"}
 
+    # Check IP abuse: max 3 trials from same IP in 7 days
+    if client_ip:
+        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        ip_claims = supabase.table("trial_claims").select("id").eq("ip", client_ip).gte("claimed_at", seven_days_ago).execute()
+        if ip_claims.data and len(ip_claims.data) >= 3:
+            logger.warning(f"Trial denied: IP {client_ip} has {len(ip_claims.data)} claims in 7 days")
+            return {"granted": False, "reason": "ip_abuse_detected"}
+
     # Grant 7-day Pro trial
     expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
     supabase.table("drivers").update({
@@ -1298,10 +1340,11 @@ async def claim_trial(request: Request, user=Depends(get_current_user)):
         "device_id": device_id,
     }).eq("id", driver_id).execute()
 
-    # Record the claim
+    # Record the claim with IP
     supabase.table("trial_claims").insert({
         "device_id": device_id,
         "driver_id": driver_id,
+        "ip": client_ip or None,
     }).execute()
 
     # Also update users table
@@ -1310,7 +1353,7 @@ async def claim_trial(request: Request, user=Depends(get_current_user)):
         "promo_plan_expires_at": expires_at,
     }).eq("id", user["id"]).execute()
 
-    logger.info(f"Trial granted: driver {driver_id}, device {device_id[:12]}..., expires {expires_at}")
+    logger.info(f"Trial granted: driver {driver_id}, device {device_id[:12]}..., IP {client_ip}, expires {expires_at}")
     return {"granted": True, "plan": "pro", "expires_at": expires_at}
 
 
