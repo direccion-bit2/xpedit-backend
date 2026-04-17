@@ -1324,12 +1324,12 @@ async def claim_trial(request: Request, user=Depends(get_current_user)):
         logger.info(f"Trial denied: device {device_id[:12]}... already claimed by driver {existing.data[0]['driver_id']}")
         return {"granted": False, "reason": "device_already_claimed"}
 
-    # Check IP abuse: max 3 trials from same IP in 7 days
+    # Check IP abuse: max 1 trial from same IP in 30 days
     if client_ip:
-        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        ip_claims = supabase.table("trial_claims").select("id").eq("ip", client_ip).gte("claimed_at", seven_days_ago).execute()
-        if ip_claims.data and len(ip_claims.data) >= 3:
-            logger.warning(f"Trial denied: IP {client_ip} has {len(ip_claims.data)} claims in 7 days")
+        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        ip_claims = supabase.table("trial_claims").select("id").eq("ip", client_ip).gte("claimed_at", thirty_days_ago).execute()
+        if ip_claims.data and len(ip_claims.data) >= 1:
+            logger.warning(f"Trial denied: IP {client_ip} already has a claim in last 30 days")
             return {"granted": False, "reason": "ip_abuse_detected"}
 
     # Grant 7-day Pro trial
