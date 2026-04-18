@@ -63,6 +63,7 @@ from emails import (
     send_social_login_broadcast,
     send_trial_expired_email,
     send_trial_expiring_email,
+    send_trial_feedback_email,
     send_upcoming_email,
     send_welcome_email,
 )
@@ -707,6 +708,12 @@ class AdminPushBlastRequest(BaseModel):
     title: str
     body: str
     target: str = "inactive"  # "inactive" | "all"
+
+
+class TrialFeedbackRequest(BaseModel):
+    driver_id: str
+    reason: Literal["price", "feature", "time", "competitor"]
+    detail: Optional[str] = None
 
 
 class CustomerNotificationRequest(BaseModel):
@@ -5657,6 +5664,84 @@ async def degrade_expired_trials():
             sentry_sdk.capture_exception(e)
 
 
+async def send_trial_feedback_emails():
+    """Daily job: send feedback email 8 days after trial expiry to users who didn't subscribe.
+    Only sends once per user (checks email_log for prior send)."""
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",  # Demo Xpedit
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",  # Apple Reviewer
+    ]
+    FEEDBACK_SUBJECT = "Tu prueba de Xpedit ha terminado - nos encantaria saber por que"
+    try:
+        now = datetime.now(timezone.utc)
+        # Window: trial expired between 7 and 8 days ago
+        window_start = (now - timedelta(days=8)).isoformat()
+        window_end = (now - timedelta(days=7)).isoformat()
+
+        # Find users whose trial expired 7-8 days ago AND have no active subscription
+        result = (
+            supabase.table("drivers")
+            .select("id, email, name, promo_plan, promo_plan_expires_at, subscription_source")
+            .is_("subscription_source", "null")
+            .is_("promo_plan", "null")
+            .not_.is_("email", "null")
+            .not_.is_("promo_plan_expires_at", "null")
+            .gte("promo_plan_expires_at", window_start)
+            .lte("promo_plan_expires_at", window_end)
+            .execute()
+        )
+
+        if not result.data:
+            logger.info("Trial feedback: no users in 7-8 day post-expiry window")
+            return
+
+        sent, skipped = 0, 0
+        for driver in result.data:
+            if driver["id"] in EXCLUDED_IDS:
+                skipped += 1
+                continue
+
+            # Check if we already sent this feedback email (deduplicate via email_log)
+            existing = (
+                supabase.table("email_log")
+                .select("id")
+                .eq("recipient_email", driver["email"])
+                .eq("subject", FEEDBACK_SUBJECT)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                skipped += 1
+                continue
+
+            email_result = send_trial_feedback_email(
+                driver["email"], driver.get("name", ""), driver["id"]
+            )
+            if email_result.get("success"):
+                sent += 1
+                # Log in email_log so we don't send again
+                try:
+                    supabase.table("email_log").insert({
+                        "recipient_email": driver["email"],
+                        "recipient_name": driver.get("name"),
+                        "subject": FEEDBACK_SUBJECT,
+                        "body": "trial feedback email (auto)",
+                        "message_id": email_result.get("id"),
+                    }).execute()
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"Trial feedback email failed for {driver['id']}: {email_result.get('error')}")
+
+        logger.info(f"Trial feedback: {sent} emails sent, {skipped} skipped")
+    except Exception as e:
+        logger.error(f"Trial feedback job failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+
+
 # Track server start time for uptime
 _server_start_time = datetime.now(timezone.utc)
 
@@ -5726,7 +5811,16 @@ async def start_monitoring_jobs():
         id="trial_degrade",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC)")
+    # Trial feedback emails (daily 10:00 UTC — 1h after expiry emails)
+    social_scheduler.add_job(
+        send_trial_feedback_emails,
+        "cron",
+        hour=10,
+        minute=30,
+        id="trial_feedback_emails",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC)")
 
 
 async def periodic_health_check():
@@ -6588,6 +6682,52 @@ async def fleet_login(request: Request):
         logger.error(f"Fleet login error: {e}")
         sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail="Error en el inicio de sesión")
+
+
+@app.post("/feedback/trial", tags=["feedback"], summary="Registrar feedback post-trial")
+async def submit_trial_feedback(request: TrialFeedbackRequest):
+    """Public endpoint (no auth) — receives feedback from email links.
+    Inserts into trial_feedback table. If reason=time, extends trial by 3 days."""
+    try:
+        # Verify driver exists
+        driver_result = supabase.table("drivers").select("id, email, name, promo_plan, promo_plan_expires_at").eq("id", request.driver_id).single().execute()
+        if not driver_result.data:
+            raise HTTPException(status_code=404, detail="Driver not found")
+
+        # Insert feedback
+        feedback_data = {
+            "driver_id": request.driver_id,
+            "reason": request.reason,
+            "detail": request.detail,
+        }
+        insert_result = supabase.table("trial_feedback").insert(feedback_data).execute()
+        if not insert_result.data:
+            raise HTTPException(status_code=500, detail="Failed to save feedback")
+
+        response = {"success": True, "reason": request.reason}
+
+        # If reason is "time", extend trial by 3 extra days
+        if request.reason == "time":
+            now = datetime.now(timezone.utc)
+            new_expiry = (now + timedelta(days=3)).isoformat()
+            supabase.table("drivers").update({
+                "promo_plan": "pro",
+                "promo_plan_expires_at": new_expiry,
+            }).eq("id", request.driver_id).execute()
+            response["trial_extended"] = True
+            response["new_expiry"] = new_expiry
+            logger.info(f"Trial extended 3 days for driver {request.driver_id} (feedback: no time)")
+
+        logger.info(f"Trial feedback received: driver={request.driver_id}, reason={request.reason}")
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Trial feedback error: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error saving feedback")
 
 
 # === MAIN ===

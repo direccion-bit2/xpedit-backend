@@ -1125,3 +1125,69 @@ def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> d
         return {"success": True, "id": response["id"]}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str) -> dict:
+    """Email de feedback post-trial: se envia 8 dias despues de expirar el trial.
+    Pregunta al usuario por que no continuo con 4 opciones de 1 click."""
+    user_name = html_escape(user_name or "")
+    base_url = "https://www.xpedit.es/feedback"
+
+    buttons = [
+        ("El precio es demasiado alto", "price", "#ef4444"),
+        ("Me falta una funci&oacute;n que necesito", "feature", "#f59e0b"),
+        ("No tuve tiempo de probarlo bien", "time", "#3b82f6"),
+        ("Us&eacute; otra app", "competitor", "#8b5cf6"),
+    ]
+
+    buttons_html = ""
+    for label, reason, color in buttons:
+        link = f"{base_url}?reason={reason}&driver={driver_id}"
+        buttons_html += f"""
+        <tr>
+            <td style="padding: 6px 0;">
+                <a href="{link}" style="display: block; background-color: {color}; color: #ffffff; text-decoration: none; padding: 14px 20px; border-radius: 8px; font-weight: 600; font-size: 15px; text-align: center;">
+                    {label}
+                </a>
+            </td>
+        </tr>
+        """
+
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 22px;">
+            Hola{(' ' + user_name) if user_name else ''},
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Tu periodo de prueba de 7 d&iacute;as de <strong>Xpedit Pro</strong> ha terminado.
+            Nos encantar&iacute;a saber por qu&eacute; no continuaste.
+        </p>
+
+        <p style="margin: 0 0 15px 0; color: #111827; font-size: 16px; font-weight: 600;">
+            Selecciona la raz&oacute;n principal (1 click):
+        </p>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 25px;">
+            {buttons_html}
+        </table>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; line-height: 1.6;">
+            Responde a este email si quieres contarnos m&aacute;s. Estamos aqu&iacute; para ayudarte.
+        </p>
+
+        <p style="margin: 20px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Xpedit &mdash; Taespack SL
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": "direccion@taespack.com",
+            "subject": "Tu prueba de Xpedit ha terminado - nos encantaria saber por que",
+            "html": get_base_template(content, "Tu opinion nos importa")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
