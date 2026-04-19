@@ -61,6 +61,7 @@ from emails import (
     send_reengagement_broadcast,
     send_referral_reward_email,
     send_social_login_broadcast,
+    send_survey_email,
     send_trial_expired_email,
     send_trial_expiring_email,
     send_trial_feedback_email,
@@ -2022,6 +2023,196 @@ async def admin_push_blast(request: AdminPushBlastRequest, user=Depends(require_
     except Exception as e:
         logger.error(f"Push blast error: {e}")
         raise HTTPException(status_code=500, detail="Error enviando push blast")
+
+
+# === SURVEY / ENGAGEMENT ENDPOINTS ===
+
+class SurveyCampaignRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    questions: list = []
+    target: str = "all"  # all, free, trial_expired, inactive, pro
+
+
+class SurveySendRequest(BaseModel):
+    campaign_id: str
+    channels: list = ["push", "email"]  # which channels to use
+
+
+@app.post("/admin/survey/create", tags=["admin", "survey"])
+async def admin_create_survey(request: SurveyCampaignRequest, user=Depends(require_admin)):
+    """Create a new survey campaign (draft status)."""
+    result = supabase.table("survey_campaigns").insert({
+        "title": request.title,
+        "description": request.description,
+        "questions": request.questions,
+        "target": request.target,
+        "status": "draft",
+    }).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create survey campaign")
+    log_audit(user["id"], "survey_create", "survey", result.data[0]["id"], {"title": request.title})
+    return {"success": True, "campaign": result.data[0]}
+
+
+@app.post("/admin/survey/send", tags=["admin", "survey"])
+async def admin_send_survey(request: SurveySendRequest, user=Depends(require_admin)):
+    """Send push + email for a survey campaign to target drivers."""
+    import asyncio
+
+    # Get campaign
+    campaign = supabase.table("survey_campaigns").select("*").eq("id", request.campaign_id).single().execute()
+    if not campaign.data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    target = campaign.data.get("target", "all")
+
+    # Get target drivers
+    query = supabase.table("drivers").select("id, name, email, push_token")
+    if target == "free":
+        query = query.is_("promo_plan", "null").is_("subscription_source", "null")
+    elif target == "trial_expired":
+        query = query.is_("promo_plan", "null").is_("subscription_source", "null")
+    elif target == "pro":
+        query = query.not_.is_("subscription_source", "null")
+    drivers_result = query.execute()
+
+    if not drivers_result.data:
+        return {"success": True, "push_sent": 0, "email_sent": 0, "message": "No matching drivers"}
+
+    drivers = drivers_result.data
+    push_sent = 0
+    push_failed = 0
+    email_sent = 0
+    email_failed = 0
+    campaign_id = request.campaign_id
+    survey_url = f"https://www.xpedit.es/survey/{campaign_id}"
+
+    # Send pushes
+    if "push" in request.channels:
+        push_targets = [d for d in drivers if d.get("push_token")]
+        if push_targets:
+            results = await asyncio.gather(*[
+                send_push_to_token(
+                    d["push_token"],
+                    "Xpedit se ha actualizado",
+                    "Hemos corregido errores y mejorado el rendimiento. Cuentanos tu experiencia en 30 seg.",
+                    data={"url": f"{survey_url}?driver={d['id']}"}
+                )
+                for d in push_targets
+            ])
+            push_sent = sum(1 for r in results if r)
+            push_failed = sum(1 for r in results if not r)
+
+    # Send emails
+    if "email" in request.channels:
+        email_targets = [d for d in drivers if d.get("email")]
+        for d in email_targets:
+            # Check email_log to avoid duplicates
+            existing = supabase.table("email_log").select("id").eq("driver_id", d["id"]).eq("type", f"survey_{campaign_id}").execute()
+            if existing.data:
+                continue
+            result = send_survey_email(d["email"], d.get("name", ""), campaign_id, d["id"])
+            if result.get("success"):
+                email_sent += 1
+                supabase.table("email_log").insert({
+                    "recipient": d["email"],
+                    "subject": "Hemos mejorado Xpedit - queremos escucharte",
+                    "type": f"survey_{campaign_id}",
+                    "status": "sent",
+                    "driver_id": d["id"],
+                    "metadata": {"campaign_id": campaign_id},
+                }).execute()
+            else:
+                email_failed += 1
+
+    # Update campaign stats
+    supabase.table("survey_campaigns").update({
+        "status": "active",
+        "push_sent_at": datetime.utcnow().isoformat() if "push" in request.channels else None,
+        "email_sent_at": datetime.utcnow().isoformat() if "email" in request.channels else None,
+        "push_sent_count": push_sent,
+        "email_sent_count": email_sent,
+    }).eq("id", campaign_id).execute()
+
+    log_audit(user["id"], "survey_send", "survey", campaign_id, {
+        "push_sent": push_sent, "push_failed": push_failed,
+        "email_sent": email_sent, "email_failed": email_failed,
+    })
+
+    return {
+        "success": True,
+        "push_sent": push_sent, "push_failed": push_failed,
+        "email_sent": email_sent, "email_failed": email_failed,
+        "total_drivers": len(drivers),
+    }
+
+
+@app.get("/admin/survey/responses/{campaign_id}", tags=["admin", "survey"])
+async def admin_get_survey_responses(campaign_id: str, user=Depends(require_admin)):
+    """Get all responses for a survey campaign with driver info."""
+    # Get campaign
+    campaign = supabase.table("survey_campaigns").select("*").eq("id", campaign_id).single().execute()
+
+    # Get responses with driver info
+    responses = supabase.table("survey_responses").select("*").eq("campaign_id", campaign_id).order("created_at", desc=True).execute()
+
+    # Enrich with driver info
+    enriched = []
+    driver_ids = [r["driver_id"] for r in (responses.data or []) if r.get("driver_id")]
+    drivers_map = {}
+    if driver_ids:
+        drivers_result = supabase.table("drivers").select("id, name, email, promo_plan, subscription_source").in_("id", driver_ids).execute()
+        drivers_map = {d["id"]: d for d in (drivers_result.data or [])}
+
+    for r in (responses.data or []):
+        driver = drivers_map.get(r.get("driver_id"), {})
+        enriched.append({
+            **r,
+            "driver_name": driver.get("name", "Anonimo"),
+            "driver_email": driver.get("email"),
+            "driver_plan": driver.get("subscription_source") or driver.get("promo_plan") or "free",
+        })
+
+    # Aggregate stats
+    answers = [r.get("answers", {}) for r in (responses.data or [])]
+    q1_counts = {}
+    q2_counts = {}
+    ratings = []
+    for a in answers:
+        q1 = a.get("why_not_using")
+        q2 = a.get("what_would_convert")
+        if q1:
+            q1_counts[q1] = q1_counts.get(q1, 0) + 1
+        if q2:
+            q2_counts[q2] = q2_counts.get(q2, 0) + 1
+    for r in (responses.data or []):
+        if r.get("rating"):
+            ratings.append(r["rating"])
+
+    return {
+        "campaign": campaign.data,
+        "responses": enriched,
+        "stats": {
+            "total_responses": len(responses.data or []),
+            "avg_rating": round(sum(ratings) / len(ratings), 1) if ratings else None,
+            "q1_breakdown": q1_counts,
+            "q2_breakdown": q2_counts,
+        },
+    }
+
+
+@app.get("/admin/survey/campaigns", tags=["admin", "survey"])
+async def admin_list_campaigns(user=Depends(require_admin)):
+    """List all survey campaigns with response counts."""
+    campaigns = supabase.table("survey_campaigns").select("*").order("created_at", desc=True).execute()
+
+    result = []
+    for c in (campaigns.data or []):
+        count = supabase.table("survey_responses").select("id", count="exact").eq("campaign_id", c["id"]).execute()
+        result.append({**c, "response_count": count.count or 0})
+
+    return {"campaigns": result}
 
 
 # === PROMO CODE MODELS ===

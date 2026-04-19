@@ -1191,3 +1191,69 @@ def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str) -> 
         return {"success": True, "id": response["id"]}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def send_survey_email(to_email: str, user_name: str, campaign_id: str, driver_id: str) -> dict:
+    """Email de encuesta con mejoras + link a survey page."""
+    user_name = html_escape(user_name or "")
+    survey_url = f"https://www.xpedit.es/survey/{campaign_id}?driver={driver_id}"
+
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 22px;">
+            Hola{(' ' + user_name) if user_name else ''}, hemos mejorado Xpedit
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            En las &uacute;ltimas semanas hemos trabajado en mejorar Xpedit bas&aacute;ndonos en lo que nos hab&eacute;is contado:
+        </p>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 20px;">
+            <tr><td style="padding: 8px 0 8px 0; color: #374151; font-size: 15px;">
+                &#10003;&nbsp; Corregido el inicio de sesi&oacute;n con Google
+            </td></tr>
+            <tr><td style="padding: 8px 0 8px 0; color: #374151; font-size: 15px;">
+                &#10003;&nbsp; Mejorada la estabilidad general (menos cierres inesperados)
+            </td></tr>
+            <tr><td style="padding: 8px 0 8px 0; color: #374151; font-size: 15px;">
+                &#10003;&nbsp; Mejor rendimiento del GPS y navegaci&oacute;n
+            </td></tr>
+            <tr><td style="padding: 8px 0 8px 0; color: #374151; font-size: 15px;">
+                &#10003;&nbsp; Nuevas funciones: reordenar paradas, marcador de fin de ruta
+            </td></tr>
+        </table>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            <strong>Queremos seguir mejorando para ti.</strong> &iquest;Nos das 30 segundos para contarnos tu experiencia?
+        </p>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 25px;">
+            <tr>
+                <td style="padding: 6px 0; text-align: center;">
+                    <a href="{survey_url}" style="display: inline-block; background-color: #3b82f6; color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 700; font-size: 16px;">
+                        Responder encuesta (30 seg)
+                    </a>
+                </td>
+            </tr>
+        </table>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; line-height: 1.6;">
+            Tambi&eacute;n puedes escribirnos directamente respondiendo a este email.
+        </p>
+
+        <p style="margin: 20px 0 0 0; color: #4b5563; font-size: 14px;">
+            Gracias por usar Xpedit,<br>
+            <strong>Miguel</strong> &mdash; Fundador de Xpedit
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": "direccion@taespack.com",
+            "subject": "Hemos mejorado Xpedit - queremos escucharte",
+            "html": get_base_template(content, "Tu opinion nos importa")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
