@@ -6040,57 +6040,31 @@ def compute_daily_health_digest() -> dict:
         "status": "ok" if active_24h > 0 else "warn",
     })
 
-    # 5. Google Sign-In — Android (okhttp user_agent) last 7d — CRITICAL regression detector
+    # 5-6. Google Sign-In — Android vs iOS (7d) via public.google_signin_stats RPC
+    # (auth schema is not exposed to PostgREST, so we use a SECURITY DEFINER function).
+    android_google_count = 0
+    ios_google_count = 0
     try:
-        sessions_android_google = supabase.schema("auth").table("sessions").select(
-            "id, user_agent, user_id, users!inner(raw_app_meta_data)", count="exact"
-        ).ilike("user_agent", "%okhttp%").gte("created_at", last_7d).execute()
-        # Filter server-side by Google provider (RLS friendly)
-        android_google_count = 0
-        for s in (sessions_android_google.data or []):
-            user = s.get("users") or {}
-            meta = user.get("raw_app_meta_data") or {}
-            if meta.get("provider") == "google":
-                android_google_count += 1
+        stats_res = supabase.rpc("google_signin_stats", {"since_ts": last_7d}).execute()
+        if stats_res.data:
+            row = stats_res.data[0] if isinstance(stats_res.data, list) else stats_res.data
+            android_google_count = row.get("android_count", 0) or 0
+            ios_google_count = row.get("ios_count", 0) or 0
     except Exception as e:
-        logger.warning(f"Health digest android google sessions failed: {e}")
-        android_google_count = 0
-    note = ""
-    status = "ok"
-    if android_google_count == 0:
-        # This is the exact regression that slipped 20 days (22 Apr 2026).
-        status = "bad"
-        note = "0 logins Google Android en 7 dias. Revisar Google Cloud OAuth + webClientId."
+        logger.warning(f"Health digest google_signin_stats RPC failed: {e}")
+
+    android_status = "bad" if android_google_count == 0 else "ok"
+    android_note = (
+        "0 logins Google Android en 7 dias. Revisar Google Cloud OAuth + webClientId."
+        if android_google_count == 0 else ""
+    )
     metrics.append({
         "label": "Google Sign-In Android (7d)",
         "value": android_google_count,
         "baseline": None,
-        "status": status,
-        "note": note,
+        "status": android_status,
+        "note": android_note,
     })
-
-    # 6. Google Sign-In — iOS (non-okhttp, google provider) last 7d
-    try:
-        google_users = supabase.schema("auth").table("users").select(
-            "id"
-        ).filter("raw_app_meta_data->>provider", "eq", "google").execute()
-        google_user_ids = [u["id"] for u in (google_users.data or [])]
-        ios_google_count = 0
-        if google_user_ids:
-            # Chunk to avoid URL too long
-            chunk = 200
-            for i in range(0, len(google_user_ids), chunk):
-                ids_chunk = google_user_ids[i:i + chunk]
-                res = supabase.schema("auth").table("sessions").select("id, user_agent", count="exact").in_(
-                    "user_id", ids_chunk
-                ).gte("created_at", last_7d).execute()
-                for s in (res.data or []):
-                    ua = (s.get("user_agent") or "").lower()
-                    if "okhttp" not in ua:
-                        ios_google_count += 1
-    except Exception as e:
-        logger.warning(f"Health digest ios google sessions failed: {e}")
-        ios_google_count = 0
     metrics.append({
         "label": "Google Sign-In iOS (7d)",
         "value": ios_google_count,
@@ -6109,24 +6083,51 @@ def compute_daily_health_digest() -> dict:
         "status": _status_from_value(trial_claims_24h, base_trials, min_expected=1),
     })
 
-    # 8. Conversions (drivers with paid subscription_source set) last 7d
+    # 8. Paid users — use daily_metrics_snapshot for 7d delta (drivers table has no updated_at)
+    paid_today = 0
+    paid_7d_ago = 0
     try:
-        conversions_7d_res = (
-            supabase.table("drivers")
-            .select("id", count="exact")
-            .in_("subscription_source", ["revenuecat", "stripe"])
-            .gte("updated_at", last_7d)
+        today_snap = (
+            supabase.table("daily_metrics_snapshot")
+            .select("paid_users")
+            .order("snapshot_date", desc=True)
+            .limit(1)
             .execute()
         )
-        conversions_7d = conversions_7d_res.count or 0
-    except Exception:
-        conversions_7d = 0
+        if today_snap.data:
+            paid_today = today_snap.data[0].get("paid_users", 0) or 0
+
+        cutoff_date = (now_utc - timedelta(days=7)).date().isoformat()
+        old_snap = (
+            supabase.table("daily_metrics_snapshot")
+            .select("paid_users")
+            .lte("snapshot_date", cutoff_date)
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if old_snap.data:
+            paid_7d_ago = old_snap.data[0].get("paid_users", 0) or 0
+    except Exception as e:
+        logger.warning(f"Health digest paid users snapshot failed: {e}")
+
+    conversions_delta = paid_today - paid_7d_ago
+    if conversions_delta > 0:
+        conv_status = "ok"
+        conv_note = ""
+    elif conversions_delta == 0:
+        conv_status = "warn"
+        conv_note = "Sin nuevas conversiones esta semana."
+    else:
+        conv_status = "bad"
+        conv_note = f"Han cancelado {abs(conversions_delta)} suscripcion(es) esta semana."
+
     metrics.append({
-        "label": "Conversiones a Pro (7d)",
-        "value": conversions_7d,
+        "label": "Paid users totales",
+        "value": f"{paid_today} (delta 7d: {conversions_delta:+d})",
         "baseline": None,
-        "status": "ok" if conversions_7d > 0 else "warn",
-        "note": "Sin conversiones esta semana." if conversions_7d == 0 else "",
+        "status": conv_status,
+        "note": conv_note,
     })
 
     # 9. Backend self-health
