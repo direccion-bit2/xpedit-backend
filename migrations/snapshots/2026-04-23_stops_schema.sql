@@ -1,0 +1,35 @@
+-- Snapshot of public.stops schema taken 2026-04-23 before adding
+-- stop_status_events audit table and server-side completed_at trigger.
+--
+-- Captured via Supabase MCP. Purpose: reference point for rollback.
+
+-- COLUMNS (21 total)
+-- id                   uuid
+-- route_id             uuid
+-- address              text
+-- lat                  numeric
+-- lng                  numeric
+-- position             integer
+-- notes                text
+-- phone                text
+-- status               text      -- 'pending' | 'completed' | 'failed'
+-- completed_at         timestamptz
+-- created_at           timestamptz
+-- proof_photo          text
+-- has_proof            boolean
+-- time_window_start    time
+-- time_window_end      time
+-- packages             integer
+-- email                text
+-- auto_completed       boolean
+-- color                varchar
+-- opening_hours        text
+-- name                 text
+
+-- TRIGGERS: none
+
+-- INDEXES
+-- stops_pkey (id)
+-- idx_stops_route_id
+-- idx_stops_time_window
+-- idx_stops_created_at
