@@ -4758,17 +4758,35 @@ async def places_directions(
     destination: str,
     waypoints: Optional[str] = None,
     avoid: Optional[str] = None,
+    heading: Optional[float] = None,
     user=Depends(get_current_user)
 ):
-    """Proxy de Google Directions API. Devuelve polylines y pasos de navegación."""
+    """Proxy de Google Directions API. Devuelve polylines y pasos de navegación.
+
+    Si `heading` (0-360) viene, inserta un micro-waypoint ~50 m delante del coche
+    en esa dirección. Así el rerouting no propone giros bruscos hacia atrás.
+    """
     params = {
         "origin": origin,
         "destination": destination,
         "key": GOOGLE_API_KEY,
         "language": "es",
     }
-    if waypoints:
-        params["waypoints"] = waypoints
+    extra_wp = ""
+    if heading is not None and "," in origin:
+        try:
+            lat_str, lng_str = origin.split(",", 1)
+            lat, lng = float(lat_str), float(lng_str)
+            h = math.radians(heading % 360)
+            # ~50 m ahead in the driver's facing direction (good enough for routing)
+            dlat = (50 * math.cos(h)) / 111320.0
+            dlng = (50 * math.sin(h)) / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
+            extra_wp = f"via:{lat + dlat:.6f},{lng + dlng:.6f}"
+        except Exception as e:
+            logger.warning(f"heading waypoint skipped: {e}")
+    combined_waypoints = "|".join(p for p in [extra_wp, waypoints] if p)
+    if combined_waypoints:
+        params["waypoints"] = combined_waypoints
     if avoid:
         params["avoid"] = avoid
     async with httpx.AsyncClient(timeout=10) as client:
