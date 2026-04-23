@@ -204,8 +204,51 @@ def enrich_stops_from_directory(company_id: str, stops: list[dict]) -> tuple[lis
     return stops, match_count
 
 
-# Webhook idempotency (in-memory, ordered for LRU eviction)
+# Webhook idempotency. The in-memory dict stays as a fast-path cache
+# (avoids a DB round-trip when the same event reaches us multiple times
+# within one process lifetime). The persistent source of truth is the
+# processed_webhooks table, which survives Railway restarts — before
+# this table, a redeploy in the middle of a retry storm could re-process
+# the same Stripe/RevenueCat event.
 _processed_webhook_events: dict = {}
+
+
+def _is_webhook_processed(event_id: str, provider: str) -> bool:
+    """True if this event has already been handled (memory OR DB)."""
+    if not event_id:
+        return False
+    if event_id in _processed_webhook_events:
+        return True
+    try:
+        existing = supabase.table("processed_webhooks").select("event_id").eq("event_id", event_id).limit(1).execute()
+        if existing.data:
+            # Populate memory cache so subsequent in-process lookups skip DB.
+            _processed_webhook_events[event_id] = True
+            return True
+    except Exception as e:
+        # Don't block on a DB hiccup; fall back to in-memory behaviour.
+        logger.warning(f"_is_webhook_processed DB check failed: {e}")
+    return False
+
+
+def _mark_webhook_processed(event_id: str, provider: str) -> None:
+    """Record that we handled this event in both memory and DB."""
+    if not event_id:
+        return
+    _processed_webhook_events[event_id] = True
+    if len(_processed_webhook_events) > 10000:
+        to_remove = list(_processed_webhook_events.keys())[:5000]
+        for k in to_remove:
+            del _processed_webhook_events[k]
+    try:
+        supabase.table("processed_webhooks").insert({
+            "event_id": event_id,
+            "provider": provider,
+        }).execute()
+    except Exception as e:
+        # Insert can fail if another instance processed the same event in
+        # parallel (PK collision). That's fine — idempotency holds.
+        logger.info(f"_mark_webhook_processed insert note: {e}")
 
 # Stripe webhook monitoring
 _last_stripe_webhook_ok: Optional[datetime] = None
@@ -4204,16 +4247,10 @@ async def stripe_webhook(request: Request):
 
     event_type = event.type
     event_id = event.get("id") if isinstance(event, dict) else getattr(event, "id", None)
-    if event_id in _processed_webhook_events:
+    if _is_webhook_processed(event_id, "stripe"):
         logger.info(f"Stripe webhook already processed event: {event_id}")
         return {"received": True, "status": "already_processed"}
-    if event_id:
-        _processed_webhook_events[event_id] = True
-    # LRU eviction: keep newest 5000 instead of clearing all
-    if len(_processed_webhook_events) > 10000:
-        to_remove = list(_processed_webhook_events.keys())[:5000]
-        for k in to_remove:
-            del _processed_webhook_events[k]
+    _mark_webhook_processed(event_id, "stripe")
 
     logger.info(f"Stripe webhook received event: {event_type}")
 
@@ -4385,16 +4422,12 @@ async def revenuecat_webhook(request: Request):
     entitlement_ids = event.get("entitlement_ids") or []
     expiration_at = event.get("expiration_at_ms")
 
-    # Idempotency (with LRU eviction to prevent memory growth)
+    # Idempotency: persistent check first (survives Railway restarts),
+    # memory cache inside the helper for hot paths.
     event_id = event.get("id", "")
-    if event_id and event_id in _processed_webhook_events:
+    if _is_webhook_processed(event_id, "revenuecat"):
         return {"received": True, "status": "already_processed"}
-    if event_id:
-        _processed_webhook_events[event_id] = True
-        if len(_processed_webhook_events) > 10000:
-            to_remove = list(_processed_webhook_events.keys())[:5000]
-            for k in to_remove:
-                del _processed_webhook_events[k]
+    _mark_webhook_processed(event_id, "revenuecat")
 
     logger.info(f"RevenueCat webhook: type={event_type}, driver_id={app_user_id}, product={product_id}, entitlements={entitlement_ids}")
 

@@ -165,7 +165,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {"evt_dup": True}):
+             patch("main._is_webhook_processed", return_value=True), patch("main._mark_webhook_processed"):
 
             mock_data_obj = MagicMock()
             mock_data_obj.client_reference_id = FAKE_USER_ID
@@ -193,7 +193,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}):
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"):
 
             mock_data_obj = MagicMock()
             mock_data_obj.customer = "cus_renew"
@@ -230,7 +230,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}):
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"):
 
             mock_data_obj = MagicMock()
             mock_data_obj.customer = "cus_new"
@@ -256,7 +256,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}), \
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"), \
              patch("main.sentry_sdk") as mock_sentry, \
              patch("main.send_alert_email") as mock_alert:
 
@@ -286,7 +286,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}), \
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"), \
              patch("main.sentry_sdk") as mock_sentry, \
              patch("main.send_alert_email") as mock_alert:
 
@@ -314,7 +314,7 @@ class TestStripeWebhookExtended:
         """Unhandled event types are silently accepted."""
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
-             patch("main._processed_webhook_events", {}):
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"):
 
             mock_event = MagicMock()
             mock_event.type = "payment_intent.created"
@@ -337,7 +337,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}):
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"):
 
             mock_data_obj = MagicMock()
             mock_data_obj.client_reference_id = None
@@ -366,7 +366,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}):
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"):
 
             mock_data_obj = MagicMock()
             mock_data_obj.customer = "cus_unknown"
@@ -400,7 +400,7 @@ class TestStripeWebhookExtended:
         with patch("main.STRIPE_WEBHOOK_SECRET", "whsec_test"), \
              patch("main.stripe") as mock_stripe, \
              patch("main.supabase") as mock_sb, \
-             patch("main._processed_webhook_events", {}), \
+             patch("main._is_webhook_processed", return_value=False), patch("main._mark_webhook_processed"), \
              patch("main.sentry_sdk") as mock_sentry:
 
             mock_data_obj = MagicMock()

@@ -76,7 +76,7 @@ class TestRevenueCatWebhook:
         """Same event.id twice → second response is 'already_processed'.
         Guards against RevenueCat retry storms charging Pro twice."""
         with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
-             patch("main._processed_webhook_events", {"evt-dup": True}), \
+             patch("main._is_webhook_processed", return_value=True), \
              patch("main.supabase") as mock_sb:
             # If the second call leaks through, this would be called — we
             # verify it is NOT by asserting the shortcut response below.
@@ -93,7 +93,8 @@ class TestRevenueCatWebhook:
         """Happy path: valid event → drivers.update writes promo_plan=pro
         with subscription_source=revenuecat."""
         with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
-             patch("main._processed_webhook_events", {}), \
+             patch("main._is_webhook_processed", return_value=False), \
+             patch("main._mark_webhook_processed"), \
              patch("main.supabase") as mock_sb:
             mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[{"id": "driver-xyz"}])
             driver_lookup = MagicMock()
@@ -117,7 +118,8 @@ class TestRevenueCatWebhook:
         event = _purchase_event(event_id="evt-exp-1")
         event["event"]["type"] = "EXPIRATION"
         with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
-             patch("main._processed_webhook_events", {}), \
+             patch("main._is_webhook_processed", return_value=False), \
+             patch("main._mark_webhook_processed"), \
              patch("main.supabase") as mock_sb:
             mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[{"id": "driver-xyz"}])
             driver_lookup = MagicMock()
