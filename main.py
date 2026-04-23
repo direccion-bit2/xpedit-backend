@@ -6203,6 +6203,103 @@ async def admin_health_digest(user=Depends(require_admin)):
     return {"success": True, "digest": digest, "sent_to": sent_to}
 
 
+@app.get("/admin/trials-expiring", tags=["admin"], summary="Trials expirando proximos N dias")
+async def admin_trials_expiring(days: int = 7, user=Depends(require_admin)):
+    """Devuelve drivers cuyo trial Pro expira en los proximos N dias (1-30).
+
+    Incluye email, telefono, stops y rutas ultimos 7 dias para priorizar
+    a quien contactar. Ordenados por fecha de expiracion ascendente.
+    Excluye drivers ambassador y los ya suscritos via RevenueCat/Stripe.
+    """
+    days = max(1, min(30, days))
+    now = datetime.now(timezone.utc)
+    window_start = now.isoformat()
+    window_end = (now + timedelta(days=days)).isoformat()
+    last_7d = (now - timedelta(days=7)).isoformat()
+
+    try:
+        drivers_res = (
+            supabase.table("drivers")
+            .select("id, email, name, phone, promo_plan, promo_plan_expires_at, subscription_source, created_at")
+            .in_("promo_plan", ["pro", "pro_plus"])
+            .is_("subscription_source", "null")
+            .not_.is_("email", "null")
+            .not_.is_("promo_plan_expires_at", "null")
+            .gte("promo_plan_expires_at", window_start)
+            .lte("promo_plan_expires_at", window_end)
+            .order("promo_plan_expires_at", desc=False)
+            .execute()
+        )
+        drivers = drivers_res.data or []
+
+        if not drivers:
+            return {"success": True, "count": 0, "drivers": []}
+
+        driver_ids = [d["id"] for d in drivers]
+
+        # Aggregate routes + stops per driver last 7 days (one query each, then bucket in Python)
+        routes_res = (
+            supabase.table("routes")
+            .select("id, driver_id")
+            .in_("driver_id", driver_ids)
+            .gte("created_at", last_7d)
+            .execute()
+        )
+        routes_by_driver: dict = {}
+        route_ids_by_driver: dict = {}
+        for r in (routes_res.data or []):
+            did = r.get("driver_id")
+            if not did:
+                continue
+            routes_by_driver[did] = routes_by_driver.get(did, 0) + 1
+            route_ids_by_driver.setdefault(did, []).append(r["id"])
+
+        # Count stops per driver by joining via route_id
+        all_route_ids = [rid for ids in route_ids_by_driver.values() for rid in ids]
+        stops_by_driver: dict = {}
+        if all_route_ids:
+            stops_res = (
+                supabase.table("stops")
+                .select("id, route_id")
+                .in_("route_id", all_route_ids)
+                .gte("created_at", last_7d)
+                .execute()
+            )
+            route_to_driver = {rid: did for did, ids in route_ids_by_driver.items() for rid in ids}
+            for s in (stops_res.data or []):
+                did = route_to_driver.get(s.get("route_id"))
+                if did:
+                    stops_by_driver[did] = stops_by_driver.get(did, 0) + 1
+
+        enriched = []
+        for d in drivers:
+            try:
+                expires_at = datetime.fromisoformat(d["promo_plan_expires_at"].replace("Z", "+00:00"))
+                hours_left = (expires_at - now).total_seconds() / 3600.0
+                days_left = hours_left / 24.0
+            except Exception:
+                days_left = None
+            enriched.append({
+                "driver_id": d["id"],
+                "email": d.get("email"),
+                "name": d.get("name"),
+                "phone": d.get("phone"),
+                "promo_plan": d.get("promo_plan"),
+                "promo_plan_expires_at": d.get("promo_plan_expires_at"),
+                "days_left": round(days_left, 2) if days_left is not None else None,
+                "created_at": d.get("created_at"),
+                "stops_7d": stops_by_driver.get(d["id"], 0),
+                "routes_7d": routes_by_driver.get(d["id"], 0),
+            })
+
+        return {"success": True, "count": len(enriched), "days": days, "drivers": enriched}
+    except Exception as e:
+        logger.error(f"/admin/trials-expiring failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Error fetching expiring trials")
+
+
 # Track server start time for uptime
 _server_start_time = datetime.now(timezone.utc)
 
