@@ -4231,10 +4231,14 @@ async def stripe_webhook(request: Request):
 
             if user_id:
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-                # Update drivers table (if user has a linked driver)
+                # Update drivers table (if user has a linked driver).
+                # subscription_source='stripe' so getSubscriptionStatus can
+                # distinguish a paid subscription from a promo/trial — the
+                # TP-2 fix on the client side relies on this being set.
                 supabase.table("drivers").update({
                     "promo_plan": plan,
                     "promo_plan_expires_at": expires_at,
+                    "subscription_source": "stripe",
                 }).eq("user_id", user_id).execute()
                 # Update users table (plan + stripe customer id)
                 supabase.table("users").update({
@@ -4243,6 +4247,44 @@ async def stripe_webhook(request: Request):
                     "promo_plan_expires_at": expires_at,
                 }).eq("id", user_id).execute()
                 logger.info(f"Stripe plan {plan} activated for user {user_id}")
+
+        elif event_type == "customer.subscription.updated":
+            # Plan change mid-cycle (upgrade / downgrade / cancellation at
+            # period end). Without this handler, the new plan was never
+            # reflected in drivers.promo_plan — a user who upgraded via
+            # the Stripe Customer Portal would still see their old plan.
+            customer_id = getattr(data_obj, "customer", None)
+            status = getattr(data_obj, "status", None)
+            current_period_end = getattr(data_obj, "current_period_end", None)
+            items = getattr(data_obj, "items", None)
+            new_plan = None
+            try:
+                # items.data[0].price.id → map to our plan names
+                price_id = items.data[0].price.id if items and items.data else None
+                if price_id and STRIPE_PLANS:
+                    for plan_name, plan_cfg in STRIPE_PLANS.items():
+                        if plan_cfg.get("price_id") == price_id:
+                            new_plan = plan_name
+                            break
+            except Exception:
+                pass
+            if customer_id and status in ("active", "trialing") and new_plan:
+                expires_at = None
+                if current_period_end:
+                    expires_at = datetime.fromtimestamp(current_period_end, tz=timezone.utc).isoformat()
+                user_result = supabase.table("users").select("id").eq("stripe_customer_id", customer_id).limit(1).execute()
+                if user_result.data:
+                    user_id = user_result.data[0]["id"]
+                    supabase.table("drivers").update({
+                        "promo_plan": new_plan,
+                        "promo_plan_expires_at": expires_at,
+                        "subscription_source": "stripe",
+                    }).eq("user_id", user_id).execute()
+                    supabase.table("users").update({
+                        "promo_plan": new_plan,
+                        "promo_plan_expires_at": expires_at,
+                    }).eq("id", user_id).execute()
+                    logger.info(f"Stripe subscription updated for user {user_id} → plan={new_plan}")
 
         elif event_type == "customer.subscription.deleted":
             customer_id = getattr(data_obj, "customer", None)
@@ -4253,6 +4295,7 @@ async def stripe_webhook(request: Request):
                     supabase.table("drivers").update({
                         "promo_plan": None,
                         "promo_plan_expires_at": None,
+                        "subscription_source": None,
                     }).eq("user_id", user_id).execute()
                     supabase.table("users").update({
                         "promo_plan": None,
