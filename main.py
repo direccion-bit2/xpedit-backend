@@ -5593,7 +5593,10 @@ async def health_check():
 
     # Min app version — set to >0 to force users on old builds to update from store
     # e.g. {"android": 27, "ios": 38} to require builds 27+ and 38+
-    checks["min_app_version"] = {"android": 0, "ios": 0}
+    # iOS=45 (23 Apr 2026): bN45 contains the AIRGoogleMap nil-guard patch
+    # (PR #5873). Older builds (bN39 etc.) crash with REACT-NATIVE-17 on
+    # any re-render that touches MapView children — force the App Store update.
+    checks["min_app_version"] = {"android": 0, "ios": 45}
 
     status_code = 200 if healthy else 503
     from fastapi.responses import JSONResponse
