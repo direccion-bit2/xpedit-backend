@@ -6046,6 +6046,40 @@ def compute_daily_health_digest() -> dict:
         "status": _status_from_value(stops_24h, base_stops, min_expected=20),
     })
 
+    # 3b. Stop processing rate (completed+failed / total created 24h).
+    # Guards against the April 2026 silent sync bug where 93% of stops stayed
+    # "pending" in DB. A healthy day is >= 50%. Below 30% is likely broken sync.
+    stops_processed_24h = 0
+    try:
+        processed_res = (
+            supabase.table("stops")
+            .select("id", count="exact")
+            .in_("status", ["completed", "failed"])
+            .gte("created_at", last_24h)
+            .execute()
+        )
+        stops_processed_24h = processed_res.count or 0
+    except Exception as e:
+        logger.warning(f"Health digest stops processed count failed: {e}")
+    if stops_24h > 0:
+        processing_rate = 100.0 * stops_processed_24h / stops_24h
+        if processing_rate < 30:
+            rate_status = "bad"
+            rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
+        elif processing_rate < 50:
+            rate_status = "warn"
+            rate_note = "Tasa de procesamiento por debajo del objetivo (50%)."
+        else:
+            rate_status = "ok"
+            rate_note = ""
+        metrics.append({
+            "label": "Paradas procesadas (24h)",
+            "value": f"{stops_processed_24h}/{stops_24h} ({processing_rate:.0f}%)",
+            "baseline": "objetivo >=50%",
+            "status": rate_status,
+            "note": rate_note,
+        })
+
     # 4. Active drivers 24h (drivers who created at least one route)
     try:
         active_rows = (
