@@ -53,6 +53,7 @@ from emails import (
     send_alert_email,
     send_broadcast_email,
     send_custom_email,
+    send_daily_health_digest_email,
     send_daily_summary_email,
     send_delivery_completed_email,
     send_delivery_failed_email,
@@ -5933,6 +5934,256 @@ async def send_trial_feedback_emails():
             sentry_sdk.capture_exception(e)
 
 
+# ============================================================
+# Daily Health Digest — detects silent regressions automatically
+# ============================================================
+
+HEALTH_DIGEST_RECIPIENTS = [
+    e.strip() for e in os.getenv("HEALTH_DIGEST_TO", "direccion@taespack.com").split(",") if e.strip()
+]
+
+
+def _status_from_value(value: int, baseline: float, min_expected: float = 1.0) -> str:
+    """Classify a metric based on value vs baseline.
+
+    - "bad": value is 0 AND baseline was meaningfully above min_expected (silent regression).
+    - "warn": value is well below baseline (< 50%) but not zero.
+    - "ok": within normal range.
+    """
+    if baseline < min_expected:
+        # Not enough baseline to judge — treat as OK
+        return "ok"
+    if value == 0:
+        return "bad"
+    if value < baseline * 0.5:
+        return "warn"
+    return "ok"
+
+
+def compute_daily_health_digest() -> dict:
+    """Collect the key daily metrics. Returns a dict ready for the email template.
+
+    Each metric: {label, value, baseline, status, note}
+    status: "ok" | "warn" | "bad"
+    """
+    madrid = ZoneInfo("Europe/Madrid")
+    now_local = datetime.now(madrid)
+    date_str = now_local.strftime("%d %b %Y")
+
+    now_utc = datetime.now(timezone.utc)
+    last_24h = (now_utc - timedelta(hours=24)).isoformat()
+    last_7d = (now_utc - timedelta(days=7)).isoformat()
+
+    def count(table: str, filters: list, timestamp_col: str, since: str) -> int:
+        q = supabase.table(table).select("id", count="exact")
+        for f in filters:
+            col, op, val = f
+            q = getattr(q, op)(col, val) if val is not None else getattr(q, op)(col)
+        q = q.gte(timestamp_col, since)
+        try:
+            return q.execute().count or 0
+        except Exception as e:
+            logger.warning(f"Health digest count failed [{table}]: {e}")
+            return 0
+
+    def baseline_avg(count_7d: int, count_24h: int) -> float:
+        # 6 previous days average (exclude today)
+        return max(0.0, (count_7d - count_24h) / 6.0)
+
+    metrics: list[dict] = []
+
+    # 1. Signups (new drivers) 24h vs 6d baseline
+    signups_24h = count("drivers", [], "created_at", last_24h)
+    signups_7d = count("drivers", [], "created_at", last_7d)
+    base_signups = baseline_avg(signups_7d, signups_24h)
+    metrics.append({
+        "label": "Nuevos registros (24h)",
+        "value": signups_24h,
+        "baseline": round(base_signups, 1),
+        "status": _status_from_value(signups_24h, base_signups, min_expected=2),
+    })
+
+    # 2. Routes created 24h
+    routes_24h = count("routes", [], "created_at", last_24h)
+    routes_7d = count("routes", [], "created_at", last_7d)
+    base_routes = baseline_avg(routes_7d, routes_24h)
+    metrics.append({
+        "label": "Rutas creadas (24h)",
+        "value": routes_24h,
+        "baseline": round(base_routes, 1),
+        "status": _status_from_value(routes_24h, base_routes, min_expected=3),
+    })
+
+    # 3. Stops created 24h
+    stops_24h = count("stops", [], "created_at", last_24h)
+    stops_7d = count("stops", [], "created_at", last_7d)
+    base_stops = baseline_avg(stops_7d, stops_24h)
+    metrics.append({
+        "label": "Paradas creadas (24h)",
+        "value": stops_24h,
+        "baseline": round(base_stops, 1),
+        "status": _status_from_value(stops_24h, base_stops, min_expected=20),
+    })
+
+    # 4. Active drivers 24h (drivers who created at least one route)
+    try:
+        active_rows = (
+            supabase.table("routes").select("driver_id").gte("created_at", last_24h).execute()
+        )
+        active_24h = len({r["driver_id"] for r in (active_rows.data or []) if r.get("driver_id")})
+    except Exception:
+        active_24h = 0
+    metrics.append({
+        "label": "Drivers activos (24h)",
+        "value": active_24h,
+        "baseline": None,
+        "status": "ok" if active_24h > 0 else "warn",
+    })
+
+    # 5. Google Sign-In — Android (okhttp user_agent) last 7d — CRITICAL regression detector
+    try:
+        sessions_android_google = supabase.schema("auth").table("sessions").select(
+            "id, user_agent, user_id, users!inner(raw_app_meta_data)", count="exact"
+        ).ilike("user_agent", "%okhttp%").gte("created_at", last_7d).execute()
+        # Filter server-side by Google provider (RLS friendly)
+        android_google_count = 0
+        for s in (sessions_android_google.data or []):
+            user = s.get("users") or {}
+            meta = user.get("raw_app_meta_data") or {}
+            if meta.get("provider") == "google":
+                android_google_count += 1
+    except Exception as e:
+        logger.warning(f"Health digest android google sessions failed: {e}")
+        android_google_count = 0
+    note = ""
+    status = "ok"
+    if android_google_count == 0:
+        # This is the exact regression that slipped 20 days (22 Apr 2026).
+        status = "bad"
+        note = "0 logins Google Android en 7 dias. Revisar Google Cloud OAuth + webClientId."
+    metrics.append({
+        "label": "Google Sign-In Android (7d)",
+        "value": android_google_count,
+        "baseline": None,
+        "status": status,
+        "note": note,
+    })
+
+    # 6. Google Sign-In — iOS (non-okhttp, google provider) last 7d
+    try:
+        google_users = supabase.schema("auth").table("users").select(
+            "id"
+        ).filter("raw_app_meta_data->>provider", "eq", "google").execute()
+        google_user_ids = [u["id"] for u in (google_users.data or [])]
+        ios_google_count = 0
+        if google_user_ids:
+            # Chunk to avoid URL too long
+            chunk = 200
+            for i in range(0, len(google_user_ids), chunk):
+                ids_chunk = google_user_ids[i:i + chunk]
+                res = supabase.schema("auth").table("sessions").select("id, user_agent", count="exact").in_(
+                    "user_id", ids_chunk
+                ).gte("created_at", last_7d).execute()
+                for s in (res.data or []):
+                    ua = (s.get("user_agent") or "").lower()
+                    if "okhttp" not in ua:
+                        ios_google_count += 1
+    except Exception as e:
+        logger.warning(f"Health digest ios google sessions failed: {e}")
+        ios_google_count = 0
+    metrics.append({
+        "label": "Google Sign-In iOS (7d)",
+        "value": ios_google_count,
+        "baseline": None,
+        "status": "ok" if ios_google_count > 0 else "warn",
+    })
+
+    # 7. Trial claims 24h
+    trial_claims_24h = count("trial_claims", [], "claimed_at", last_24h)
+    trial_claims_7d = count("trial_claims", [], "claimed_at", last_7d)
+    base_trials = baseline_avg(trial_claims_7d, trial_claims_24h)
+    metrics.append({
+        "label": "Trials nuevos (24h)",
+        "value": trial_claims_24h,
+        "baseline": round(base_trials, 1),
+        "status": _status_from_value(trial_claims_24h, base_trials, min_expected=1),
+    })
+
+    # 8. Conversions (drivers with paid subscription_source set) last 7d
+    try:
+        conversions_7d_res = (
+            supabase.table("drivers")
+            .select("id", count="exact")
+            .in_("subscription_source", ["revenuecat", "stripe"])
+            .gte("updated_at", last_7d)
+            .execute()
+        )
+        conversions_7d = conversions_7d_res.count or 0
+    except Exception:
+        conversions_7d = 0
+    metrics.append({
+        "label": "Conversiones a Pro (7d)",
+        "value": conversions_7d,
+        "baseline": None,
+        "status": "ok" if conversions_7d > 0 else "warn",
+        "note": "Sin conversiones esta semana." if conversions_7d == 0 else "",
+    })
+
+    # 9. Backend self-health
+    try:
+        uptime_hours = int((now_utc - _server_start_time).total_seconds() // 3600)
+        metrics.append({
+            "label": "Backend uptime",
+            "value": f"{uptime_hours}h",
+            "baseline": None,
+            "status": "ok",
+        })
+    except Exception:
+        pass
+
+    return {
+        "date": date_str,
+        "metrics": metrics,
+    }
+
+
+async def send_daily_health_digest_job():
+    """APScheduler job wrapper — runs daily. Sends to HEALTH_DIGEST_RECIPIENTS."""
+    try:
+        digest = compute_daily_health_digest()
+        for recipient in HEALTH_DIGEST_RECIPIENTS:
+            result = send_daily_health_digest_email(recipient, digest)
+            if not result.get("success"):
+                logger.warning(f"Daily health digest email failed for {recipient}: {result.get('error')}")
+            else:
+                logger.info(f"Daily health digest sent to {recipient}")
+
+        # Escalate to Sentry if any metric is in "bad" state
+        bad_metrics = [m for m in digest.get("metrics", []) if m.get("status") == "bad"]
+        if bad_metrics and SENTRY_DSN:
+            labels = ", ".join(m["label"] for m in bad_metrics)
+            sentry_sdk.capture_message(
+                f"Daily health digest: {len(bad_metrics)} critical metric(s) failing — {labels}",
+                level="error",
+            )
+    except Exception as e:
+        logger.error(f"Daily health digest job failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+
+
+@app.get("/admin/health-digest", tags=["admin", "health"], summary="Disparar digest de salud manualmente")
+async def admin_health_digest(user=Depends(require_admin)):
+    """Calcula y envía el digest diario bajo demanda (útil para probar)."""
+    digest = compute_daily_health_digest()
+    sent_to = []
+    for recipient in HEALTH_DIGEST_RECIPIENTS:
+        result = send_daily_health_digest_email(recipient, digest)
+        if result.get("success"):
+            sent_to.append(recipient)
+    return {"success": True, "digest": digest, "sent_to": sent_to}
+
+
 # Track server start time for uptime
 _server_start_time = datetime.now(timezone.utc)
 
@@ -6011,7 +6262,17 @@ async def start_monitoring_jobs():
         id="trial_feedback_emails",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC)")
+    # Daily health digest (08:00 Europe/Madrid — detect silent regressions)
+    social_scheduler.add_job(
+        send_daily_health_digest_job,
+        "cron",
+        hour=8,
+        minute=0,
+        timezone=ZoneInfo("Europe/Madrid"),
+        id="daily_health_digest",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET)")
 
 
 async def periodic_health_check():

@@ -1257,3 +1257,84 @@ def send_survey_email(to_email: str, user_name: str, campaign_id: str, driver_id
         return {"success": True, "id": response["id"]}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
+    """Email diario de estado del sistema. `digest` contiene métricas calculadas en main.py."""
+    date_str = html_escape(digest.get("date", ""))
+
+    def row(label: str, value, baseline, status: str, note: str = "") -> str:
+        color = {"ok": "#22c55e", "warn": "#f59e0b", "bad": "#ef4444"}.get(status, "#6b7280")
+        icon = {"ok": "&#10003;", "warn": "!", "bad": "&#10007;"}.get(status, "&middot;")
+        baseline_txt = f" &middot; baseline 7d: <strong>{baseline}</strong>" if baseline is not None else ""
+        note_html = (
+            f"<div style='color:{color}; font-size:13px; margin-top:4px;'>{html_escape(note)}</div>" if note else ""
+        )
+        return f"""
+        <tr><td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="color:#334155; font-size:15px;">
+                    <span style="color:{color}; font-weight:700; margin-right:8px;">{icon}</span>
+                    {html_escape(label)}
+                </div>
+                <div style="color:#0f172a; font-weight:700; font-size:15px; text-align:right;">
+                    {html_escape(str(value))}<span style="color:#94a3b8; font-weight:400; font-size:13px;">{baseline_txt}</span>
+                </div>
+            </div>
+            {note_html}
+        </td></tr>
+        """
+
+    metrics = digest.get("metrics", [])
+    rows_html = "".join(
+        row(m["label"], m["value"], m.get("baseline"), m.get("status", "ok"), m.get("note", ""))
+        for m in metrics
+    )
+
+    alerts_count = sum(1 for m in metrics if m.get("status") == "bad")
+    warns_count = sum(1 for m in metrics if m.get("status") == "warn")
+    if alerts_count > 0:
+        summary_color = "#ef4444"
+        header_summary = f"{alerts_count} alerta{'s' if alerts_count != 1 else ''} &middot; {warns_count} aviso{'s' if warns_count != 1 else ''}"
+    elif warns_count > 0:
+        summary_color = "#f59e0b"
+        header_summary = f"{warns_count} aviso{'s' if warns_count != 1 else ''}"
+    else:
+        summary_color = "#22c55e"
+        header_summary = "Todo en verde"
+
+    content = f"""
+        <h2 style="margin: 0 0 4px 0; color: #0f172a; font-size: 22px; font-weight: 700;">Xpedit Daily Health</h2>
+        <p style="margin: 0 0 24px 0; color: #64748b; font-size: 14px;">{date_str}</p>
+
+        <div style="background:{summary_color}; color:white; padding:14px 18px; border-radius:10px; margin-bottom:22px; font-weight:600; font-size:15px;">
+            {header_summary}
+        </div>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 24px;">
+            {rows_html}
+        </table>
+
+        <p style="margin: 24px 0 8px 0; color: #64748b; font-size: 13px; line-height: 1.6;">
+            Este resumen se genera autom&aacute;ticamente cada ma&ntilde;ana a las 08:00 CET.
+            Si ves una l&iacute;nea en rojo, entra a investigar cuanto antes.
+        </p>
+        <p style="margin: 6px 0 0 0; color: #94a3b8; font-size: 12px;">
+            Baseline = media diaria de los &uacute;ltimos 7 d&iacute;as.
+        </p>
+    """
+
+    subject_prefix = "ALERT" if alerts_count > 0 else ("WARN" if warns_count > 0 else "OK")
+    subject = f"[{subject_prefix}] Xpedit Daily Health — {date_str}"
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": subject,
+            "html": get_base_template(content, "Xpedit Daily Health"),
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
