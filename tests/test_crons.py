@@ -727,3 +727,186 @@ class TestMonitorWebsiteHealth:
             await monitor_website_health()
 
         mock_alert.assert_called_once()
+
+
+# ===================== DAILY HEALTH DIGEST =====================
+#
+# Protects the watchdog that emails us every morning with key metrics.
+# If this job silently breaks, regressions (like the April 2026 silent sync
+# bug) go undetected for days. We add coverage because it had ZERO tests.
+
+class TestSendDailyHealthDigestJob:
+    """Tests for send_daily_health_digest_job (APScheduler wrapper)."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_no_bad_metrics_no_sentry(self):
+        """All metrics OK -> email sent, Sentry NOT invoked for capture_message."""
+        fake_digest = {
+            "date": "24 abr 2026",
+            "metrics": [
+                {"label": "Paradas procesadas (24h)", "value": "60/100 (60%)", "status": "ok"},
+                {"label": "Nuevos registros (24h)", "value": 5, "status": "ok"},
+            ],
+        }
+        with patch("main.compute_daily_health_digest", return_value=fake_digest), \
+             patch("main.HEALTH_DIGEST_RECIPIENTS", ["ops@example.com"]), \
+             patch("main.send_daily_health_digest_email", return_value={"success": True}) as mock_email, \
+             patch("main.SENTRY_DSN", "https://sentry.io/fake"), \
+             patch("main.sentry_sdk") as mock_sentry:
+            from main import send_daily_health_digest_job
+            await send_daily_health_digest_job()
+
+        mock_email.assert_called_once_with("ops@example.com", fake_digest)
+        mock_sentry.capture_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bad_metric_escalates_to_sentry(self):
+        """Any metric with status='bad' triggers Sentry capture_message at
+        error level. This is the watchdog behaviour that catches silent
+        regressions."""
+        fake_digest = {
+            "date": "24 abr 2026",
+            "metrics": [
+                {"label": "Paradas procesadas (24h)", "value": "5/100 (5%)", "status": "bad"},
+                {"label": "Nuevos registros (24h)", "value": 3, "status": "ok"},
+            ],
+        }
+        with patch("main.compute_daily_health_digest", return_value=fake_digest), \
+             patch("main.HEALTH_DIGEST_RECIPIENTS", ["ops@example.com"]), \
+             patch("main.send_daily_health_digest_email", return_value={"success": True}), \
+             patch("main.SENTRY_DSN", "https://sentry.io/fake"), \
+             patch("main.sentry_sdk") as mock_sentry:
+            from main import send_daily_health_digest_job
+            await send_daily_health_digest_job()
+
+        assert mock_sentry.capture_message.call_count == 1
+        call_args = mock_sentry.capture_message.call_args
+        assert "Paradas procesadas" in call_args[0][0]
+        assert call_args[1]["level"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_email_failure_does_not_raise(self):
+        """If send_daily_health_digest_email returns success=False, log
+        a warning and continue — must NOT crash the scheduler."""
+        fake_digest = {"date": "x", "metrics": []}
+        with patch("main.compute_daily_health_digest", return_value=fake_digest), \
+             patch("main.HEALTH_DIGEST_RECIPIENTS", ["a@x.com", "b@x.com"]), \
+             patch(
+                 "main.send_daily_health_digest_email",
+                 side_effect=[{"success": False, "error": "rate_limit"}, {"success": True}],
+             ) as mock_email, \
+             patch("main.SENTRY_DSN", ""):
+            from main import send_daily_health_digest_job
+            await send_daily_health_digest_job()
+
+        assert mock_email.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_compute_exception_captured_by_sentry(self):
+        """If compute_daily_health_digest raises, the wrapper captures it
+        to Sentry instead of crashing the scheduler."""
+        with patch("main.compute_daily_health_digest", side_effect=RuntimeError("DB unreachable")), \
+             patch("main.SENTRY_DSN", "https://sentry.io/fake"), \
+             patch("main.sentry_sdk") as mock_sentry:
+            from main import send_daily_health_digest_job
+            await send_daily_health_digest_job()
+
+        mock_sentry.capture_exception.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_sentry_when_dsn_empty(self):
+        """Without SENTRY_DSN configured we must not call sentry_sdk even
+        when there are bad metrics — env is intentionally off (local/CI)."""
+        fake_digest = {
+            "date": "24 abr 2026",
+            "metrics": [{"label": "foo", "value": 0, "status": "bad"}],
+        }
+        with patch("main.compute_daily_health_digest", return_value=fake_digest), \
+             patch("main.HEALTH_DIGEST_RECIPIENTS", ["ops@example.com"]), \
+             patch("main.send_daily_health_digest_email", return_value={"success": True}), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.sentry_sdk") as mock_sentry:
+            from main import send_daily_health_digest_job
+            await send_daily_health_digest_job()
+
+        mock_sentry.capture_message.assert_not_called()
+
+
+class TestComputeDailyHealthDigest:
+    """Tests for compute_daily_health_digest (collects metrics from DB)."""
+
+    def test_returns_date_and_metrics_shape(self):
+        """Must return a dict with 'date' (str) and 'metrics' (list of dicts)
+        — every metric must have label + status."""
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain(count=0))
+        mock_sb.rpc = MagicMock(side_effect=lambda name, params=None: _FixedResultChain(data=[]))
+
+        with patch("main.supabase", mock_sb):
+            from main import compute_daily_health_digest
+            digest = compute_daily_health_digest()
+
+        assert isinstance(digest, dict)
+        assert isinstance(digest.get("date"), str) and digest["date"]
+        assert isinstance(digest.get("metrics"), list)
+        assert len(digest["metrics"]) > 0
+        for m in digest["metrics"]:
+            assert "label" in m, f"metric missing label: {m}"
+            assert "status" in m, f"metric missing status: {m}"
+            assert m["status"] in ("ok", "warn", "bad"), f"invalid status: {m}"
+
+    def test_survives_google_signin_rpc_failure(self):
+        """RPC to google_signin_stats can fail — digest must still produce
+        a complete output with both platforms defaulted to 0 counts."""
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain(count=0))
+        mock_sb.rpc = MagicMock(side_effect=Exception("RPC exploded"))
+
+        with patch("main.supabase", mock_sb):
+            from main import compute_daily_health_digest
+            digest = compute_daily_health_digest()
+
+        labels = [m["label"] for m in digest["metrics"]]
+        assert "Google Sign-In Android (7d)" in labels
+        assert "Google Sign-In iOS (7d)" in labels
+        android = next(m for m in digest["metrics"] if m["label"] == "Google Sign-In Android (7d)")
+        # 0 android logins in 7d is always flagged bad (regression watchdog).
+        assert android["value"] == 0
+        assert android["status"] == "bad"
+
+    def test_processing_rate_flagged_bad_when_under_30_percent(self):
+        """THE metric that catches the April 2026 silent-sync class of bugs.
+        When processed/total < 30%, status MUST be 'bad' with an alerting note."""
+        # 100 stops created, only 10 processed = 10% — must flag as bad.
+        # Stop queries come in this order inside compute():
+        #   1. stops created last_24h  (total)   -> 100
+        #   2. stops created last_7d   (total)   -> 700
+        #   3. stops processed last_24h          -> 10
+        call_counter = {"stops_calls": 0}
+
+        def table_dispatch(name):
+            if name != "stops":
+                return _FixedResultChain(count=0)
+            call_counter["stops_calls"] += 1
+            if call_counter["stops_calls"] == 1:
+                return _FixedResultChain(count=100)
+            if call_counter["stops_calls"] == 2:
+                return _FixedResultChain(count=700)
+            return _FixedResultChain(count=10)
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=table_dispatch)
+        mock_sb.rpc = MagicMock(side_effect=lambda name, params=None: _FixedResultChain(data=[]))
+
+        with patch("main.supabase", mock_sb):
+            from main import compute_daily_health_digest
+            digest = compute_daily_health_digest()
+
+        rate_metric = next(
+            (m for m in digest["metrics"] if m["label"] == "Paradas procesadas (24h)"),
+            None,
+        )
+        assert rate_metric is not None, "processing rate metric must be present"
+        assert rate_metric["status"] == "bad"
+        assert "ALERTA" in rate_metric.get("note", ""), "bad rate must come with an alert note"
+        assert "10/100" in str(rate_metric["value"])
