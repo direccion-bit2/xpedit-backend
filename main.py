@@ -59,6 +59,7 @@ from emails import (
     send_delivery_failed_email,
     send_delivery_started_email,
     send_plan_activated_email,
+    send_reactivation_persistence_email,
     send_reengagement_broadcast,
     send_referral_reward_email,
     send_social_login_broadcast,
@@ -2027,6 +2028,211 @@ async def admin_broadcast_social_login(user=Depends(require_admin)):
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error enviando social login broadcast")
+
+
+# ========== REACTIVATION CAMPAIGN (25 Apr 2026 — persistence-fix) ==========
+
+REACTIVATION_CAMPAIGN_ID = "reactivation_25apr_persistence_fix"
+REACTIVATION_INACTIVE_DAYS = 5  # users with last session >5 days ago
+REACTIVATION_TEST_DRIVER_IDS = [
+    "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # direccion@taespack.com
+    "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # migue995@gmail.com
+]
+REACTIVATION_PUSH_TITLE = "Hemos arreglado lo de las paradas"
+REACTIVATION_PUSH_BODY = "Vuelve a Xpedit. App rediseñada, mapas más rápidos y paradas que ya se guardan siempre."
+
+
+def _reactivation_audience_query(days_inactive: int):
+    """Base query for the reactivation audience. Returns Supabase result.
+
+    Audience: drivers who used the app at some point, have email, and last session
+    is older than days_inactive. Excludes internal accounts.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_inactive)).isoformat()
+    return (
+        supabase.table("drivers")
+        .select("id, email, name, push_token, session_started_at, promo_plan, subscription_source")
+        .not_.is_("email", "null")
+        .not_.is_("session_started_at", "null")
+        .lt("session_started_at", cutoff)
+        .execute()
+    )
+
+
+def _reactivation_filter_internal(drivers: list) -> list:
+    return [d for d in drivers if d["id"] not in REACTIVATION_TEST_DRIVER_IDS and d.get("email")]
+
+
+def _reactivation_pick_channel(driver: dict, requested: str) -> str:
+    """Decide channel for one driver. 'auto' picks push if token, email otherwise."""
+    has_push = bool(driver.get("push_token") and str(driver["push_token"]).startswith("ExponentPushToken["))
+    if requested == "push":
+        return "push" if has_push else "skip"
+    if requested == "email":
+        return "email"
+    # auto
+    return "push" if has_push else "email"
+
+
+class ReactivationPreviewRequest(BaseModel):
+    days_inactive: int = REACTIVATION_INACTIVE_DAYS
+
+
+class ReactivationSendRequest(BaseModel):
+    mode: str = "test"  # 'test' | 'real'
+    channel: str = "auto"  # 'auto' | 'push' | 'email'
+    days_inactive: int = REACTIVATION_INACTIVE_DAYS
+    limit: Optional[int] = None
+    campaign: str = REACTIVATION_CAMPAIGN_ID
+    dry_run: bool = False
+
+
+@app.post("/admin/reactivation/preview", tags=["admin", "reactivation"], summary="Preview audience for the persistence-fix reactivation campaign")
+async def admin_reactivation_preview(body: ReactivationPreviewRequest, user=Depends(require_admin)):
+    """Returns audience count + breakdown without sending anything."""
+    try:
+        result = _reactivation_audience_query(body.days_inactive)
+        targets = _reactivation_filter_internal(result.data or [])
+        with_push = [d for d in targets if d.get("push_token") and str(d["push_token"]).startswith("ExponentPushToken[")]
+        without_push = [d for d in targets if d not in with_push]
+        sample = [{"name": d.get("name"), "email": d["email"], "channel": "push" if d in with_push else "email"} for d in targets[:5]]
+        return {
+            "total": len(targets),
+            "with_push": len(with_push),
+            "without_push": len(without_push),
+            "campaign": REACTIVATION_CAMPAIGN_ID,
+            "days_inactive_threshold": body.days_inactive,
+            "sample": sample,
+        }
+    except Exception as e:
+        logger.error(f"reactivation preview: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error generating preview")
+
+
+@app.post("/admin/reactivation/send", tags=["admin", "reactivation"], summary="Send the persistence-fix reactivation campaign")
+async def admin_reactivation_send(body: ReactivationSendRequest, user=Depends(require_admin)):
+    """Send reactivation push or email. mode=test only sends to internal test drivers (Miguel)."""
+    if body.mode not in ("test", "real"):
+        raise HTTPException(status_code=400, detail="mode must be 'test' or 'real'")
+    if body.channel not in ("auto", "push", "email"):
+        raise HTTPException(status_code=400, detail="channel must be 'auto', 'push' or 'email'")
+
+    try:
+        if body.mode == "test":
+            # Solo destinatarios de prueba (Miguel). Bypass exclusion.
+            test_query = (
+                supabase.table("drivers")
+                .select("id, email, name, push_token, session_started_at")
+                .in_("id", REACTIVATION_TEST_DRIVER_IDS)
+                .execute()
+            )
+            targets = test_query.data or []
+        else:
+            result = _reactivation_audience_query(body.days_inactive)
+            targets = _reactivation_filter_internal(result.data or [])
+
+        if body.limit is not None and body.limit > 0:
+            targets = targets[: body.limit]
+
+        if body.dry_run:
+            return {
+                "dry_run": True,
+                "would_send": len(targets),
+                "campaign": body.campaign,
+                "mode": body.mode,
+            }
+
+        sent_push = 0
+        sent_email = 0
+        failed = 0
+        skipped = 0
+
+        for d in targets:
+            channel = _reactivation_pick_channel(d, body.channel)
+            if channel == "skip":
+                skipped += 1
+                continue
+
+            # Pre-insert log row (status=queued). UPSERT-style: skip if already sent.
+            existing = (
+                supabase.table("reactivation_log")
+                .select("id, status")
+                .eq("driver_id", d["id"]).eq("channel", channel).eq("campaign", body.campaign)
+                .limit(1).execute()
+            )
+            if existing.data and existing.data[0].get("status") in ("sent", "opened"):
+                skipped += 1
+                continue
+
+            log_row = {
+                "driver_id": d["id"],
+                "channel": channel,
+                "campaign": body.campaign,
+                "status": "queued",
+                "session_at_send": d.get("session_started_at"),
+            }
+
+            ok = False
+            error_msg = None
+            resend_id = None
+
+            if channel == "push":
+                ok = await send_push_to_token(
+                    d["push_token"],
+                    REACTIVATION_PUSH_TITLE,
+                    REACTIVATION_PUSH_BODY,
+                    data={"campaign": body.campaign, "deeplink": "xpedit://"},
+                )
+                if not ok:
+                    error_msg = "expo push returned error"
+            else:  # email
+                result = send_reactivation_persistence_email(d["email"], d.get("name") or "")
+                ok = bool(result.get("success"))
+                resend_id = result.get("id")
+                if not ok:
+                    error_msg = result.get("error", "unknown email error")
+
+            log_row["status"] = "sent" if ok else "failed"
+            log_row["error"] = error_msg
+            log_row["resend_id"] = resend_id
+
+            try:
+                if existing.data:
+                    supabase.table("reactivation_log").update(log_row).eq("id", existing.data[0]["id"]).execute()
+                else:
+                    supabase.table("reactivation_log").insert(log_row).execute()
+            except Exception as log_err:
+                logger.warning(f"reactivation_log write failed for driver {d['id']}: {log_err}")
+
+            if ok:
+                if channel == "push":
+                    sent_push += 1
+                else:
+                    sent_email += 1
+            else:
+                failed += 1
+
+        log_audit(
+            user["id"],
+            "reactivation_send",
+            "campaign",
+            body.campaign,
+            {"mode": body.mode, "sent_push": sent_push, "sent_email": sent_email, "failed": failed, "skipped": skipped},
+        )
+
+        return {
+            "success": True,
+            "campaign": body.campaign,
+            "mode": body.mode,
+            "total_targets": len(targets),
+            "sent_push": sent_push,
+            "sent_email": sent_email,
+            "failed": failed,
+            "skipped": skipped,
+        }
+    except Exception as e:
+        logger.error(f"reactivation send: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en envío: {type(e).__name__}")
 
 
 @app.post("/admin/push-blast")
@@ -6304,6 +6510,91 @@ async def send_daily_health_digest_job():
             sentry_sdk.capture_exception(e)
 
 
+async def reactivation_push_followup_job():
+    """Hourly: drivers who got a reactivation push >=5h ago and have not opened the app since
+    receive a follow-up email. If they did open the app, mark the push as 'opened' instead.
+
+    Idempotent via reactivation_log uniqueness on (driver_id, channel, campaign).
+    """
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        push_logs = (
+            supabase.table("reactivation_log")
+            .select("id, driver_id, campaign, sent_at, session_at_send")
+            .eq("channel", "push").eq("status", "sent")
+            .lt("sent_at", cutoff)
+            .execute()
+        ).data or []
+        if not push_logs:
+            return
+
+        driver_ids = list({p["driver_id"] for p in push_logs})
+        existing_emails = (
+            supabase.table("reactivation_log")
+            .select("driver_id, campaign")
+            .eq("channel", "email").in_("driver_id", driver_ids)
+            .execute()
+        ).data or []
+        already_emailed = {(e["driver_id"], e["campaign"]) for e in existing_emails}
+        candidates = [p for p in push_logs if (p["driver_id"], p["campaign"]) not in already_emailed]
+        if not candidates:
+            return
+
+        drivers = (
+            supabase.table("drivers")
+            .select("id, email, name, session_started_at")
+            .in_("id", list({c["driver_id"] for c in candidates}))
+            .execute()
+        ).data or []
+        driver_map = {d["id"]: d for d in drivers}
+
+        sent_email = 0
+        marked_opened = 0
+        failed = 0
+        for c in candidates:
+            d = driver_map.get(c["driver_id"])
+            if not d or not d.get("email"):
+                continue
+            current_session = d.get("session_started_at")
+            log_session = c.get("session_at_send")
+            if current_session and current_session != log_session:
+                # User opened the app after the push — mark and skip email.
+                supabase.table("reactivation_log").update({
+                    "status": "opened",
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", c["id"]).execute()
+                marked_opened += 1
+                continue
+
+            res = send_reactivation_persistence_email(d["email"], d.get("name") or "")
+            row = {
+                "driver_id": c["driver_id"],
+                "channel": "email",
+                "campaign": c["campaign"],
+                "status": "sent" if res.get("success") else "failed",
+                "session_at_send": current_session,
+                "resend_id": res.get("id"),
+                "error": None if res.get("success") else res.get("error"),
+            }
+            try:
+                supabase.table("reactivation_log").insert(row).execute()
+            except Exception as ins_err:
+                logger.warning(f"reactivation_log followup insert failed: {ins_err}")
+
+            if res.get("success"):
+                sent_email += 1
+            else:
+                failed += 1
+
+        logger.info(
+            f"reactivation_push_followup: candidates={len(candidates)} email_sent={sent_email} opened={marked_opened} failed={failed}"
+        )
+    except Exception as e:
+        logger.error(f"reactivation_push_followup error: {type(e).__name__}: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+
+
 @app.get("/admin/health-digest", tags=["admin", "health"], summary="Disparar digest de salud manualmente")
 async def admin_health_digest(user=Depends(require_admin)):
     """Calcula y envía el digest diario bajo demanda (útil para probar)."""
@@ -6501,7 +6792,15 @@ async def start_monitoring_jobs():
         id="daily_health_digest",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET)")
+    # Reactivation push 5h follow-up (hourly at :15 → email if user did not open the app after push)
+    social_scheduler.add_job(
+        reactivation_push_followup_job,
+        "cron",
+        minute=15,
+        id="reactivation_push_followup",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET), reactivation followup (hourly :15)")
 
 
 async def periodic_health_check():

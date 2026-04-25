@@ -887,6 +887,86 @@ def send_reengagement_broadcast(to_emails_with_names: List[dict]) -> dict:
     return results
 
 
+def send_reactivation_persistence_email(to_email: str, user_name: str) -> dict:
+    """Reactivation campaign 25 Apr 2026 — apologize for persistence bug + invite back.
+
+    Lead message: stops marked as delivered/failed sometimes did not save. Fixed.
+    CTA: open the app (deep link) + store fallbacks. Update is forced on iOS.
+    """
+    user_name = html_escape(user_name or "repartidor")
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            Hemos arreglado lo de las paradas
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola <strong>{user_name}</strong>,
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Si dejaste de usar Xpedit estos días &mdash; la app que te organiza las rutas de reparto en minutos &mdash; tenías razón en estar molesto. Algunas paradas que marcabas como entregadas o fallidas no se guardaban bien. <strong>Ya está arreglado</strong> y queremos que lo veas tú mismo.
+        </p>
+
+        <div style="background-color: #f0fdf4; border-left: 4px solid #10b981; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+            <p style="margin: 0 0 10px 0; color: #065f46; font-size: 15px; font-weight: 600;">Esta semana hemos cambiado:</p>
+            <ul style="margin: 0; padding-left: 20px; color: #065f46; font-size: 14px; line-height: 1.7;">
+                <li>Cada parada que marcas se guarda <strong>siempre</strong> &mdash; aunque cambies a Maps/Waze, cierres la app o se reinicie el móvil</li>
+                <li><strong>Interfaz rediseñada</strong>: iconos más limpios, lista de paradas más clara y botones más cómodos al volante</li>
+                <li>Optimizador más rápido y mapas más estables, sin parpadeos al hacer zoom</li>
+                <li>Decenas de errores pequeños corregidos</li>
+            </ul>
+        </div>
+
+        <p style="margin: 25px 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            <strong>Solo tienes que abrir la app.</strong> En Android se actualiza sola. En iPhone te pedirá instalar la última versión desde la App Store (un toque).
+        </p>
+
+        <!-- CTAs -->
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="xpedit://" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3); margin-bottom: 12px;">
+                Abrir Xpedit
+            </a>
+        </div>
+
+        <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 13px; text-align: center;">
+            ¿Ya no la tienes instalada?
+        </p>
+
+        <div style="text-align: center; margin: 0 0 25px 0;">
+            <a href="{APP_STORE_URL}" style="display: inline-block; background-color: #111827; color: #ffffff; text-decoration: none; padding: 10px 22px; border-radius: 8px; font-weight: 500; font-size: 14px; margin: 4px 6px;">
+                Descargar para iPhone
+            </a>
+            <a href="{PLAY_STORE_URL}" style="display: inline-block; background-color: #111827; color: #ffffff; text-decoration: none; padding: 10px 22px; border-radius: 8px; font-weight: 500; font-size: 14px; margin: 4px 6px;">
+                Descargar para Android
+            </a>
+        </div>
+
+        <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            Si quieres comentarnos algo, <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">escríbenos por WhatsApp</a>. Leo cada mensaje personalmente.
+        </p>
+
+        <p style="margin: 25px 0 0 0; color: #4b5563; font-size: 14px; text-align: center; font-style: italic;">
+            Gracias por la paciencia.<br>&mdash; Miguel, Xpedit
+        </p>
+
+        <p style="margin: 20px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Recibes este email porque tienes una cuenta en Xpedit. Si no quieres recibir más, responde con "cancelar".
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": "Hemos arreglado lo de las paradas — vuelve a probarla",
+            "html": get_base_template(content, "Hemos arreglado lo de las paradas"),
+        })
+        return {"success": True, "id": response.get("id")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def send_social_login_announcement(to_email: str, user_name: str) -> dict:
     """Email anunciando social login (Google + Apple) a usuarios existentes"""
     user_name = html_escape(user_name or "repartidor")
