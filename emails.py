@@ -40,9 +40,10 @@ def get_base_template(content: str, title: str = "Xpedit") -> str:
                     <table width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);">
                         <!-- Header -->
                         <tr>
-                            <td style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); padding: 32px; text-align: center;">
-                                <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Xpedit</h1>
-                                <p style="margin: 8px 0 0 0; color: rgba(255,255,255,0.85); font-size: 14px;">Optimiza tus rutas de reparto</p>
+                            <td style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); padding: 28px 32px; text-align: center;">
+                                <img src="https://www.xpedit.es/logo.png" alt="Xpedit" width="64" height="64" style="display: block; margin: 0 auto 12px; border-radius: 14px; background-color: #ffffff; padding: 4px;">
+                                <h1 style="margin: 0; color: #ffffff; font-size: 26px; font-weight: 700; letter-spacing: -0.5px;">Xpedit</h1>
+                                <p style="margin: 6px 0 0 0; color: rgba(255,255,255,0.85); font-size: 14px;">Optimiza tus rutas de reparto</p>
                             </td>
                         </tr>
                         <!-- Content -->
