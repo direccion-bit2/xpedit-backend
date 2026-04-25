@@ -923,7 +923,7 @@ def send_reactivation_persistence_email(to_email: str, user_name: str) -> dict:
 
         <!-- CTAs -->
         <div style="text-align: center; margin: 30px 0;">
-            <a href="xpedit://" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3); margin-bottom: 12px;">
+            <a href="https://www.xpedit.es/abrir" style="display: inline-block; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3); margin-bottom: 12px;">
                 Abrir Xpedit
             </a>
         </div>
