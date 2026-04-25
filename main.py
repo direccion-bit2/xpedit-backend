@@ -4743,6 +4743,8 @@ async def resend_webhook(request: Request):
     event_type = payload.get("type")
     data = payload.get("data", {})
     email_id = data.get("email_id")
+    recipients = data.get("to") or []
+    recipient = recipients[0] if isinstance(recipients, list) and recipients else None
 
     if not event_type or not email_id:
         return {"received": True, "skipped": True}
@@ -4750,8 +4752,21 @@ async def resend_webhook(request: Request):
     logger.info(f"Resend webhook event: {event_type}, email_id: {email_id}")
 
     now = datetime.now(timezone.utc).isoformat()
-    update_data = {}
 
+    # 1. Always log the raw event so we can analyze open/click rates from SQL,
+    #    even for campaigns whose source row is not in email_log.
+    try:
+        supabase.table("resend_email_events").insert({
+            "email_id": email_id,
+            "event_type": event_type,
+            "recipient": recipient,
+            "raw": data,
+        }).execute()
+    except Exception as e:
+        logger.warning(f"resend_email_events insert failed: {type(e).__name__}: {e}")
+
+    # 2. Update email_log (transactional emails table) if a row for this id exists.
+    update_data = {}
     if event_type == "email.delivered":
         update_data = {"status": "delivered", "delivered_at": now}
     elif event_type == "email.opened":
@@ -4762,17 +4777,27 @@ async def resend_webhook(request: Request):
         update_data = {"status": "bounced", "bounced_at": now}
     elif event_type == "email.complained":
         update_data = {"status": "complained"}
-    else:
-        logger.info(f"Resend webhook unhandled event: {event_type}")
-        return {"received": True}
 
-    try:
-        result = supabase.table("email_log").update(update_data).eq("message_id", email_id).execute()
-        updated = len(result.data) if result.data else 0
-        logger.info(f"Resend webhook updated {updated} rows for {email_id} -> {event_type}")
-    except Exception as e:
-        logger.error(f"Resend webhook DB error: {type(e).__name__}: {e}")
-        sentry_sdk.capture_exception(e)
+    if update_data:
+        try:
+            result = supabase.table("email_log").update(update_data).eq("message_id", email_id).execute()
+            updated = len(result.data) if result.data else 0
+            logger.info(f"Resend webhook email_log updated {updated} rows for {email_id} -> {event_type}")
+        except Exception as e:
+            logger.error(f"Resend webhook email_log error: {type(e).__name__}: {e}")
+            sentry_sdk.capture_exception(e)
+
+    # 3. Update reactivation_log when this email belongs to a campaign send.
+    #    Stamps opened_at the first time we see an open and flips status to
+    #    'opened' so the dashboard query is a simple GROUP BY status.
+    if event_type in ("email.opened", "email.clicked"):
+        try:
+            supabase.table("reactivation_log").update({
+                "status": "opened",
+                "opened_at": now,
+            }).eq("resend_id", email_id).is_("opened_at", "null").execute()
+        except Exception as e:
+            logger.warning(f"resend webhook reactivation_log update failed: {type(e).__name__}: {e}")
 
     return {"received": True}
 
