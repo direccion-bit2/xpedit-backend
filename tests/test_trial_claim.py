@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests.conftest import FAKE_DRIVER_ID, FAKE_USER_ID
+from tests.conftest import FAKE_DRIVER_ID
 
 
 def _mock_driver_select(mock_sb, promo_plan=None):

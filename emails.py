@@ -1208,11 +1208,17 @@ def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> d
         return {"success": False, "error": str(e)}
 
 
-def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str) -> dict:
+def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str, tokens: Optional[dict] = None) -> dict:
     """Email de feedback post-trial: se envia 8 dias despues de expirar el trial.
-    Pregunta al usuario por que no continuo con 4 opciones de 1 click."""
+    Pregunta al usuario por que no continuo con 4 opciones de 1 click.
+
+    `tokens` is a dict mapping reason → HMAC token; required by the backend
+    /feedback/trial endpoint to validate that the click came from a legit
+    email and not from someone guessing UUIDs.
+    """
     user_name = html_escape(user_name or "")
     base_url = "https://www.xpedit.es/feedback"
+    tokens = tokens or {}
 
     buttons = [
         ("El precio es demasiado alto", "price", "#ef4444"),
@@ -1223,7 +1229,9 @@ def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str) -> 
 
     buttons_html = ""
     for label, reason, color in buttons:
-        link = f"{base_url}?reason={reason}&driver={driver_id}"
+        token = tokens.get(reason, "")
+        token_param = f"&token={token}" if token else ""
+        link = f"{base_url}?reason={reason}&driver={driver_id}{token_param}"
         buttons_html += f"""
         <tr>
             <td style="padding: 6px 0;">
