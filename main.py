@@ -5422,8 +5422,19 @@ async def check_scheduled_posts():
 # Initialize scheduler
 social_scheduler = AsyncIOScheduler()
 
+# RUN_SCHEDULER controls whether this process owns the cron jobs (digest,
+# trial expiry, reactivation followup, snapshot, etc.). When the backend runs
+# in two-process mode (web with --workers 2 + dedicated worker), only the
+# worker should set RUN_SCHEDULER=true. Default true keeps the legacy single-
+# process behavior so this change is backwards-compatible until the worker
+# service is provisioned in Railway.
+SHOULD_RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "true").lower() != "false"
+
 @app.on_event("startup")
 async def start_social_scheduler():
+    if not SHOULD_RUN_SCHEDULER:
+        logger.info("Scheduler skipped on this process (RUN_SCHEDULER=false)")
+        return
     if TWITTER_CONSUMER_KEY:
         social_scheduler.add_job(check_scheduled_posts, "interval", seconds=60, id="social_checker", replace_existing=True)
         logger.info("Social scheduler: checking every 60s")
@@ -6749,6 +6760,9 @@ _server_start_time = datetime.now(timezone.utc)
 @app.on_event("startup")
 async def start_monitoring_jobs():
     """Iniciar jobs de backup y limpieza."""
+    if not SHOULD_RUN_SCHEDULER:
+        logger.info("Monitoring jobs skipped on this process (RUN_SCHEDULER=false)")
+        return
     # Re-engagement push semanal (lunes 10:00 UTC)
     social_scheduler.add_job(
         send_weekly_reengagement_push,
