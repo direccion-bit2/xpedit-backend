@@ -20,7 +20,7 @@ WHATSAPP_URL = "https://wa.me/34632073689"
 
 # App store links
 PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.taespack.rutamax"
-APP_STORE_URL = "https://apps.apple.com/app/xpedit-planificador-de-rutas/id6740513547"
+APP_STORE_URL = "https://apps.apple.com/es/app/xpedit-rutas-de-reparto/id6759053639"
 
 
 def get_base_template(content: str, title: str = "Xpedit") -> str:
