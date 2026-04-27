@@ -1064,14 +1064,18 @@ def send_social_login_broadcast(to_emails_with_names: List[dict]) -> dict:
     return results
 
 
-def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
-    """Email cuando el trial de un usuario está a punto de expirar (3 días antes)."""
-    user_name = html_escape(user_name or "")
-    plan_name = html_escape(plan_name)
+TRIAL_EXPIRING_D3_SUBJECT = "Te quedan 3 dias de Xpedit Pro"
+TRIAL_EXPIRING_D1_SUBJECT = "Manana se acaba tu prueba Pro"
 
-    urgency_text = f"en {days_left} días" if days_left > 1 else "mañana" if days_left == 1 else "hoy"
-    plan_display = "Pro+" if "plus" in plan_name.lower() else "Pro"
-    price = "9,99€" if "plus" in plan_name.lower() else "4,99€"
+
+def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
+    """D-3 reminder. ROI-focused copy: '1 ruta extra paga el mes'.
+    plan_name kept in signature for backward-compat; we always pitch Pro (Pro+ is roadmap)."""
+    user_name = html_escape(user_name or "")
+    # plan_name only kept for logging/back-compat; Pro+ is not yet launched, so we always say "Pro"
+    _ = plan_name
+
+    cta_deeplink = "xpedit://upgrade"
 
     content = f"""
         <div style="text-align: center; margin-bottom: 25px;">
@@ -1081,46 +1085,59 @@ def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, day
         </div>
 
         <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
-            Tu prueba {plan_display} termina {urgency_text}
+            Te quedan 3 d&iacute;as de Pro
         </h2>
 
-        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+        <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
             Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
         </p>
 
         <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Tu periodo de prueba de <strong>Xpedit {plan_display}</strong> termina {urgency_text}.
-            Cuando expire, perder&aacute;s acceso a las funciones avanzadas.
+            Tu prueba gratis de <strong>Xpedit Pro</strong> termina en 3 d&iacute;as.
+            Despu&eacute;s vuelves al plan gratis (10 paradas/d&iacute;a, sin optimizaci&oacute;n autom&aacute;tica).
         </p>
 
-        <div style="background-color: #fef2f2; border-radius: 12px; padding: 20px; margin: 25px 0; border: 1px solid #fecaca;">
-            <h3 style="margin: 0 0 12px 0; color: #991b1b; font-size: 15px;">Lo que perder&aacute;s:</h3>
-            <ul style="margin: 0; padding-left: 20px; color: #991b1b; font-size: 14px; line-height: 2;">
-                <li>Optimizaci&oacute;n de rutas con IA (ahorra hasta 30% en km)</li>
-                <li>Paradas ilimitadas por ruta</li>
-                <li>Prueba de entrega con foto y firma</li>
-                <li>Asistente de voz (beta)</li>
+        <div style="background-color: #ecfdf5; border-radius: 12px; padding: 20px; margin: 25px 0; border: 1px solid #a7f3d0;">
+            <h3 style="margin: 0 0 12px 0; color: #065f46; font-size: 16px;">Lo que est&aacute;s pagando con Pro:</h3>
+            <p style="margin: 0 0 8px 0; color: #065f46; font-size: 14px; line-height: 1.7;">
+                4,99&euro; al mes &mdash; menos de lo que ganas en <strong>1 parada extra al d&iacute;a</strong>.
+            </p>
+            <p style="margin: 0; color: #047857; font-size: 13px; line-height: 1.6;">
+                Si Pro te ahorra 30 min al d&iacute;a optimizando rutas, ya lo has amortizado.
+            </p>
+        </div>
+
+        <div style="background-color: #f9fafb; border-radius: 12px; padding: 20px; margin: 25px 0;">
+            <h3 style="margin: 0 0 12px 0; color: #111827; font-size: 15px;">Funciones Pro:</h3>
+            <ul style="margin: 0; padding-left: 20px; color: #374151; font-size: 14px; line-height: 1.9;">
+                <li>Optimizaci&oacute;n autom&aacute;tica de rutas (ahorra hasta 30% km)</li>
+                <li>Paradas ilimitadas por d&iacute;a</li>
+                <li>Foto y firma de entrega</li>
+                <li>Asistente de voz manos libres</li>
             </ul>
         </div>
 
-        <div style="background-color: #eff6ff; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center; border: 1px solid #bfdbfe;">
-            <p style="margin: 0 0 5px 0; color: #1e40af; font-size: 14px;">Contin&uacute;a con {plan_display} por solo</p>
-            <p style="margin: 0; color: #1e40af; font-size: 32px; font-weight: 700;">{price}<span style="font-size: 16px; font-weight: 400;">/mes</span></p>
-            <p style="margin: 8px 0 0 0; color: #3b82f6; font-size: 13px;">Cancela cuando quieras. Sin compromisos.</p>
-        </div>
-
         <div style="text-align: center; margin: 30px 0;">
-            <a href="https://xpedit.es/#pricing" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 600; font-size: 18px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
-                Suscribirme a {plan_display}
+            <a href="{cta_deeplink}" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 600; font-size: 18px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
+                Mantener Pro &mdash; 4,99&euro;/mes
             </a>
+            <p style="margin: 12px 0 0 0; color: #9ca3af; font-size: 12px;">
+                Cancela cuando quieras desde la app.
+            </p>
         </div>
 
-        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
-            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escr&iacute;benos por WhatsApp</a> &mdash; te respondemos en minutos.
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 13px; text-align: center;">
+            &iquest;No tienes la app a mano?
+            <a href="{APP_STORE_URL}" style="color: #2563eb; text-decoration: none;">App Store</a> &middot;
+            <a href="{PLAY_STORE_URL}" style="color: #2563eb; text-decoration: none;">Google Play</a>
+        </p>
+
+        <p style="margin: 18px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escr&iacute;benos por WhatsApp</a>.
         </p>
 
         <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
-            Recibes este email porque tienes una cuenta en Xpedit.
+            Recibes este email porque tu prueba Pro termina pronto.
         </p>
     """
 
@@ -1129,8 +1146,69 @@ def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, day
             "from": FROM_EMAIL,
             "to": [to_email],
             "reply_to": REPLY_TO,
-            "subject": f"Tu prueba {plan_display} termina {urgency_text}",
-            "html": get_base_template(content, f"Trial {plan_display} expira")
+            "subject": TRIAL_EXPIRING_D3_SUBJECT,
+            "html": get_base_template(content, "Tu prueba Pro termina pronto")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_trial_last_day_email(to_email: str, user_name: str) -> dict:
+    """D-1 final urgency. Same offer, sharper tone, single CTA."""
+    user_name = html_escape(user_name or "")
+    cta_deeplink = "xpedit://upgrade"
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #fee2e2; border-radius: 50%; padding: 20px;">
+                <span style="font-size: 40px;">&#9888;</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 16px 0; color: #991b1b; font-size: 26px; text-align: center;">
+            Ma&ntilde;ana se acaba tu Pro
+        </h2>
+
+        <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Ma&ntilde;ana tu cuenta vuelve al plan gratis: <strong>10 paradas al d&iacute;a</strong> y sin
+            optimizaci&oacute;n autom&aacute;tica de rutas.
+        </p>
+
+        <div style="background-color: #fef2f2; border-radius: 12px; padding: 18px; margin: 22px 0; border: 1px solid #fecaca;">
+            <p style="margin: 0; color: #991b1b; font-size: 15px; line-height: 1.6; text-align: center;">
+                Mant&eacute;n Pro por <strong>4,99&euro;/mes</strong>.<br>
+                Cancela en cualquier momento desde la app, sin preguntas.
+            </p>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="{cta_deeplink}" style="display: inline-block; background: #dc2626; color: #ffffff; text-decoration: none; padding: 18px 44px; border-radius: 10px; font-weight: 700; font-size: 18px; box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);">
+                Mantener Pro ahora
+            </a>
+        </div>
+
+        <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 13px; text-align: center;">
+            <a href="{APP_STORE_URL}" style="color: #2563eb; text-decoration: none;">App Store</a> &middot;
+            <a href="{PLAY_STORE_URL}" style="color: #2563eb; text-decoration: none;">Google Play</a>
+        </p>
+
+        <p style="margin: 18px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Algo te ha frenado? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Cu&eacute;ntanos por WhatsApp</a>.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": TRIAL_EXPIRING_D1_SUBJECT,
+            "html": get_base_template(content, "Manana acaba tu prueba Pro")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:

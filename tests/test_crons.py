@@ -276,44 +276,139 @@ class TestSendWeeklyReengagementPush:
 
 # ===================== CHECK EXPIRING TRIALS =====================
 
+def _expiry_dispatch(drivers_data, email_log_existing=False):
+    """Build a side_effect for supabase.table(name) used by check_expiring_trials.
+
+    drivers query → returns the supplied driver rows.
+    email_log query (dedup probe) → returns either empty (no prior send) or one row.
+    email_log INSERT → goes through the same chain harmlessly.
+    """
+    def dispatch(name):
+        if name == "drivers":
+            return _FixedResultChain(data=drivers_data)
+        # email_log: only the dedup SELECT needs realistic data; INSERT is fire-and-forget
+        return _FixedResultChain(data=[{"id": "prior"}] if email_log_existing else [])
+    return dispatch
+
+
 class TestCheckExpiringTrials:
-    """Tests for check_expiring_trials cron job."""
+    """Tests for check_expiring_trials cron job — D-3 and D-1 conversion touchpoints."""
 
     @pytest.mark.asyncio
-    async def test_sends_email_for_expiring_trials(self):
-        mock_sb = make_mock_supabase()
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    async def test_d3_cohort_sends_d3_email(self):
+        # Trial expires in 3 days + 12h → falls in [72h, 96h) bucket
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=3, hours=12)).isoformat()
+        drivers = [{
+            "id": "driver-d3",
+            "email": "user@test.com",
+            "name": "Test User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+        }]
 
-        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain(data=[
-            {
-                "id": "driver-not-excluded",
-                "email": "user@test.com",
-                "name": "Test User",
-                "promo_plan": "pro",
-                "promo_plan_expires_at": expires_at,
-            }
-        ]))
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
 
         with patch("main.supabase", mock_sb), \
              patch("main.SENTRY_DSN", ""), \
-             patch("main.send_trial_expiring_email", return_value={"success": True}) as mock_email:
+             patch("main.send_trial_expiring_email", return_value={"success": True, "id": "msg1"}) as mock_d3, \
+             patch("main.send_trial_last_day_email", return_value={"success": True}) as mock_d1:
             from main import check_expiring_trials
             await check_expiring_trials()
 
-        mock_email.assert_called_once()
+        mock_d3.assert_called_once()
+        mock_d1.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_d1_cohort_sends_d1_email(self):
+        # Trial expires in 1 day + 12h → falls in [24h, 48h) bucket
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=1, hours=12)).isoformat()
+        drivers = [{
+            "id": "driver-d1",
+            "email": "user@test.com",
+            "name": "Test User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+        }]
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expiring_email", return_value={"success": True}) as mock_d3, \
+             patch("main.send_trial_last_day_email", return_value={"success": True, "id": "msg2"}) as mock_d1:
+            from main import check_expiring_trials
+            await check_expiring_trials()
+
+        mock_d1.assert_called_once()
+        mock_d3.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_2day_cohort_outside_buckets_skipped(self):
+        # Trial expires in 2 days + 6h → 54h, NOT in [24h,48h) NOR [72h,96h) → no send
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=6)).isoformat()
+        drivers = [{
+            "id": "driver-mid",
+            "email": "user@test.com",
+            "name": "User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+        }]
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_last_day_email") as mock_d1:
+            from main import check_expiring_trials
+            await check_expiring_trials()
+
+        mock_d3.assert_not_called()
+        mock_d1.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dedup_via_email_log(self):
+        # D-3 driver, but email_log already contains the D-3 send → skipped
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=3, hours=12)).isoformat()
+        drivers = [{
+            "id": "driver-dup",
+            "email": "user@test.com",
+            "name": "User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+        }]
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers, email_log_existing=True))
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_last_day_email") as mock_d1:
+            from main import check_expiring_trials
+            await check_expiring_trials()
+
+        mock_d3.assert_not_called()
+        mock_d1.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_excludes_admin_and_test_ids(self):
-        mock_sb = make_mock_supabase()
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
-
-        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain(data=[
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=3, hours=12)).isoformat()
+        drivers = [
             {
                 "id": "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
                 "email": "admin@xpedit.es",
                 "name": "Admin",
                 "promo_plan": "pro",
                 "promo_plan_expires_at": expires_at,
+                "subscription_source": None,
             },
             {
                 "id": "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
@@ -321,76 +416,93 @@ class TestCheckExpiringTrials:
                 "name": "Test",
                 "promo_plan": "pro",
                 "promo_plan_expires_at": expires_at,
+                "subscription_source": None,
             },
-        ]))
+            {
+                "id": "d773b1aa-b077-4b44-a66b-1cb79cf1059b",  # demo
+                "email": "demo@xpedit.es",
+                "name": "Demo",
+                "promo_plan": "pro",
+                "promo_plan_expires_at": expires_at,
+                "subscription_source": None,
+            },
+        ]
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
 
         with patch("main.supabase", mock_sb), \
              patch("main.SENTRY_DSN", ""), \
-             patch("main.send_trial_expiring_email", return_value={"success": True}) as mock_email:
+             patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_last_day_email") as mock_d1:
             from main import check_expiring_trials
             await check_expiring_trials()
 
-        mock_email.assert_not_called()
+        mock_d3.assert_not_called()
+        mock_d1.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_expiring_trials(self):
         mock_sb = make_mock_supabase()
-        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain())
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch([]))
 
         with patch("main.supabase", mock_sb), \
              patch("main.SENTRY_DSN", ""), \
-             patch("main.send_trial_expiring_email") as mock_email:
+             patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_last_day_email") as mock_d1:
             from main import check_expiring_trials
             await check_expiring_trials()
 
-        mock_email.assert_not_called()
+        mock_d3.assert_not_called()
+        mock_d1.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_email_failure_counted(self):
-        mock_sb = make_mock_supabase()
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=1, hours=12)).isoformat()
+        drivers = [{
+            "id": "driver-x",
+            "email": "user@test.com",
+            "name": "User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+        }]
 
-        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain(data=[
-            {
-                "id": "driver-x",
-                "email": "user@test.com",
-                "name": "User",
-                "promo_plan": "pro",
-                "promo_plan_expires_at": expires_at,
-            }
-        ]))
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
 
         with patch("main.supabase", mock_sb), \
              patch("main.SENTRY_DSN", ""), \
-             patch("main.send_trial_expiring_email", return_value={"success": False, "error": "fail"}) as mock_email:
+             patch("main.send_trial_last_day_email", return_value={"success": False, "error": "fail"}) as mock_d1:
             from main import check_expiring_trials
             await check_expiring_trials()
 
-        mock_email.assert_called_once()
+        mock_d1.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_driver_without_email_skipped(self):
-        mock_sb = make_mock_supabase()
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=3, hours=12)).isoformat()
+        drivers = [{
+            "id": "driver-no-email",
+            "email": None,
+            "name": "NoEmail",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+        }]
 
-        mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain(data=[
-            {
-                "id": "driver-no-email",
-                "email": None,
-                "name": "NoEmail",
-                "promo_plan": "pro",
-                "promo_plan_expires_at": expires_at,
-            }
-        ]))
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
 
         with patch("main.supabase", mock_sb), \
              patch("main.SENTRY_DSN", ""), \
-             patch("main.send_trial_expiring_email", return_value={"success": True}) as mock_email:
+             patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_last_day_email") as mock_d1:
             from main import check_expiring_trials
             await check_expiring_trials()
 
-        # No email because email is None
-        mock_email.assert_not_called()
+        mock_d3.assert_not_called()
+        mock_d1.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_db_error_with_sentry(self):

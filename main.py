@@ -51,6 +51,8 @@ if SENTRY_DSN:
     logger.info("Sentry initialized for error monitoring")
 
 from emails import (
+    TRIAL_EXPIRING_D1_SUBJECT,
+    TRIAL_EXPIRING_D3_SUBJECT,
     send_alert_email,
     send_broadcast_email,
     send_custom_email,
@@ -68,6 +70,7 @@ from emails import (
     send_trial_expired_email,
     send_trial_expiring_email,
     send_trial_feedback_email,
+    send_trial_last_day_email,
     send_upcoming_email,
     send_welcome_email,
 )
@@ -6111,50 +6114,111 @@ async def send_weekly_reengagement_push():
 
 
 async def check_expiring_trials():
-    """Daily check for trials expiring in 3 days. Sends warning email. Runs 09:00 UTC."""
+    """Daily conversion touchpoints: D-3 reminder + D-1 final urgency.
+
+    Runs once a day. Picks ONLY users whose trial expires in [3, 4) days (D-3 cohort)
+    or in [1, 2) days (D-1 cohort) and sends the corresponding template. email_log
+    dedup ensures each user receives each touch at most once even if the cron retries
+    or the window slightly shifts day-to-day.
+    """
     EXCLUDED_IDS = [
         "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",  # Demo Xpedit
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",  # Apple Reviewer
     ]
     if SENTRY_DSN:
         sentry_check_in(monitor_slug="check-expiring-trials", status="in_progress")
     try:
         now = datetime.now(timezone.utc)
-        # Window: expires between now and now+3 days (send email 3 days before)
-        window_start = now.isoformat()
-        window_end = (now + timedelta(days=3)).isoformat()
+
+        # Single query covering both windows. We split into D-3 / D-1 in Python
+        # so we only hit Supabase once.
+        window_start = (now + timedelta(days=1)).isoformat()
+        window_end = (now + timedelta(days=4)).isoformat()
 
         result = (
             supabase.table("drivers")
-            .select("id, email, name, promo_plan, promo_plan_expires_at")
+            .select("id, email, name, promo_plan, promo_plan_expires_at, subscription_source")
             .in_("promo_plan", ["pro", "pro_plus"])
             .eq("is_ambassador", False)
+            .is_("subscription_source", "null")  # already-paying users skip
             .not_.is_("email", "null")
             .not_.is_("promo_plan_expires_at", "null")
             .gte("promo_plan_expires_at", window_start)
-            .lte("promo_plan_expires_at", window_end)
+            .lt("promo_plan_expires_at", window_end)
             .execute()
         )
 
         if not result.data:
-            logger.info("Trial expiry check: no trials expiring in next 3 days")
+            logger.info("Trial expiry check: no trials in D-3 or D-1 windows")
+            if SENTRY_DSN:
+                sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
             return
 
-        sent, failed = 0, 0
+        sent_d3, sent_d1, skipped, failed = 0, 0, 0, 0
         for driver in result.data:
             if driver["id"] in EXCLUDED_IDS or not driver.get("email"):
+                skipped += 1
                 continue
             expires_at = datetime.fromisoformat(driver["promo_plan_expires_at"].replace("Z", "+00:00"))
-            days_left = max(0, (expires_at - now).days)
-            email_result = send_trial_expiring_email(
-                driver["email"], driver.get("name", ""), driver["promo_plan"], days_left
+            hours_left = (expires_at - now).total_seconds() / 3600
+
+            # Bucket selection: D-1 takes precedence if both could match (shouldn't happen).
+            if 24 <= hours_left < 48:
+                template_subject = TRIAL_EXPIRING_D1_SUBJECT
+                template_kind = "d1"
+            elif 72 <= hours_left < 96:
+                template_subject = TRIAL_EXPIRING_D3_SUBJECT
+                template_kind = "d3"
+            else:
+                # Outside our two cohorts (e.g. 50h or 25h gap day) — skip silently.
+                skipped += 1
+                continue
+
+            # email_log dedup: never send the same touch twice to the same address.
+            existing = (
+                supabase.table("email_log")
+                .select("id")
+                .eq("recipient_email", driver["email"])
+                .eq("subject", template_subject)
+                .limit(1)
+                .execute()
             )
+            if existing.data:
+                skipped += 1
+                continue
+
+            if template_kind == "d3":
+                days_left = max(0, int(hours_left // 24))
+                email_result = send_trial_expiring_email(
+                    driver["email"], driver.get("name", ""), driver["promo_plan"], days_left
+                )
+            else:  # d1
+                email_result = send_trial_last_day_email(driver["email"], driver.get("name", ""))
+
             if email_result.get("success"):
-                sent += 1
+                if template_kind == "d3":
+                    sent_d3 += 1
+                else:
+                    sent_d1 += 1
+                try:
+                    supabase.table("email_log").insert({
+                        "recipient_email": driver["email"],
+                        "recipient_name": driver.get("name"),
+                        "subject": template_subject,
+                        "body": f"trial expiry reminder ({template_kind}, auto)",
+                        "message_id": email_result.get("id"),
+                    }).execute()
+                except Exception:
+                    # Log failure isn't fatal — the email already went out. Worst case the user
+                    # gets one duplicate next run; that's acceptable.
+                    pass
             else:
                 failed += 1
+                logger.warning(f"Trial expiry email failed for {driver['id']}: {email_result.get('error')}")
 
-        logger.info(f"Trial expiry check: {sent} emails sent, {failed} failed (of {len(result.data)} expiring)")
+        logger.info(f"Trial expiry: D-3={sent_d3} D-1={sent_d1} skipped={skipped} failed={failed} of {len(result.data)} candidates")
         if SENTRY_DSN:
             sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
     except Exception as e:
