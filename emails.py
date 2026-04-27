@@ -94,7 +94,7 @@ def send_welcome_email(to_email: str, user_name: str) -> dict:
                 </td>
                 <td valign="top">
                     <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Abre la app y agrega paradas</p>
-                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Escribe direcciones, usa la voz o escanea etiquetas con la cámara.</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Escribe direcciones o escanea etiquetas con la cámara.</p>
                 </td>
             </tr>
         </table>
@@ -821,11 +821,11 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
         <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 20px;">
             <tr>
                 <td width="40" valign="top" style="padding-top: 2px;">
-                    <span style="font-size: 20px;">🎤</span>
+                    <span style="font-size: 20px;">📷</span>
                 </td>
                 <td>
-                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Asistente de voz <span style="background-color: #dbeafe; color: #1e40af; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; margin-left: 6px;">BETA</span></p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Di "Oye copiloto" y controla la app sin manos mientras conduces. Función en fase beta.</p>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Escaneo de etiquetas con la cámara</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Apunta la cámara al albarán y la app extrae dirección, nombre y teléfono automáticamente.</p>
                 </td>
             </tr>
         </table>
@@ -1113,7 +1113,8 @@ def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, day
                 <li>Optimizaci&oacute;n autom&aacute;tica de rutas (ahorra hasta 30% km)</li>
                 <li>Paradas ilimitadas por d&iacute;a</li>
                 <li>Foto y firma de entrega</li>
-                <li>Asistente de voz manos libres</li>
+                <li>Escaneo de etiquetas con la c&aacute;mara (OCR)</li>
+                <li>Ventanas horarias por parada</li>
             </ul>
         </div>
 
