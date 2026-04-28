@@ -4681,6 +4681,14 @@ async def revenuecat_webhook(request: Request):
         elif "pro" in entitlement_ids:
             plan = "pro"
 
+        # Determine period from product_id (xpedit_pro_yearly / xpedit_pro_monthly).
+        # NULL when ambiguous so we don't overwrite a previous correct value.
+        period = None
+        if "yearly" in product_id or "annual" in product_id:
+            period = "yearly"
+        elif "monthly" in product_id:
+            period = "monthly"
+
         # Events that grant access
         if event_type in ("INITIAL_PURCHASE", "RENEWAL", "UNCANCELLATION", "NON_RENEWING_PURCHASE"):
             if plan:
@@ -4689,13 +4697,18 @@ async def revenuecat_webhook(request: Request):
                     from datetime import datetime as dt
                     expires_at = dt.fromtimestamp(expiration_at / 1000, tz=timezone.utc).isoformat()
                 else:
-                    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+                    fallback_days = 365 if period == "yearly" else 30
+                    expires_at = (datetime.now(timezone.utc) + timedelta(days=fallback_days)).isoformat()
 
-                result = supabase.table("drivers").update({
+                update_payload = {
                     "promo_plan": plan,
                     "promo_plan_expires_at": expires_at,
                     "subscription_source": "revenuecat",
-                }).eq("id", app_user_id).execute()
+                }
+                if period:
+                    update_payload["subscription_period"] = period
+
+                result = supabase.table("drivers").update(update_payload).eq("id", app_user_id).execute()
 
                 # Also update users table via driver's user_id
                 driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()
@@ -4713,6 +4726,7 @@ async def revenuecat_webhook(request: Request):
                 "promo_plan": None,
                 "promo_plan_expires_at": None,
                 "subscription_source": None,
+                "subscription_period": None,
             }).eq("id", app_user_id).execute()
 
             driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()

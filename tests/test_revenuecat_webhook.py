@@ -147,3 +147,94 @@ class TestRevenueCatWebhook:
             )
         assert response.status_code == 200
         assert response.json().get("status") == "no_user"
+
+    @pytest.mark.asyncio
+    async def test_yearly_purchase_writes_subscription_period(self, unauth_client, rc_headers):
+        """product_id 'xpedit_pro_yearly' → subscription_period='yearly'."""
+        event = _purchase_event(event_id="evt-yearly-1")
+        event["event"]["product_id"] = "xpedit_pro_yearly"
+        with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
+             patch("main._is_webhook_processed", return_value=False), \
+             patch("main._mark_webhook_processed"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[{"id": "driver-xyz"}])
+            driver_lookup = MagicMock()
+            driver_lookup.data = {"user_id": "user-xyz"}
+            mock_sb.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value = driver_lookup
+
+            response = await unauth_client.post(
+                "/revenuecat/webhook", json=event, headers=rc_headers,
+            )
+        assert response.status_code == 200
+        payload = mock_sb.table.return_value.update.call_args_list[0][0][0]
+        assert payload.get("subscription_period") == "yearly"
+
+    @pytest.mark.asyncio
+    async def test_monthly_purchase_writes_subscription_period(self, unauth_client, rc_headers):
+        """product_id 'xpedit_pro_monthly' → subscription_period='monthly'."""
+        event = _purchase_event(event_id="evt-monthly-1")  # default product_id is monthly
+        with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
+             patch("main._is_webhook_processed", return_value=False), \
+             patch("main._mark_webhook_processed"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[{"id": "driver-xyz"}])
+            driver_lookup = MagicMock()
+            driver_lookup.data = {"user_id": "user-xyz"}
+            mock_sb.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value = driver_lookup
+
+            response = await unauth_client.post(
+                "/revenuecat/webhook", json=event, headers=rc_headers,
+            )
+        assert response.status_code == 200
+        payload = mock_sb.table.return_value.update.call_args_list[0][0][0]
+        assert payload.get("subscription_period") == "monthly"
+
+    @pytest.mark.asyncio
+    async def test_expiration_clears_subscription_period(self, unauth_client, rc_headers):
+        """EXPIRATION → subscription_period cleared to NULL."""
+        event = _purchase_event(event_id="evt-exp-period")
+        event["event"]["type"] = "EXPIRATION"
+        event["event"]["product_id"] = "xpedit_pro_yearly"
+        with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
+             patch("main._is_webhook_processed", return_value=False), \
+             patch("main._mark_webhook_processed"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[{"id": "driver-xyz"}])
+            driver_lookup = MagicMock()
+            driver_lookup.data = {"user_id": "user-xyz"}
+            mock_sb.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value = driver_lookup
+
+            response = await unauth_client.post(
+                "/revenuecat/webhook", json=event, headers=rc_headers,
+            )
+        assert response.status_code == 200
+        payload = mock_sb.table.return_value.update.call_args_list[0][0][0]
+        assert payload.get("subscription_period") is None
+
+    @pytest.mark.asyncio
+    async def test_yearly_without_expiration_uses_365_days(self, unauth_client, rc_headers):
+        """If RevenueCat omits expiration_at_ms (rare), yearly product fallback
+        is 365 days, not 30 — otherwise app would mark user as expired in a month
+        despite paying for a year."""
+        event = _purchase_event(event_id="evt-yearly-no-exp")
+        event["event"]["product_id"] = "xpedit_pro_yearly"
+        # expiration_at_ms is None (not provided)
+        with patch("main.REVENUECAT_WEBHOOK_SECRET", "test-rc-secret"), \
+             patch("main._is_webhook_processed", return_value=False), \
+             patch("main._mark_webhook_processed"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[{"id": "driver-xyz"}])
+            driver_lookup = MagicMock()
+            driver_lookup.data = {"user_id": "user-xyz"}
+            mock_sb.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value = driver_lookup
+
+            response = await unauth_client.post(
+                "/revenuecat/webhook", json=event, headers=rc_headers,
+            )
+        assert response.status_code == 200
+        payload = mock_sb.table.return_value.update.call_args_list[0][0][0]
+        from datetime import datetime, timezone
+        expires_at = datetime.fromisoformat(payload["promo_plan_expires_at"])
+        days_diff = (expires_at - datetime.now(timezone.utc)).days
+        # Allow 1-day slack for clock drift / test runtime
+        assert 363 <= days_diff <= 366, f"yearly fallback should be ~365 days, got {days_diff}"
