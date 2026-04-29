@@ -6276,10 +6276,16 @@ async def degrade_expired_trials():
             if driver["id"] in EXCLUDED_IDS:
                 continue
             old_plan = driver["promo_plan"]
-            # Downgrade to free (NULL = free in the system)
+            # Downgrade to free (NULL = free in the system).
+            # NOTE: promo_plan_expires_at is intentionally PRESERVED.
+            # The send_trial_feedback_emails cron filters by `expires_at IS NOT
+            # NULL` to find users 7-8 days post-expiry. Clearing this field
+            # silently broke that cron for months — 0 feedback emails sent,
+            # zero qualitative data on why drivers don't convert.
+            # Side-effects audited: /promo/status, MRR queries, AuthContext,
+            # admin/stats — none rely on this field being null after expiry.
             supabase.table("drivers").update({
                 "promo_plan": None,
-                "promo_plan_expires_at": None,
             }).eq("id", driver["id"]).execute()
             degraded += 1
 
@@ -6383,6 +6389,117 @@ async def send_trial_feedback_emails():
         logger.error(f"Trial feedback job failed: {e}")
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
+
+
+# Inline pydantic — local to this endpoint, no need to bubble up to top of file.
+class _FeedbackBackfillRequest(BaseModel):
+    """Run trial feedback emails over a custom window (one-shot recovery).
+    Default daily cron is 7-8 days; this lets us sweep recent orphans (e.g. 14d)
+    one time after fixing the degrade bug that left expires_at NULL for months.
+    """
+    window_days: int = Field(default=14, ge=7, le=30)
+    require_stops: bool = True  # only email drivers who actually USED the trial
+    dry_run: bool = True  # default to dry_run for safety
+
+
+@app.post("/admin/cron/trial-feedback-backfill", tags=["admin", "cron"], summary="One-shot feedback email backfill (window-aware)")
+async def admin_trial_feedback_backfill(body: _FeedbackBackfillRequest, user=Depends(require_admin)):
+    """Sweep drivers whose trial expired in the last `window_days` (default 14)
+    and send the feedback email to those who haven't received it yet.
+
+    Default `dry_run=true` — caller must explicitly pass `dry_run=false` to send.
+    `require_stops=true` filters to drivers with at least 1 stop in their history
+    (signal of actual product use, not "installed and forgot").
+    """
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",
+    ]
+    FEEDBACK_SUBJECT = "Tu prueba de Xpedit ha terminado - nos encantaria saber por que"
+
+    try:
+        now = datetime.now(timezone.utc)
+        window_start = (now - timedelta(days=body.window_days)).isoformat()
+        window_end = now.isoformat()
+
+        result = (
+            supabase.table("drivers")
+            .select("id, email, name")
+            .is_("subscription_source", "null")
+            .is_("promo_plan", "null")
+            .not_.is_("email", "null")
+            .not_.is_("promo_plan_expires_at", "null")
+            .gte("promo_plan_expires_at", window_start)
+            .lte("promo_plan_expires_at", window_end)
+            .execute()
+        )
+        candidates = [d for d in (result.data or []) if d["id"] not in EXCLUDED_IDS]
+
+        # Filter: only drivers with at least 1 stop. Excludes "installed but
+        # never used" cohort whose feedback would just be silence.
+        if body.require_stops and candidates:
+            ids = [d["id"] for d in candidates]
+            routes_with_stops = (
+                supabase.table("routes")
+                .select("driver_id, stops!inner(id)")
+                .in_("driver_id", ids)
+                .limit(1000)
+                .execute()
+            )
+            active_drivers = {r["driver_id"] for r in (routes_with_stops.data or []) if r.get("stops")}
+            candidates = [d for d in candidates if d["id"] in active_drivers]
+
+        # Drop ones already emailed
+        eligible = []
+        for d in candidates:
+            existing = (
+                supabase.table("email_log").select("id")
+                .eq("recipient_email", d["email"])
+                .eq("subject", FEEDBACK_SUBJECT)
+                .limit(1).execute()
+            )
+            if not existing.data:
+                eligible.append(d)
+
+        if body.dry_run:
+            return {
+                "dry_run": True,
+                "window_days": body.window_days,
+                "require_stops": body.require_stops,
+                "candidates_in_window": len(result.data or []),
+                "after_filters": len(eligible),
+                "sample": [{"name": d.get("name"), "email": d["email"]} for d in eligible[:10]],
+            }
+
+        # Real send. 1s sleep between emails — avoids burst spike to Resend.
+        sent, failed = 0, 0
+        import asyncio
+        for d in eligible:
+            tokens = {r: _trial_feedback_token(d["id"], r) for r in ("price", "feature", "time", "competitor")}
+            res = send_trial_feedback_email(d["email"], d.get("name", ""), d["id"], tokens=tokens)
+            if res.get("success"):
+                sent += 1
+                try:
+                    supabase.table("email_log").insert({
+                        "recipient_email": d["email"],
+                        "recipient_name": d.get("name"),
+                        "subject": FEEDBACK_SUBJECT,
+                        "body": "trial feedback email (one-shot backfill)",
+                        "message_id": res.get("id"),
+                    }).execute()
+                except Exception:
+                    pass
+            else:
+                failed += 1
+                logger.warning(f"Backfill feedback email failed for {d['id']}: {res.get('error')}")
+            await asyncio.sleep(1.0)
+
+        return {"dry_run": False, "sent": sent, "failed": failed, "total": len(eligible)}
+    except Exception as e:
+        logger.error(f"Trial feedback backfill failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Backfill failed")
 
 
 # ============================================================
