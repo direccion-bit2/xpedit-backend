@@ -6502,6 +6502,37 @@ async def admin_trial_feedback_backfill(body: _FeedbackBackfillRequest, user=Dep
         raise HTTPException(status_code=500, detail="Backfill failed")
 
 
+class _TestFeedbackEmailRequest(BaseModel):
+    """Send the trial feedback email to a single address for visual QA.
+    Bypasses dedup, EXCLUDED_IDS, and the post-trial filter — by design.
+    Admin-only. Use the admin's own driver_id so the HMAC tokens validate.
+    """
+    to_email: str = Field(..., pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    name: str = "Admin"
+    driver_id: str  # used to sign the per-reason HMAC tokens
+
+
+@app.post("/admin/email/send-test-feedback", tags=["admin", "email"], summary="Send trial feedback email to a test address")
+async def admin_send_test_feedback(body: _TestFeedbackEmailRequest, user=Depends(require_admin)):
+    """Test-send the feedback email so the admin can review the rendered HTML
+    and verify the 4 click buttons resolve correctly. Logs to email_log with a
+    distinct subject suffix so it doesn't dedupe future real sends."""
+    tokens = {r: _trial_feedback_token(body.driver_id, r) for r in ("price", "feature", "time", "competitor")}
+    res = send_trial_feedback_email(body.to_email, body.name, body.driver_id, tokens=tokens)
+    if res.get("success"):
+        try:
+            supabase.table("email_log").insert({
+                "recipient_email": body.to_email,
+                "recipient_name": body.name,
+                "subject": "[TEST] Trial feedback email preview",
+                "body": "test send via /admin/email/send-test-feedback",
+                "message_id": res.get("id"),
+            }).execute()
+        except Exception:
+            pass
+    return res
+
+
 # ============================================================
 # Daily Health Digest — detects silent regressions automatically
 # ============================================================
