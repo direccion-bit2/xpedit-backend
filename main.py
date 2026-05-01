@@ -4958,8 +4958,20 @@ _places_api_last_alert: Optional[datetime] = None
 _places_api_last_check: Optional[datetime] = None
 
 @app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
-async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Optional[float] = None, user=Depends(get_current_user)):
-    """Proxy de Google Places Autocomplete con sesgo de ubicación. Fallback a Nominatim si falla."""
+async def places_autocomplete(
+    input: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    sessiontoken: Optional[str] = None,
+    user=Depends(get_current_user),
+):
+    """Proxy de Google Places Autocomplete con sesgo de ubicación. Fallback a Nominatim si falla.
+
+    `sessiontoken` (opcional) agrupa keystrokes + Place Details en una única
+    sesión facturable. Con session token, Google factura SOLO el Details final
+    y los autocompletes son gratis. Sin token, cada autocomplete cuesta $2.83/1k.
+    El cliente debe generar un UUID al abrir el input y pasarlo en cada
+    autocomplete + en el details posterior."""
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
     import re
 
@@ -4973,6 +4985,8 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
         if lat and lng:
             params["location"] = f"{lat},{lng}"
             params["radius"] = "30000"
+        if sessiontoken:
+            params["sessiontoken"] = sessiontoken
 
         # Retry once on timeout/error before falling back to Nominatim
         for attempt in range(2):
@@ -5067,14 +5081,25 @@ async def places_autocomplete(input: str, lat: Optional[float] = None, lng: Opti
 
 
 @app.get("/places/details", tags=["places"], summary="Detalles de lugar")
-async def places_details(place_id: str, user=Depends(get_current_user)):
-    """Proxy de Google Places Details. Devuelve geometría, componentes de dirección y dirección formateada."""
+async def places_details(
+    place_id: str,
+    sessiontoken: Optional[str] = None,
+    user=Depends(get_current_user),
+):
+    """Proxy de Google Places Details. Devuelve geometría, componentes de dirección y dirección formateada.
+
+    `sessiontoken` (opcional) cierra la sesión facturable abierta en
+    /places/autocomplete: pasa el MISMO UUID que el cliente generó al abrir
+    el input. Si la sesión es válida, Google factura solo este Details
+    (los autocompletes salen gratis)."""
     params = {
         "place_id": place_id,
         "fields": "geometry,address_components,formatted_address,name,opening_hours,types",
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
+    if sessiontoken:
+        params["sessiontoken"] = sessiontoken
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/place/details/json", params=params)
     return resp.json()

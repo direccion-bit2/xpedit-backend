@@ -629,6 +629,67 @@ class TestPlacesEndpoints:
         assert response.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_places_autocomplete_passes_sessiontoken(self, client):
+        """sessiontoken (when sent) is forwarded to Google so the session
+        stays free-tier billable. Without the token, current per-request
+        billing applies. Regression guard for the cost-saving fix."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "OK", "predictions": []}
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get(
+                "/places/autocomplete?input=Madrid&sessiontoken=abc-123-uuid"
+            )
+        assert response.status_code == 200
+        # The first call is the one to Google's autocomplete endpoint.
+        called_params = mock_http.get.call_args.kwargs.get("params", {})
+        assert called_params.get("sessiontoken") == "abc-123-uuid"
+
+    @pytest.mark.asyncio
+    async def test_places_details_passes_sessiontoken(self, client):
+        """sessiontoken propagation closes the session opened in autocomplete.
+        Same UUID = Google bills only the Details, not each keystroke."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "OK", "result": {}}
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get(
+                "/places/details?place_id=PID&sessiontoken=abc-123-uuid"
+            )
+        assert response.status_code == 200
+        called_params = mock_http.get.call_args.kwargs.get("params", {})
+        assert called_params.get("sessiontoken") == "abc-123-uuid"
+
+    @pytest.mark.asyncio
+    async def test_places_autocomplete_no_sessiontoken_backcompat(self, client):
+        """Without sessiontoken the endpoint still works (back-compat for old app
+        builds). Google receives no sessiontoken param and falls back to per-request
+        billing — same as before this change."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "OK", "predictions": []}
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/autocomplete?input=Madrid")
+        assert response.status_code == 200
+        called_params = mock_http.get.call_args.kwargs.get("params", {})
+        assert "sessiontoken" not in called_params
+
+    @pytest.mark.asyncio
     async def test_places_directions(self, client):
         mock_response = MagicMock()
         mock_response.json.return_value = {
