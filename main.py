@@ -5174,6 +5174,75 @@ async def places_directions(
   # Street View proxy removed - app opens Google Maps directly (free, no API cost)
 
 
+# === STREET CLOSURES (scraped from official municipal sources) ===
+
+from street_closures import ALL_SCRAPERS as _CLOSURE_SCRAPERS
+from street_closures import upsert_closures as _upsert_closures
+
+
+@app.post("/admin/scrape-closures/{city}", tags=["admin", "closures"], summary="Disparar scraper de cortes manualmente")
+async def admin_scrape_closures(city: str, user=Depends(require_admin)):
+    """Run a closures scraper on demand (admin only). City is a slug
+    matching keys in `street_closures.ALL_SCRAPERS`. Returns counts."""
+    scraper = _CLOSURE_SCRAPERS.get(city)
+    if not scraper:
+        raise HTTPException(status_code=404, detail=f"Unknown city slug '{city}'. Known: {list(_CLOSURE_SCRAPERS.keys())}")
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+    try:
+        records = await scraper(google_api_key=GOOGLE_API_KEY)
+    except Exception as e:
+        logger.exception(f"Scraper '{city}' failed")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail=f"Scraper failed: {e}")
+    counts = _upsert_closures(supabase, records)
+    return {"city": city, "scraped": len(records), **counts}
+
+
+@app.get("/closures/near", tags=["closures"], summary="Cortes de calle activos cerca de un punto")
+async def closures_near(
+    lat: float,
+    lng: float,
+    radius_m: int = 1000,
+    user=Depends(get_current_user),
+):
+    """Returns active street closures within `radius_m` meters of (lat, lng).
+    Active = `ends_at >= now - 1h AND starts_at <= now + 7d`.
+    Sorted by distance ascending."""
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        raise HTTPException(status_code=400, detail="Invalid coordinates")
+    if radius_m <= 0 or radius_m > 50000:
+        raise HTTPException(status_code=400, detail="radius_m must be between 1 and 50000")
+    try:
+        result = supabase.rpc(
+            "closures_near",
+            {"p_lat": lat, "p_lng": lng, "p_radius_m": radius_m},
+        ).execute()
+        return {"closures": result.data or []}
+    except Exception as e:
+        logger.warning(f"closures_near RPC failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Failed to query closures")
+
+
+async def run_all_closure_scrapers():
+    """Scheduled job: run every closure scraper and upsert. Logged + Sentry-captured on failure."""
+    if not GOOGLE_API_KEY:
+        logger.info("Skipping closures scrape: GOOGLE_API_KEY missing")
+        return
+    for city, scraper in _CLOSURE_SCRAPERS.items():
+        try:
+            records = await scraper(google_api_key=GOOGLE_API_KEY)
+            counts = _upsert_closures(supabase, records)
+            logger.info(f"Closures scrape [{city}]: {len(records)} scraped, {counts}")
+        except Exception as e:
+            logger.exception(f"Closure scraper '{city}' failed")
+            if SENTRY_DSN:
+                sentry_sdk.capture_exception(e)
+
+
 # === ACCOUNT DELETION ===
 
 @app.delete("/auth/delete-account", tags=["auth"], summary="Eliminar cuenta")
@@ -5497,6 +5566,13 @@ async def start_social_scheduler():
         logger.info("Social scheduler: checking every 60s")
     else:
         logger.info("Social: Twitter credentials not configured, social posts not scheduled")
+    # Closures scrapers: refresh every 30 minutes
+    social_scheduler.add_job(
+        run_all_closure_scrapers, "interval", minutes=30,
+        id="closures_scraper", replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),  # first run 2 min after boot
+    )
+    logger.info("Closures scrapers: every 30 min")
     # Siempre arrancar el scheduler (tambien para backups y retention)
     if not social_scheduler.running:
         social_scheduler.start()

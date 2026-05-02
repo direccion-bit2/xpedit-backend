@@ -12,6 +12,8 @@ svix==1.44.0
 tweepy==4.14.0
 python-multipart==0.0.9
 apscheduler==3.10.4
+beautifulsoup4==4.12.3
+lxml==5.3.0
 google-genai>=1.0.0
 sentry-sdk[fastapi]>=2.0.0
 
