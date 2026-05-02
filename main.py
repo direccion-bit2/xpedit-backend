@@ -3007,6 +3007,7 @@ async def admin_toggle_company(company_id: str, request: CompanyToggleRequest, u
 class DriverFeatureToggleRequest(BaseModel):
     voice_assistant_enabled: Optional[bool] = None
     is_ambassador: Optional[bool] = None
+    closures_alerts_enabled: Optional[bool] = None  # Pro+ feature, opt-in for early access
 
 
 @app.patch("/admin/drivers/{driver_id}/features", tags=["admin"], summary="Toggle feature flags de un driver")
@@ -3025,6 +3026,9 @@ async def admin_toggle_driver_features(driver_id: str, request: DriverFeatureTog
             else:
                 update_data["promo_plan"] = None
                 update_data["promo_plan_expires_at"] = None
+
+        if request.closures_alerts_enabled is not None:
+            update_data["closures_alerts_enabled"] = request.closures_alerts_enabled
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -5209,11 +5213,34 @@ async def closures_near(
 ):
     """Returns active street closures within `radius_m` meters of (lat, lng).
     Active = `ends_at >= now - 1h AND starts_at <= now + 7d`.
-    Sorted by distance ascending."""
+    Sorted by distance ascending.
+
+    Pro+ feature: gated to drivers with `subscription_period='yearly'`/`pro_plus`
+    OR with `closures_alerts_enabled=true` (admin-granted early access).
+    Returns 403 otherwise."""
     if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
         raise HTTPException(status_code=400, detail="Invalid coordinates")
     if radius_m <= 0 or radius_m > 50000:
         raise HTTPException(status_code=400, detail="radius_m must be between 1 and 50000")
+    # Gate: only Pro+ users or admin-granted early access can see closures
+    try:
+        d = supabase.table("drivers").select(
+            "promo_plan, subscription_period, closures_alerts_enabled"
+        ).eq("id", user["id"]).single().execute()
+        driver_row = d.data or {}
+        is_pro_plus = driver_row.get("promo_plan") == "pro_plus" or driver_row.get("subscription_period") == "yearly"
+        has_early_access = bool(driver_row.get("closures_alerts_enabled"))
+        if not (is_pro_plus or has_early_access):
+            raise HTTPException(
+                status_code=403,
+                detail="Closures alerts is a Pro+ feature. Upgrade to Pro+ or request early access.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Could not verify closures access: {e}")
+        # Fail closed: if we can't verify the user, deny.
+        raise HTTPException(status_code=403, detail="Could not verify access")
     try:
         result = supabase.rpc(
             "closures_near",
