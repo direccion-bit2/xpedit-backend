@@ -5204,12 +5204,19 @@ async def admin_scrape_closures(city: str, user=Depends(require_admin)):
     return {"city": city, "scraped": len(records), **counts}
 
 
-def _verify_closures_access(user_id: str) -> None:
-    """Shared gate for /closures/* endpoints. Raises 403 if not Pro+ / not opted in."""
+def _verify_closures_access(auth_user_id: str) -> None:
+    """Shared gate for /closures/* endpoints. Raises 403 if not Pro+ / not opted in.
+
+    Critical: `auth_user_id` is the JWT sub claim (auth.users.id), NOT drivers.id.
+    drivers has a foreign-key user_id column pointing back to auth.users.id, so
+    we must match on user_id. The original code used .eq("id", ...) and silently
+    returned 403 to every legitimate user since the gate first shipped — that's
+    why direccion@taespack.com saw zero closures all day on 2 may 2026 despite
+    closures_alerts_enabled=true."""
     try:
         d = supabase.table("drivers").select(
             "promo_plan, subscription_period, closures_alerts_enabled"
-        ).eq("id", user_id).single().execute()
+        ).eq("user_id", auth_user_id).single().execute()
         driver_row = d.data or {}
         is_pro_plus = driver_row.get("promo_plan") == "pro_plus" or driver_row.get("subscription_period") == "yearly"
         has_early_access = bool(driver_row.get("closures_alerts_enabled"))
