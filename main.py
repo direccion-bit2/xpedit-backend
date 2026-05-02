@@ -5204,6 +5204,60 @@ async def admin_scrape_closures(city: str, user=Depends(require_admin)):
     return {"city": city, "scraped": len(records), **counts}
 
 
+def _verify_closures_access(user_id: str) -> None:
+    """Shared gate for /closures/* endpoints. Raises 403 if not Pro+ / not opted in."""
+    try:
+        d = supabase.table("drivers").select(
+            "promo_plan, subscription_period, closures_alerts_enabled"
+        ).eq("id", user_id).single().execute()
+        driver_row = d.data or {}
+        is_pro_plus = driver_row.get("promo_plan") == "pro_plus" or driver_row.get("subscription_period") == "yearly"
+        has_early_access = bool(driver_row.get("closures_alerts_enabled"))
+        if not (is_pro_plus or has_early_access):
+            raise HTTPException(
+                status_code=403,
+                detail="Closures alerts is a Pro+ feature. Upgrade to Pro+ or request early access.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Could not verify closures access: {e}")
+        raise HTTPException(status_code=403, detail="Could not verify access")
+
+
+@app.get("/closures/active", tags=["closures"], summary="Todos los cortes de calle activos (sin filtro de distancia)")
+async def closures_active(user=Depends(get_current_user)):
+    """Returns ALL active/upcoming closures (active = ends_at >= now-1h AND starts_at <= now+7d).
+    No geo filter — the app caches the full list and renders whatever falls in the user's
+    current map viewport. With ~1-50 closures total this stays well under 50KB.
+
+    Pro+ feature, same gate as /closures/near."""
+    _verify_closures_access(user["id"])
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff_past = (now - timedelta(hours=1)).isoformat()
+        cutoff_future = (now + timedelta(days=7)).isoformat()
+        result = (
+            supabase.table("street_closures")
+            .select(
+                "id, city, street_name, segment_from, segment_to, "
+                "closure_type, reason, starts_at, ends_at, all_day, "
+                "time_window_start, time_window_end, "
+                "lat, lng, lat_from, lng_from, lat_to, lng_to, street_polyline"
+            )
+            .gte("ends_at", cutoff_past)
+            .lte("starts_at", cutoff_future)
+            .order("starts_at", desc=False)
+            .execute()
+        )
+        return {"closures": result.data or []}
+    except Exception as e:
+        logger.warning(f"closures_active failed: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Failed to query closures")
+
+
 @app.get("/closures/near", tags=["closures"], summary="Cortes de calle activos cerca de un punto")
 async def closures_near(
     lat: float,
@@ -5222,25 +5276,7 @@ async def closures_near(
         raise HTTPException(status_code=400, detail="Invalid coordinates")
     if radius_m <= 0 or radius_m > 50000:
         raise HTTPException(status_code=400, detail="radius_m must be between 1 and 50000")
-    # Gate: only Pro+ users or admin-granted early access can see closures
-    try:
-        d = supabase.table("drivers").select(
-            "promo_plan, subscription_period, closures_alerts_enabled"
-        ).eq("id", user["id"]).single().execute()
-        driver_row = d.data or {}
-        is_pro_plus = driver_row.get("promo_plan") == "pro_plus" or driver_row.get("subscription_period") == "yearly"
-        has_early_access = bool(driver_row.get("closures_alerts_enabled"))
-        if not (is_pro_plus or has_early_access):
-            raise HTTPException(
-                status_code=403,
-                detail="Closures alerts is a Pro+ feature. Upgrade to Pro+ or request early access.",
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"Could not verify closures access: {e}")
-        # Fail closed: if we can't verify the user, deny.
-        raise HTTPException(status_code=403, detail="Could not verify access")
+    _verify_closures_access(user["id"])
     try:
         result = supabase.rpc(
             "closures_near",
