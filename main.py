@@ -6159,6 +6159,31 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
 
 # === HEALTH CHECK & MONITORING ===
 
+
+@app.get("/health/loop", tags=["health"], summary="Event-loop lag probe (cheap)")
+async def health_loop():
+    """Cheap probe to detect when the asyncio event loop is starved.
+
+    Schedules a no-op coroutine and measures how long it actually takes to
+    run. Under a healthy worker the lag is sub-millisecond. If sync code
+    is blocking the loop (5 may 2026 incident: supabase-py sync inside
+    async handlers), this endpoint shows lag in the hundreds of ms or
+    seconds — much earlier than `/health` which also does DB queries.
+
+    Curl one-liner for a tight monitor loop:
+        watch -n 2 'curl -s -w "\\nlag=%{time_total}s\\n" .../health/loop'
+    """
+    import time
+    t0 = time.perf_counter()
+    await asyncio.sleep(0)  # yield once; healthy loop returns immediately
+    yielded_ms = (time.perf_counter() - t0) * 1000.0
+    return {
+        "status": "ok",
+        "yielded_ms": round(yielded_ms, 3),
+        "warning": yielded_ms > 100,  # > 100ms means loop was busy when we yielded
+    }
+
+
 @app.get("/health", tags=["health"], summary="Health check", response_model=HealthCheckResponse)
 async def health_check():
     """Verifica el estado de la base de datos, Sentry, scheduler y uptime del servidor. Devuelve 503 si hay problemas."""
