@@ -4981,48 +4981,21 @@ async def places_autocomplete(
     sessiontoken: Optional[str] = None,
     user=Depends(get_current_user),
 ):
-    """Proxy de Google Places Autocomplete con cache Supabase + sesgo de ubicación.
+    """Proxy de Google Places Autocomplete. Solo Google, sin Nominatim.
 
-    Flow:
-    1. Lookup cache (places_autocomplete_cache, normalized query + 11km bias cell).
-       If hit + not expired → return cached predictions, NO Google call.
-    2. Miss → Google Places (timeouts 20s/25s).
-    3. On Google success → upsert cache (TTL 30d).
-    4. On Google failure → return ZERO_RESULTS (no Nominatim).
-
-    `sessiontoken` (opcional) agrupa keystrokes + Place Details. Con cache
-    HIT no usamos sessiontoken hacia Google (no hay llamada), pero el cliente
-    puede seguir mandándolo para el Details posterior."""
+    `sessiontoken` (opcional) agrupa keystrokes + Place Details en una única
+    sesión facturable. Con session token, Google factura SOLO el Details final
+    y los autocompletes son gratis."""
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
     import asyncio
 
-    norm_query, bias = _ac_cache_key(input, lat, lng)
-
-    # 1. Cache lookup — fast path. Failures fall through to Google silently.
-    if norm_query and len(norm_query) >= 3:
-        try:
-            cache_resp = (
-                supabase.table("places_autocomplete_cache")
-                .select("predictions, expires_at, hits")
-                .eq("query_normalized", norm_query)
-                .eq("bias_geohash5", bias)
-                .gt("expires_at", datetime.now(timezone.utc).isoformat())
-                .limit(1)
-                .execute()
-            )
-            row = (cache_resp.data or [None])[0]
-            if row and row.get("predictions"):
-                # Bump hits + last_used_at, fire-and-forget.
-                try:
-                    supabase.table("places_autocomplete_cache").update({
-                        "hits": (row.get("hits") or 0) + 1,
-                        "last_used_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("query_normalized", norm_query).eq("bias_geohash5", bias).execute()
-                except Exception:
-                    pass
-                return {"status": "OK", "predictions": row["predictions"], "source": "cache"}
-        except Exception as e:
-            logger.warning(f"places cache lookup failed (falling through to Google): {e}")
+    # 5 may incident note: a previous version of this handler did a cache
+    # lookup + write to Supabase BEFORE/AFTER calling Google. Both calls
+    # used the synchronous supabase-py client inside an async handler, which
+    # blocks the worker's event loop. With 6+ drivers typing simultaneously
+    # the workers stalled. Reverted to plain Google call. Cache logic
+    # belongs in a separate path that uses asyncio.to_thread() or the
+    # async Supabase client.
 
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
@@ -5054,25 +5027,7 @@ async def places_autocomplete(
                 data = resp.json()
 
             status = data.get("status")
-            if status == "OK":
-                if not _places_api_healthy:
-                    logger.info("Google Places API recovered")
-                    _places_api_healthy = True
-                # Write to cache (best-effort, never blocks the response).
-                if norm_query and len(norm_query) >= 3 and data.get("predictions"):
-                    try:
-                        supabase.table("places_autocomplete_cache").upsert({
-                            "query_normalized": norm_query,
-                            "bias_geohash5": bias,
-                            "predictions": data["predictions"],
-                            "hits": 1,
-                            "last_used_at": datetime.now(timezone.utc).isoformat(),
-                            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
-                        }, on_conflict="query_normalized,bias_geohash5").execute()
-                    except Exception as e:
-                        logger.warning(f"places cache write failed (non-fatal): {e}")
-                return data
-            if status == "ZERO_RESULTS":
+            if status in ("OK", "ZERO_RESULTS"):
                 if not _places_api_healthy:
                     logger.info("Google Places API recovered")
                     _places_api_healthy = True
