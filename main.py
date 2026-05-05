@@ -6219,6 +6219,47 @@ Responde SOLO con un JSON válido (sin markdown, sin ```), con esta estructura e
 # === HEALTH CHECK & MONITORING ===
 
 
+@app.get("/debug/sentry-test", tags=["health"], summary="Force a Sentry event (no auth)")
+async def debug_sentry_test(level: str = "error"):
+    """Diagnostic endpoint to verify Sentry ingestion.
+
+    Sentry shows 0 events for python-fastapi in 30 days despite SENTRY_DSN
+    being configured in Railway and explicit integrations registered. This
+    endpoint forces a real capture and returns metadata so we can correlate
+    via curl.
+    """
+    import time
+    info = {
+        "sentry_dsn_present": bool(SENTRY_DSN),
+        "sentry_environment": os.getenv("SENTRY_ENVIRONMENT", "production"),
+        "release": "xpedit-backend@1.1.4",
+        "timestamp": time.time(),
+        "client_active": sentry_sdk.Hub.current.client is not None,
+    }
+    if level == "exception":
+        try:
+            raise RuntimeError("debug/sentry-test: forced exception")
+        except Exception as e:
+            event_id = sentry_sdk.capture_exception(e)
+            info["captured"] = "exception"
+            info["event_id"] = str(event_id) if event_id else None
+    else:
+        event_id = sentry_sdk.capture_message(
+            f"debug/sentry-test forced {level}",
+            level=level if level in ("error", "warning", "info", "debug") else "error",
+        )
+        info["captured"] = level
+        info["event_id"] = str(event_id) if event_id else None
+    # Force flush so the SDK actually sends before the response returns.
+    try:
+        sentry_sdk.Hub.current.flush(timeout=5.0)
+        info["flushed"] = True
+    except Exception as e:
+        info["flushed"] = False
+        info["flush_error"] = str(e)
+    return info
+
+
 @app.get("/health/loop", tags=["health"], summary="Event-loop lag probe (cheap)")
 async def health_loop():
     """Cheap probe to detect when the asyncio event loop is starved.
