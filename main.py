@@ -4961,6 +4961,18 @@ _places_api_healthy = True
 _places_api_last_alert: Optional[datetime] = None
 _places_api_last_check: Optional[datetime] = None
 
+
+def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tuple[str, str]:
+    """Normalize query + bias for cache lookup.
+    bias_geohash5 is rounded to 1 decimal (~11km cell) when bias is provided."""
+    norm = " ".join((query or "").lower().strip().split())[:200]
+    if lat is None or lng is None:
+        bias = ""
+    else:
+        bias = f"{round(lat, 1)},{round(lng, 1)}"
+    return norm, bias
+
+
 @app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
 async def places_autocomplete(
     input: str,
@@ -4969,18 +4981,48 @@ async def places_autocomplete(
     sessiontoken: Optional[str] = None,
     user=Depends(get_current_user),
 ):
-    """Proxy de Google Places Autocomplete con sesgo de ubicación. Solo Google, sin Nominatim.
+    """Proxy de Google Places Autocomplete con cache Supabase + sesgo de ubicación.
 
-    `sessiontoken` (opcional) agrupa keystrokes + Place Details en una única
-    sesión facturable. Con session token, Google factura SOLO el Details final
-    y los autocompletes son gratis. Sin token, cada autocomplete cuesta $2.83/1k.
-    El cliente debe generar un UUID al abrir el input y pasarlo en cada
-    autocomplete + en el details posterior.
+    Flow:
+    1. Lookup cache (places_autocomplete_cache, normalized query + 11km bias cell).
+       If hit + not expired → return cached predictions, NO Google call.
+    2. Miss → Google Places (timeouts 20s/25s).
+    3. On Google success → upsert cache (TTL 30d).
+    4. On Google failure → return ZERO_RESULTS (no Nominatim).
 
-    5 may 2026: Nominatim removido. El cliente prefiere "no resultados" antes
-    que datos imprecisos. Timeouts subidos a 20s/25s para tolerar saturación."""
+    `sessiontoken` (opcional) agrupa keystrokes + Place Details. Con cache
+    HIT no usamos sessiontoken hacia Google (no hay llamada), pero el cliente
+    puede seguir mandándolo para el Details posterior."""
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
     import asyncio
+
+    norm_query, bias = _ac_cache_key(input, lat, lng)
+
+    # 1. Cache lookup — fast path. Failures fall through to Google silently.
+    if norm_query and len(norm_query) >= 3:
+        try:
+            cache_resp = (
+                supabase.table("places_autocomplete_cache")
+                .select("predictions, expires_at, hits")
+                .eq("query_normalized", norm_query)
+                .eq("bias_geohash5", bias)
+                .gt("expires_at", datetime.now(timezone.utc).isoformat())
+                .limit(1)
+                .execute()
+            )
+            row = (cache_resp.data or [None])[0]
+            if row and row.get("predictions"):
+                # Bump hits + last_used_at, fire-and-forget.
+                try:
+                    supabase.table("places_autocomplete_cache").update({
+                        "hits": (row.get("hits") or 0) + 1,
+                        "last_used_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("query_normalized", norm_query).eq("bias_geohash5", bias).execute()
+                except Exception:
+                    pass
+                return {"status": "OK", "predictions": row["predictions"], "source": "cache"}
+        except Exception as e:
+            logger.warning(f"places cache lookup failed (falling through to Google): {e}")
 
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
@@ -5012,7 +5054,25 @@ async def places_autocomplete(
                 data = resp.json()
 
             status = data.get("status")
-            if status in ("OK", "ZERO_RESULTS"):
+            if status == "OK":
+                if not _places_api_healthy:
+                    logger.info("Google Places API recovered")
+                    _places_api_healthy = True
+                # Write to cache (best-effort, never blocks the response).
+                if norm_query and len(norm_query) >= 3 and data.get("predictions"):
+                    try:
+                        supabase.table("places_autocomplete_cache").upsert({
+                            "query_normalized": norm_query,
+                            "bias_geohash5": bias,
+                            "predictions": data["predictions"],
+                            "hits": 1,
+                            "last_used_at": datetime.now(timezone.utc).isoformat(),
+                            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+                        }, on_conflict="query_normalized,bias_geohash5").execute()
+                    except Exception as e:
+                        logger.warning(f"places cache write failed (non-fatal): {e}")
+                return data
+            if status == "ZERO_RESULTS":
                 if not _places_api_healthy:
                     logger.info("Google Places API recovered")
                     _places_api_healthy = True
@@ -5144,9 +5204,26 @@ async def places_directions(
         params["waypoints"] = combined_waypoints
     if avoid:
         params["avoid"] = avoid
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/directions/json", params=params)
-    return resp.json()
+    # Timeouts raised from 10s to 20s/25s with one retry on transient errors —
+    # 5 may incident: under FORCE-OTA reload pico, Google sometimes took 12s+
+    # responding to /directions. The 10s timeout was tripping HTTP 500s and
+    # leaving drivers staring at a blank map. Retry pattern matches /places/autocomplete.
+    last_error = "no attempt"
+    for attempt in range(2):
+        try:
+            timeout = 20.0 if attempt == 0 else 25.0
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/directions/json",
+                    params=params,
+                )
+            return resp.json()
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"directions request error (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                continue
+    raise HTTPException(status_code=504, detail=f"Google Directions timeout after retry: {last_error}")
 
 
   # Street View proxy removed - app opens Google Maps directly (free, no API cost)
