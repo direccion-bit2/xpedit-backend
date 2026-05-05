@@ -116,6 +116,38 @@ from optimizer import (
 # Cargar variables de entorno
 load_dotenv()
 
+
+# ---------------------------------------------------------------------------
+# Reusable HTTPX AsyncClient for Google Maps Platform.
+# 5 may 2026 incident: every /places/* and /directions handler did
+# `async with httpx.AsyncClient(timeout=N) as client:` — fresh TCP+TLS
+# handshake on every call. Under real load (22 drivers FORCE-OTA reload
+# at once) this saturated the event loop and pushed p99 past 17s.
+#
+# Note: an earlier attempt with a shared client at 10:24 today hit pool
+# exhaustion under 22 concurrent users (max_connections=50, pool=2s was
+# too tight). This version is more generous: 100/50/keepalive=30s, and
+# the pool timeout is 10s so a small burst doesn't immediately error.
+# Per-request timeout overrides are applied at each call site.
+_google_maps_client: Optional["httpx.AsyncClient"] = None
+
+
+def google_maps_client() -> "httpx.AsyncClient":
+    """Lazy singleton. Re-creates if the previous one was closed."""
+    global _google_maps_client
+    if _google_maps_client is None or _google_maps_client.is_closed:
+        _google_maps_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=10.0, write=3.0, pool=10.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=100,
+                keepalive_expiry=30.0,
+            ),
+            headers={"User-Agent": "Xpedit/1.1.4 (+xpedit.es)"},
+            http2=False,  # explicit: HTTP/1.1 keepalive is enough, avoids h2 dep
+        )
+    return _google_maps_client
+
 # Inicializar Supabase (service role key para bypass RLS en servidor)
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
 supabase: Client = create_client(
@@ -5085,19 +5117,21 @@ async def places_autocomplete(
     if sessiontoken:
         params["sessiontoken"] = sessiontoken
 
-    # 2 attempts with generous timeouts. Each attempt creates its own client
-    # (per-request handshake is slower per call but isolates pool issues —
-    # we tested a shared client at 10:24 today and hit pool exhaustion).
+    # 2 attempts with generous timeouts on the shared HTTPX client (avoids
+    # per-request TLS handshake). The earlier shared-client attempt at 10:24
+    # failed due to too-tight pool config (max=50, pool_timeout=2s) — this
+    # version uses 100/50/keepalive=30s/pool=10s which is more forgiving.
+    client = google_maps_client()
     last_error = None
     for attempt in range(2):
         try:
             timeout = 20.0 if attempt == 0 else 25.0
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(
-                    "https://maps.googleapis.com/maps/api/place/autocomplete/json",
-                    params=params,
-                )
-                data = resp.json()
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                params=params,
+                timeout=timeout,
+            )
+            data = resp.json()
 
             status = data.get("status")
             if status in ("OK", "ZERO_RESULTS"):
@@ -5166,8 +5200,11 @@ async def places_details(
     }
     if sessiontoken:
         params["sessiontoken"] = sessiontoken
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/place/details/json", params=params)
+    resp = await google_maps_client().get(
+        "https://maps.googleapis.com/maps/api/place/details/json",
+        params=params,
+        timeout=10.0,
+    )
     return resp.json()
 
 
@@ -5180,9 +5217,12 @@ async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/geocode/json", params=params)
-        data = resp.json()
+    resp = await google_maps_client().get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        params=params,
+        timeout=10.0,
+    )
+    data = resp.json()
     if data.get("status") == "OK" and data.get("results"):
         result = data["results"][0]
         gloc = result.get("geometry", {}).get("location", {})
@@ -5237,14 +5277,15 @@ async def places_directions(
     # responding to /directions. The 10s timeout was tripping HTTP 500s and
     # leaving drivers staring at a blank map. Retry pattern matches /places/autocomplete.
     last_error = "no attempt"
+    client = google_maps_client()
     for attempt in range(2):
         try:
             timeout = 20.0 if attempt == 0 else 25.0
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(
-                    "https://maps.googleapis.com/maps/api/directions/json",
-                    params=params,
-                )
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/directions/json",
+                params=params,
+                timeout=timeout,
+            )
             return resp.json()
         except Exception as e:
             last_error = str(e)
@@ -7391,13 +7432,13 @@ async def periodic_health_check():
             places_ok = False
             for _hc_attempt in range(2):
                 try:
-                    async with httpx.AsyncClient(timeout=8.0) as client:
-                        resp = await client.get(
-                            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
-                            params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
-                        )
-                        places_data = resp.json()
-                        places_ok = places_data.get("status") in ("OK", "ZERO_RESULTS")
+                    resp = await google_maps_client().get(
+                        "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                        params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
+                        timeout=8.0,
+                    )
+                    places_data = resp.json()
+                    places_ok = places_data.get("status") in ("OK", "ZERO_RESULTS")
                 except Exception:
                     places_ok = False
                 if places_ok:
