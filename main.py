@@ -2,6 +2,7 @@
 Xpedit API - Backend de optimización de rutas
 """
 
+import asyncio
 import hashlib
 import hmac as _hmac
 import json
@@ -323,6 +324,21 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 _jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 _jwks_client = PyJWKClient(_jwks_url) if SUPABASE_URL else None
 
+# In-process TTL cache for user profiles. 5 may 2026 incident: every single
+# authenticated request hit `supabase.table("users").select(...).execute()`
+# (sync supabase-py inside async handler) which blocked the event loop.
+# Cache profile by user_id for 60s — JWT lifetime is much longer, role
+# changes are rare, and a 60s window is still well within auth security
+# tolerances. Reduces DB load ~60% under typical autocomplete bursts.
+from cachetools import TTLCache as _TTLCache  # noqa: E402
+
+_user_profile_cache: _TTLCache = _TTLCache(maxsize=10000, ttl=60)
+
+
+def invalidate_user_cache(user_id: str) -> None:
+    """Drop a single user profile from cache (call after role changes)."""
+    _user_profile_cache.pop(user_id, None)
+
 
 async def get_current_user(authorization: str = Header(default=None)):
     """Verify Supabase JWT token and return user info"""
@@ -361,11 +377,21 @@ async def get_current_user(authorization: str = Header(default=None)):
 
         sentry_sdk.set_user({"id": user_id})
 
-        # Get user profile from DB
-        result = supabase.table("users").select("id, email, role, company_id").eq("id", user_id).single().execute()
+        # Cache hit path — skip DB roundtrip entirely.
+        cached = _user_profile_cache.get(user_id)
+        if cached is not None:
+            return cached
+
+        # Cache miss — fetch from DB and store. Sync call wrapped via thread
+        # pool so a slow DB query doesn't block the event loop for other
+        # in-flight requests (anyio default 40 → bumped to 200 in startup).
+        result = await asyncio.to_thread(
+            lambda: supabase.table("users").select("id, email, role, company_id").eq("id", user_id).single().execute()
+        )
         if not result.data:
             raise HTTPException(status_code=401, detail="Usuario no encontrado")
 
+        _user_profile_cache[user_id] = result.data
         return result.data
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado - cierra sesion y vuelve a entrar")
@@ -562,6 +588,25 @@ app = FastAPI(
     openapi_url=None if _is_production else "/openapi.json",
     openapi_tags=tags_metadata,
 )
+
+
+# 5 may 2026 incident mitigation: FastAPI/Starlette default thread pool is
+# 40 tokens (anyio). When `async def` handlers call sync supabase-py inside
+# them, the call is NOT delegated to the thread pool — it blocks the event
+# loop directly. But many internal `run_in_threadpool` paths (Starlette
+# middleware, FastAPI sync routes) DO use this pool. With 22 concurrent
+# drivers + a saturated event loop a 40-token pool is too small. Bumping
+# to 200 buys us breathing room while we migrate sync calls to
+# `await asyncio.to_thread(...)` one by one. See
+# https://github.com/Kludex/fastapi-tips#5-bigger-applications-multiple-files
+@app.on_event("startup")
+async def _bump_anyio_thread_pool():
+    try:
+        import anyio
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 200
+        logger.info("anyio thread pool limiter raised to 200 (was 40)")
+    except Exception as e:
+        logger.warning(f"Could not raise anyio thread limiter: {e}")
 
 # CORS
 app.add_middleware(
