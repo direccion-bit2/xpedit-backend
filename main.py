@@ -37,6 +37,32 @@ from supabase import Client, create_client
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("xpedit")
 
+# ---------------------------------------------------------------------------
+# Reusable HTTPX client for Google Maps APIs.
+# Why: previously every /places/* and /directions/* endpoint did
+# `async with httpx.AsyncClient(timeout=8) as client: ...`, which forces a
+# fresh TCP+TLS handshake on every request. Under real load (5 may incident:
+# 22 drivers active, autocomplete "se queda cargando") this saturated the
+# event loop and pushed p95 latencies past 8s, tripping the Nominatim
+# fallback alert.
+# Fix: one shared AsyncClient with HTTP/2 keepalive + connection pool,
+# small connect/read timeouts, and per-request timeout overrides where the
+# operation legitimately needs more headroom (Directions can be slower than
+# Autocomplete).
+_google_maps_client: Optional["httpx.AsyncClient"] = None
+
+
+def google_maps_client() -> "httpx.AsyncClient":
+    global _google_maps_client
+    if _google_maps_client is None or _google_maps_client.is_closed:
+        _google_maps_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=4.0, write=2.0, pool=2.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            headers={"User-Agent": "Xpedit/1.1.4 (+xpedit.es)"},
+            http2=False,  # explicit: avoid pulling h2 dep, HTTP/1.1 keepalive is enough
+        )
+    return _google_maps_client
+
 # Sentry - Error monitoring
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 if SENTRY_DSN:
@@ -4992,13 +5018,20 @@ async def places_autocomplete(
         if sessiontoken:
             params["sessiontoken"] = sessiontoken
 
-        # Retry once on timeout/error before falling back to Nominatim
+        # Retry once on timeout/error before falling back to Nominatim.
+        # Tighter per-request timeouts (3s/5s vs old 8s/10s) so a slow Google
+        # response trips Nominatim fast instead of leaving the user staring
+        # at a "cargando" spinner. Reusable client = no TLS handshake per call.
+        client = google_maps_client()
         for attempt in range(2):
             try:
-                timeout = 8.0 if attempt == 0 else 10.0
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
-                    data = resp.json()
+                per_attempt_timeout = 3.0 if attempt == 0 else 5.0
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                    params=params,
+                    timeout=per_attempt_timeout,
+                )
+                data = resp.json()
 
                 status = data.get("status")
                 if status == "OK":
@@ -5104,8 +5137,12 @@ async def places_details(
     }
     if sessiontoken:
         params["sessiontoken"] = sessiontoken
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/place/details/json", params=params)
+    # Shared client + tight 4s timeout (Place Details is a small, predictable call).
+    resp = await google_maps_client().get(
+        "https://maps.googleapis.com/maps/api/place/details/json",
+        params=params,
+        timeout=4.0,
+    )
     return resp.json()
 
 
@@ -5118,9 +5155,12 @@ async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/geocode/json", params=params)
-        data = resp.json()
+    resp = await google_maps_client().get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        params=params,
+        timeout=4.0,
+    )
+    data = resp.json()
     if data.get("status") == "OK" and data.get("results"):
         result = data["results"][0]
         gloc = result.get("geometry", {}).get("location", {})
@@ -5170,8 +5210,13 @@ async def places_directions(
         params["waypoints"] = combined_waypoints
     if avoid:
         params["avoid"] = avoid
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://maps.googleapis.com/maps/api/directions/json", params=params)
+    # Directions can legitimately be slower than Autocomplete (more compute upstream),
+    # so we give it a slightly larger 6s budget but still on the shared pooled client.
+    resp = await google_maps_client().get(
+        "https://maps.googleapis.com/maps/api/directions/json",
+        params=params,
+        timeout=6.0,
+    )
     return resp.json()
 
 
