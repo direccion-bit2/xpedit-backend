@@ -1648,7 +1648,9 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
 async def get_route(route_id: str, user=Depends(get_current_user)):
     """Obtiene una ruta con todas sus paradas. Verifica permisos de acceso."""
     await verify_route_access(route_id, user)
-    result = supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
+    )
     return result.data
 
 
@@ -1656,10 +1658,13 @@ async def get_route(route_id: str, user=Depends(get_current_user)):
 async def start_route(route_id: str, user=Depends(get_current_user)):
     """Marca una ruta como 'in_progress' y registra la hora de inicio."""
     await verify_route_access(route_id, user)
-    result = supabase.table("routes").update({
-        "status": "in_progress",
-        "started_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", route_id).execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").update({
+            "status": "in_progress",
+            "started_at": now_iso,
+        }).eq("id", route_id).execute()
+    )
     route = safe_first(result)
     if not route:
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
@@ -1670,10 +1675,13 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 async def complete_route(route_id: str, user=Depends(get_current_user)):
     """Marca una ruta como 'completed' y registra la hora de finalización."""
     await verify_route_access(route_id, user)
-    result = supabase.table("routes").update({
-        "status": "completed",
-        "completed_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", route_id).execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").update({
+            "status": "completed",
+            "completed_at": now_iso,
+        }).eq("id", route_id).execute()
+    )
     route = safe_first(result)
     if not route:
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
@@ -1709,10 +1717,13 @@ async def delete_route(route_id: str, user=Depends(get_current_user)):
 async def complete_stop(stop_id: str, user=Depends(get_current_user)):
     """Marca una parada como 'completed' y registra la hora."""
     await verify_stop_access(stop_id, user)
-    result = supabase.table("stops").update({
-        "status": "completed",
-        "completed_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", stop_id).execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("stops").update({
+            "status": "completed",
+            "completed_at": now_iso,
+        }).eq("id", stop_id).execute()
+    )
     stop = safe_first(result)
     if not stop:
         raise HTTPException(status_code=404, detail="Parada no encontrada")
@@ -1723,10 +1734,13 @@ async def complete_stop(stop_id: str, user=Depends(get_current_user)):
 async def fail_stop(stop_id: str, user=Depends(get_current_user)):
     """Marca una parada como 'failed' y registra la hora."""
     await verify_stop_access(stop_id, user)
-    result = supabase.table("stops").update({
-        "status": "failed",
-        "completed_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", stop_id).execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("stops").update({
+            "status": "failed",
+            "completed_at": now_iso,
+        }).eq("id", stop_id).execute()
+    )
     stop = safe_first(result)
     if not stop:
         raise HTTPException(status_code=404, detail="Parada no encontrada")
@@ -1773,7 +1787,11 @@ async def update_location(location: LocationUpdate, user=Depends(get_current_use
         "accuracy": location.accuracy
     }
 
-    result = supabase.table("location_history").insert(data).execute()
+    # asyncio.to_thread: location pings llegan cada ~15s × N drivers — el endpoint
+    # más caliente. Sync supabase aquí bloquea el event loop bajo carga.
+    result = await asyncio.to_thread(
+        lambda: supabase.table("location_history").insert(data).execute()
+    )
     location = safe_first(result)
     if not location:
         raise HTTPException(status_code=500, detail="Error al registrar ubicación")
