@@ -38,17 +38,45 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("xpedit")
 
 # Sentry - Error monitoring
+# 5 may 2026 incident: 0 events received in 30 days. Suspected silent SDK
+# misconfiguration. Made integrations explicit, raised sample rate, and
+# added a startup ping so we know whether Sentry is reachable from Railway.
 SENTRY_DSN = os.getenv("SENTRY_DSN")
+SENTRY_DEBUG = os.getenv("SENTRY_DEBUG", "false").lower() == "true"
 if SENTRY_DSN:
+    from sentry_sdk.integrations.asyncio import AsyncioIntegration
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration
+    from sentry_sdk.integrations.starlette import StarletteIntegration
+
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=0.1,
+        traces_sample_rate=1.0,  # 100% temporarily until we trust ingestion; drop to 0.1 once stable
         profiles_sample_rate=0.1,
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
         release="xpedit-backend@1.1.4",
         send_default_pii=False,
+        debug=SENTRY_DEBUG,
+        attach_stacktrace=True,
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            StarletteIntegration(transaction_style="endpoint"),
+            AsyncioIntegration(),
+            LoggingIntegration(level=logging.INFO, event_level=logging.ERROR),
+        ],
     )
-    logger.info("Sentry initialized for error monitoring")
+    logger.info(f"Sentry initialized (DSN configured, debug={SENTRY_DEBUG})")
+    # Startup ping — if this never appears in the Sentry UI, the SDK is silently
+    # dropping events (network blocked, DSN wrong, project disabled).
+    try:
+        sentry_sdk.capture_message(
+            "Backend startup ping",
+            level="info",
+        )
+    except Exception as e:
+        logger.warning(f"Sentry startup ping failed: {e}")
+else:
+    logger.warning("SENTRY_DSN not configured — backend errors will NOT be reported")
 
 from emails import (
     TRIAL_EXPIRING_D1_SUBJECT,
