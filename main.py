@@ -4969,69 +4969,74 @@ async def places_autocomplete(
     sessiontoken: Optional[str] = None,
     user=Depends(get_current_user),
 ):
-    """Proxy de Google Places Autocomplete con sesgo de ubicación. Fallback a Nominatim si falla.
+    """Proxy de Google Places Autocomplete con sesgo de ubicación. Solo Google, sin Nominatim.
 
     `sessiontoken` (opcional) agrupa keystrokes + Place Details en una única
     sesión facturable. Con session token, Google factura SOLO el Details final
     y los autocompletes son gratis. Sin token, cada autocomplete cuesta $2.83/1k.
     El cliente debe generar un UUID al abrir el input y pasarlo en cada
-    autocomplete + en el details posterior."""
+    autocomplete + en el details posterior.
+
+    5 may 2026: Nominatim removido. El cliente prefiere "no resultados" antes
+    que datos imprecisos. Timeouts subidos a 20s/25s para tolerar saturación."""
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
-    import re
+    import asyncio
 
-    google_ok = False
-    if GOOGLE_API_KEY:
-        params = {
-            "input": input,
-            "language": "es",
-            "key": GOOGLE_API_KEY,
-        }
-        if lat and lng:
-            params["location"] = f"{lat},{lng}"
-            params["radius"] = "30000"
-        if sessiontoken:
-            params["sessiontoken"] = sessiontoken
+    if not GOOGLE_API_KEY:
+        logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
+        return {"status": "ZERO_RESULTS", "predictions": [], "error_message": "API key not configured"}
 
-        # Retry once on timeout/error before falling back to Nominatim
-        for attempt in range(2):
-            try:
-                timeout = 8.0 if attempt == 0 else 10.0
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.get("https://maps.googleapis.com/maps/api/place/autocomplete/json", params=params)
-                    data = resp.json()
+    params = {
+        "input": input,
+        "language": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    if lat and lng:
+        params["location"] = f"{lat},{lng}"
+        params["radius"] = "30000"
+    if sessiontoken:
+        params["sessiontoken"] = sessiontoken
 
-                status = data.get("status")
-                if status == "OK":
-                    google_ok = True
-                    if not _places_api_healthy:
-                        logger.info("Google Places API recovered")
-                        _places_api_healthy = True
-                    return data
-                elif status == "ZERO_RESULTS":
-                    # API is working fine, just no matches — NOT a failure
-                    google_ok = True
-                    if not _places_api_healthy:
-                        logger.info("Google Places API recovered")
-                        _places_api_healthy = True
-                    break  # Fall through to Nominatim for better results
-                elif status == "OVER_QUERY_LIMIT":
-                    logger.warning(f"Google Places rate limited (attempt {attempt + 1})")
-                    if attempt == 0:
-                        import asyncio
-                        await asyncio.sleep(1)
-                        continue
-                    break
-                else:
-                    error_msg = data.get("error_message", status or "unknown")
-                    logger.warning(f"Google Places failed: status={status}, http={resp.status_code}, error={error_msg} (query: {input[:30]})")
-                    break
-            except Exception as e:
-                logger.warning(f"Google Places request error (attempt {attempt + 1}): {e}")
+    # 2 attempts with generous timeouts. Each attempt creates its own client
+    # (per-request handshake is slower per call but isolates pool issues —
+    # we tested a shared client at 10:24 today and hit pool exhaustion).
+    last_error = None
+    for attempt in range(2):
+        try:
+            timeout = 20.0 if attempt == 0 else 25.0
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                    params=params,
+                )
+                data = resp.json()
+
+            status = data.get("status")
+            if status in ("OK", "ZERO_RESULTS"):
+                if not _places_api_healthy:
+                    logger.info("Google Places API recovered")
+                    _places_api_healthy = True
+                return data
+            if status == "OVER_QUERY_LIMIT":
+                logger.warning(f"Google Places rate limited (attempt {attempt + 1})")
                 if attempt == 0:
+                    await asyncio.sleep(0.5)
                     continue
+                last_error = "OVER_QUERY_LIMIT"
+                break
+            error_msg = data.get("error_message", status or "unknown")
+            logger.warning(f"Google Places failed: status={status}, http={resp.status_code}, error={error_msg} (query: {input[:30]})")
+            last_error = f"{status}: {error_msg}"
+            break
+        except Exception as e:
+            logger.warning(f"Google Places request error (attempt {attempt + 1}): {e}")
+            last_error = str(e)
+            if attempt == 0:
+                continue
 
-    # Alert on first failure (then cooldown 1h)
-    if not google_ok and _places_api_healthy:
+    # Failure path: alert (cooldown 1h) and return empty so the client
+    # shows "Sin resultados" instead of stale/imprecise data.
+    if _places_api_healthy:
         _places_api_healthy = False
         now = datetime.now(timezone.utc)
         if not _places_api_last_alert or (now - _places_api_last_alert).total_seconds() > 3600:
@@ -5039,49 +5044,18 @@ async def places_autocomplete(
             try:
                 send_alert_email(
                     ALERT_EMAIL,
-                    "ALERTA: Google Places API caída - usando Nominatim",
-                    f"Google Places no responde. Autocomplete usa Nominatim como fallback.\n"
+                    "ALERTA: Google Places API no responde",
+                    f"Google Places falló tras 2 intentos. Última causa: {last_error}\n"
                     f"Key configurada: {'Sí' if GOOGLE_API_KEY else 'NO (vacía!)'}\n"
                     f"Timestamp: {now.isoformat()}Z\n"
-                    f"Acción: verificar GOOGLE_API_KEY en Railway y restricciones en Google Cloud Console.",
+                    f"Acción: verificar GOOGLE_API_KEY en Railway, cuotas y restricciones en Google Cloud Console.",
                 )
             except Exception:
                 pass
             if SENTRY_DSN:
-                sentry_sdk.capture_message("Google Places API down, using Nominatim fallback", level="warning")
+                sentry_sdk.capture_message(f"Google Places failed: {last_error}", level="warning")
 
-    # Fallback: Nominatim (OpenStreetMap) - free, no API key
-    nom_query = input
-    nom_base_params = {
-        "format": "json",
-        "addressdetails": "1",
-        "limit": "5",
-        "accept-language": "es",
-    }
-    if lat and lng:
-        nom_base_params["viewbox"] = f"{lng-0.5},{lat+0.5},{lng+0.5},{lat-0.5}"
-        nom_base_params["bounded"] = "0"
-
-    street_prefixes = r"^(calle|avenida|avda|av|plaza|paseo|camino|carretera|ctra|ronda|travesia|urbanizacion|urb|poligono|pol)\s+"
-    stripped = re.sub(street_prefixes, "", nom_query, flags=re.IGNORECASE).strip()
-    queries = [nom_query] if stripped == nom_query else [nom_query, stripped]
-
-    nom_data = []
-    async with httpx.AsyncClient(timeout=10) as client:
-        for q in queries:
-            nom_resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={**nom_base_params, "q": q},
-                headers={"User-Agent": "Xpedit/1.1"}
-            )
-            nom_data = nom_resp.json()
-            if nom_data:
-                break
-
-    if nom_data:
-        results = [{"place_id": None, "display_name": r["display_name"], "lat": r["lat"], "lon": r["lon"], "source": "nominatim"} for r in nom_data]
-        return {"status": "OK", "predictions": results, "source": "nominatim"}
-    return {"status": "ZERO_RESULTS", "predictions": []}
+    return {"status": "ZERO_RESULTS", "predictions": [], "error_message": last_error}
 
 
 @app.get("/places/details", tags=["places"], summary="Detalles de lugar")
