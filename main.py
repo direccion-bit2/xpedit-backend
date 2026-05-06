@@ -4523,7 +4523,16 @@ CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
             )
 
         if response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"OCR API error: {response.status_code}")
+            error_body = response.text[:500]
+            logger.error(f"Anthropic OCR error {response.status_code}: {error_body}")
+            sentry_sdk.capture_message(
+                f"Anthropic OCR error {response.status_code}: {error_body}",
+                level="error",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"OCR API error {response.status_code}: {error_body[:200]}",
+            )
 
         data = response.json()
         content = data.get("content", [{}])[0].get("text", "")

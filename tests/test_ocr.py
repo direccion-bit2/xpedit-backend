@@ -195,7 +195,7 @@ class TestOCRLabelErrors:
             })
 
         assert resp.status_code == 502
-        assert "OCR API error: 429" in resp.json()["detail"]
+        assert "OCR API error 429" in resp.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_anthropic_api_500(self, client):
