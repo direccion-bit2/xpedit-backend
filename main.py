@@ -3,6 +3,7 @@ Xpedit API - Backend de optimización de rutas
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac as _hmac
 import json
@@ -4543,6 +4544,308 @@ CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
+
+
+# === MULTI-SCREENSHOT IMPORTER (Pro+ killer feature) ===
+#
+# Driver sends 1-10 screenshots of their carrier app (CTT, MRW, Seur, GLS,
+# NACEX, Correos Express, …) or a generic stop list and we extract structured
+# stops with Gemini 2.5 Pro. Day 1 returns raw extraction; Day 2 will add
+# normalization + Google Geocoding with ES anchors.
+#
+# Gate: Pro+ paid OR Pro yearly OR active Pro trial. See _verify_msi_access.
+# Rate limit: 5 batches/day on trial, 50 batches/day on Pro+/yearly.
+
+_MSI_MAX_IMAGES = 10
+_MSI_MAX_IMAGE_B64 = 12_000_000  # ~9 MB per image post-base64
+_MSI_MODEL = "gemini-2.5-pro"
+
+
+class MSIScreenshotImage(BaseModel):
+    image_base64: str = Field(..., max_length=_MSI_MAX_IMAGE_B64)
+    media_type: Literal["image/jpeg", "image/png", "image/webp"] = "image/jpeg"
+
+
+class MSIRouteContext(BaseModel):
+    depot_lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    depot_lng: Optional[float] = Field(default=None, ge=-180, le=180)
+    country: Optional[str] = Field(default=None, max_length=2)  # ISO-2
+    language: Optional[str] = Field(default="es", max_length=5)
+
+
+class MSIBatchRequest(BaseModel):
+    images: List[MSIScreenshotImage] = Field(..., min_length=1, max_length=_MSI_MAX_IMAGES)
+    carrier_hint: Optional[Literal[
+        "ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"
+    ]] = None
+    route_context: Optional[MSIRouteContext] = None
+
+
+def _verify_msi_access(auth_user_id: str) -> dict:
+    """Gate for /ocr/screenshots-batch. Returns {tier, is_eligible, trial_eligible}.
+
+    Eligible:
+      - Pro+ paid: promo_plan='pro_plus' AND subscription_source IN ('stripe','revenuecat')
+      - Pro yearly: subscription_period='yearly' (treat as premium tier)
+      - Active trial: promo_plan='pro' AND promo_plan_expires_at > NOW()
+        AND subscription_source IS NULL  (i.e. not paid Pro monthly)
+
+    Pro paid monthly is NOT eligible — this is the Pro+ differentiator.
+
+    Raises HTTPException(403) if not eligible. The detail body always includes
+    `trial_eligible` so the app knows whether to show "Start trial" or
+    "Upgrade to Pro+" in the paywall.
+    """
+    try:
+        d = supabase.table("drivers").select(
+            "promo_plan, promo_plan_expires_at, subscription_source, subscription_period"
+        ).eq("user_id", auth_user_id).single().execute()
+        row = d.data or {}
+    except Exception as e:
+        logger.warning(f"MSI access check failed: {e}")
+        raise HTTPException(status_code=403, detail={"error": "verification_failed"})
+
+    promo = row.get("promo_plan")
+    expires_raw = row.get("promo_plan_expires_at")
+    sub_src = row.get("subscription_source")
+    sub_period = row.get("subscription_period")
+
+    is_pro_plus_paid = promo == "pro_plus" and sub_src in ("stripe", "revenuecat")
+    is_pro_yearly = sub_period == "yearly"
+
+    is_trial = False
+    if promo in ("pro", "pro_plus") and sub_src is None and expires_raw:
+        try:
+            expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+            is_trial = expires_at > datetime.now(timezone.utc)
+        except (ValueError, AttributeError):
+            is_trial = False
+
+    is_eligible = is_pro_plus_paid or is_pro_yearly or is_trial
+    tier = "pro_plus" if is_pro_plus_paid else ("pro_yearly" if is_pro_yearly else ("trial" if is_trial else "none"))
+
+    if not is_eligible:
+        # Trial-eligible if user has never used a trial or trial already expired
+        # (we offer extension via email/marketing flow). For now, true if no
+        # subscription at all and trial not currently active.
+        trial_eligible = sub_src is None and not is_trial
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "pro_plus_required",
+                "message": "El importador de pantallazos es exclusivo de Pro+. Activa la prueba o suscríbete.",
+                "trial_eligible": trial_eligible,
+            },
+        )
+
+    return {"tier": tier, "is_eligible": True, "trial_eligible": False}
+
+
+def _msi_gemini_response_schema() -> dict:
+    """JSON Schema (subset Google supports) for Gemini structured output."""
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "carrier_detected": {
+                "type": "STRING",
+                "description": "Detected carrier from app UI hints (logo, colors, layout). Use 'generic' if uncertain.",
+                "enum": ["ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"],
+            },
+            "language": {"type": "STRING", "description": "Detected language (ISO-639-1). Usually 'es'."},
+            "stops": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "raw_text": {"type": "STRING", "description": "Original text block from screenshot"},
+                        "name": {"type": "STRING", "description": "Recipient name if visible"},
+                        "street": {"type": "STRING", "description": "Street name only — NOT including floor/etc."},
+                        "number": {"type": "STRING", "description": "Street number (5, 5B, 5-7, s/n)"},
+                        "floor_etc": {"type": "STRING", "description": "Floor/portal/staircase: '4B', 'Esc 2', 'Pta 3'. Save for delivery instructions, NEVER send to geocoder."},
+                        "postal_code": {"type": "STRING", "description": "Spanish 5-digit postal code"},
+                        "city": {"type": "STRING", "description": "City / municipality"},
+                        "province": {"type": "STRING", "description": "Spanish province"},
+                        "phone": {"type": "STRING"},
+                        "tracking_number": {"type": "STRING", "description": "Carrier tracking ID if visible"},
+                        "notes": {"type": "STRING", "description": "Extra delivery instructions"},
+                        "confidence_per_field": {
+                            "type": "OBJECT",
+                            "description": "Per-field confidence 0..1. Lower if inferred from context.",
+                            "properties": {
+                                "street": {"type": "NUMBER"},
+                                "number": {"type": "NUMBER"},
+                                "city": {"type": "NUMBER"},
+                                "postal_code": {"type": "NUMBER"},
+                                "province": {"type": "NUMBER"},
+                            },
+                        },
+                        "source_image_idx": {"type": "INTEGER", "description": "0-based index of the source image in the batch"},
+                        "context_inferred_fields": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "Field names that were inferred from sibling stops, not explicitly visible.",
+                        },
+                    },
+                    "required": ["street", "source_image_idx", "confidence_per_field"],
+                },
+            },
+            "global_inference_notes": {
+                "type": "STRING",
+                "description": "Free-form notes about overall extraction (e.g. 'all stops appear to be in Sevilla based on visible header').",
+            },
+        },
+        "required": ["carrier_detected", "stops"],
+    }
+
+
+def _msi_build_prompt(carrier_hint: Optional[str], route_context: Optional[MSIRouteContext]) -> str:
+    """Builds the system prompt for screenshot extraction. V1 will inject
+    per-carrier few-shot examples (TODO #256). Day 1 ships generic prompt."""
+    carrier_line = ""
+    if carrier_hint and carrier_hint != "generic":
+        carrier_line = f"\nEl usuario indica que las pantallas son de la app del courier: {carrier_hint.upper()}. Usa ese contexto para localizar campos."
+    else:
+        carrier_line = "\nDetecta el courier (CTT, MRW, Seur, GLS, NACEX, Correos Express, TIPSA) por logo, colores o disposición. Si no estás seguro, devuelve 'generic'."
+
+    ctx_line = ""
+    if route_context:
+        bits = []
+        if route_context.depot_lat and route_context.depot_lng:
+            bits.append(f"el depósito del repartidor está en lat={route_context.depot_lat}, lng={route_context.depot_lng}")
+        if route_context.country:
+            bits.append(f"país={route_context.country}")
+        if bits:
+            ctx_line = "\nContexto del repartidor: " + "; ".join(bits) + "."
+
+    return f"""Eres un extractor experto de listas de paradas de reparto desde pantallazos de apps de paquetería españolas.{carrier_line}{ctx_line}
+
+Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distintas posiciones) o listas distintas. Tu tarea:
+
+1. Detecta cada parada/envío único. Si la misma parada aparece en 2 imágenes (porque el usuario hizo scroll), inclúyela UNA sola vez (con `source_image_idx` = la imagen donde se ve más completa).
+2. Extrae los campos: name (destinatario), street (solo nombre de calle), number (número), floor_etc (piso/escalera/portal/puerta — NUNCA juntar con street), postal_code (5 dígitos), city, province, phone, tracking_number, notes.
+3. Para cada campo extraído anota un `confidence_per_field` entre 0 y 1 (1 = totalmente legible y seguro).
+4. **Inferencia contextual**: si una parada no muestra ciudad/provincia pero el resto de la lista sí, infiere usándolas. Marca esos campos en `context_inferred_fields` y baja su confidence a ≤0.7. Si la mayoría de paradas son de Sevilla y una parada solo muestra calle, asume Sevilla con confidence 0.6 y anota.
+5. **NUNCA inventes**. Si no puedes leer un campo y NO hay contexto suficiente, deja el campo vacío (string vacía).
+6. Para `floor_etc` extrae expresiones como "4ºB", "Esc 2", "Pta 3", "Portal C", "1º derecha". Estas NUNCA van junto a la calle, van separadas para añadirlas a las notas del repartidor.
+7. Si una imagen no contiene una lista de paradas (foto random, captura no relacionada), simplemente no añadas paradas de ahí.
+8. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
+
+Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
+
+
+def _msi_extract_stops_with_gemini(
+    images: List[MSIScreenshotImage],
+    carrier_hint: Optional[str],
+    route_context: Optional[MSIRouteContext],
+) -> dict:
+    """Synchronous helper that calls Gemini 2.5 Pro with multimodal request +
+    structured response schema. Returns the parsed JSON dict. Wrap in
+    asyncio.to_thread() from async caller — google-genai SDK is blocking."""
+    from google.genai import types
+
+    client = get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="Gemini AI no configurado")
+
+    parts: list = [types.Part.from_text(text=_msi_build_prompt(carrier_hint, route_context))]
+    for idx, img in enumerate(images):
+        parts.append(types.Part.from_text(text=f"[Imagen #{idx}]"))
+        parts.append(
+            types.Part.from_bytes(
+                data=base64.b64decode(img.image_base64),
+                mime_type=img.media_type,
+            )
+        )
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=_msi_gemini_response_schema(),
+        temperature=0.1,
+        max_output_tokens=8192,
+    )
+
+    response = client.models.generate_content(
+        model=_MSI_MODEL,
+        contents=[types.Content(role="user", parts=parts)],
+        config=config,
+    )
+    text = (response.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="Empty response from Gemini")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"MSI Gemini returned invalid JSON: {e}; text[:200]={text[:200]}")
+        raise HTTPException(status_code=502, detail="Invalid JSON from Gemini")
+
+
+@app.post(
+    "/ocr/screenshots-batch",
+    tags=["ocr", "msi"],
+    summary="Importar paradas desde 1-10 pantallazos (Pro+ feature)",
+)
+async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_user)):
+    """Multi-Screenshot Importer Day 1: extract stops from a batch of carrier-app
+    screenshots using Gemini 2.5 Pro. Returns structured stops; geocoding +
+    normalization will land in Day 2.
+
+    Gate: Pro+ paid OR Pro yearly OR active Pro trial. Pro paid monthly is NOT
+    eligible (this is the Pro+ differentiator).
+
+    Rate limit: 5 batches/day on trial, 50 batches/day on Pro+/yearly.
+    """
+    import time
+
+    auth_user_id = user["id"]
+    eligibility = _verify_msi_access(auth_user_id)  # raises 403 if not eligible
+    tier = eligibility["tier"]
+
+    # Per-tier daily rate limit (window=24h). Reuses helper from main.py:707.
+    daily_quota = 5 if tier == "trial" else 50
+    check_rate_limit(f"msi:{auth_user_id}:daily", max_requests=daily_quota, window_seconds=86400)
+
+    t_start = time.perf_counter()
+    try:
+        gemini_result = await asyncio.to_thread(
+            _msi_extract_stops_with_gemini, req.images, req.carrier_hint, req.route_context
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MSI extraction failed: {type(e).__name__}: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=502, detail="Extraction failed")
+
+    processing_ms = int((time.perf_counter() - t_start) * 1000)
+    stops = gemini_result.get("stops") or []
+
+    if SENTRY_DSN:
+        sentry_sdk.add_breadcrumb(
+            category="msi",
+            message="screenshots-batch processed",
+            level="info",
+            data={
+                "n_images": len(req.images),
+                "n_stops": len(stops),
+                "carrier_detected": gemini_result.get("carrier_detected"),
+                "carrier_hint": req.carrier_hint,
+                "tier": tier,
+                "processing_ms": processing_ms,
+            },
+        )
+
+    return {
+        "success": True,
+        "carrier_detected": gemini_result.get("carrier_detected", "generic"),
+        "language": gemini_result.get("language", "es"),
+        "stops_count": len(stops),
+        "stops": stops,
+        "global_inference_notes": gemini_result.get("global_inference_notes", ""),
+        "processing_ms": processing_ms,
+        "model": _MSI_MODEL,
+        "tier": tier,
+    }
 
 
 # === STRIPE CHECKOUT ===
