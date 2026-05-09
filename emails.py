@@ -788,8 +788,8 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
                     <span style="font-size: 20px;">📍</span>
                 </td>
                 <td>
-                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">20 paradas/día gratis</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Hemos ampliado el plan gratuito: optimiza hasta 20 paradas al día sin coste.</p>
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">10 paradas/día gratis</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Sigue probándolo: hasta 10 paradas al día sin coste.</p>
                 </td>
             </tr>
         </table>
@@ -973,7 +973,7 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
     user_name = html_escape(user_name or "repartidor")
     content = f"""
         <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
-            Nuevo: inicia sesion con Google o Apple
+            Nuevo: inicia sesi&oacute;n con Google o Apple
         </h2>
 
         <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
@@ -981,7 +981,7 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
         </p>
 
         <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
-            Ahora puedes iniciar sesion en Xpedit con tu cuenta de Google o Apple. Sin recordar contrasenas, sin formularios. Un toque y estas dentro.
+            Ahora puedes iniciar sesi&oacute;n en Xpedit con tu cuenta de Google o Apple. Sin recordar contrase&ntilde;as ni formularios. Un toque y est&aacute;s dentro.
         </p>
 
         <!-- Features -->
@@ -992,7 +992,7 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
                 </td>
                 <td>
                     <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Google Login</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Inicia sesion con tu cuenta de Google en un toque. Funciona en la app y en la web.</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Inicia sesi&oacute;n con tu cuenta de Google en un toque. Funciona en la app y en la web.</p>
                 </td>
             </tr>
         </table>
@@ -1004,7 +1004,7 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
                 </td>
                 <td>
                     <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Apple Login</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Si usas iPhone, inicia sesion con Face ID o Touch ID. Rapido, seguro y privado.</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Si usas iPhone, inicia sesi&oacute;n con Face ID o Touch ID. R&aacute;pido, seguro y privado.</p>
                 </td>
             </tr>
         </table>
@@ -1016,23 +1016,23 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
                 </td>
                 <td>
                     <p style="margin: 0 0 4px 0; color: #111827; font-size: 15px; font-weight: 600;">Tu cuenta no cambia</p>
-                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Tus rutas, paradas e historial siguen igual. Solo cambia como entras — todo lo demas se mantiene.</p>
+                    <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 14px;">Tus rutas, paradas e historial siguen igual. Solo cambia c&oacute;mo entras &mdash; todo lo dem&aacute;s se mantiene.</p>
                 </td>
             </tr>
         </table>
 
         <div style="text-align: center; margin: 30px 0;">
             <a href="https://www.xpedit.es/login" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
-                Probar Social Login
+                Probar inicio de sesi&oacute;n
             </a>
         </div>
 
         <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
-            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escribenos por WhatsApp</a> — te respondemos en minutos.
+            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escr&iacute;benos por WhatsApp</a> &mdash; te respondemos en minutos.
         </p>
 
         <p style="margin: 15px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
-            Recibes este email porque tienes una cuenta en Xpedit. Si no quieres recibir mas emails, responde con &quot;cancelar&quot;.
+            Recibes este email porque tienes una cuenta en Xpedit. Si no quieres recibir m&aacute;s emails, responde con &quot;cancelar&quot;.
         </p>
     """
 
@@ -1041,8 +1041,8 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
             "from": FROM_EMAIL,
             "to": [to_email],
             "reply_to": REPLY_TO,
-            "subject": "Nuevo: inicia sesion con Google o Apple",
-            "html": get_base_template(content, "Social Login en Xpedit")
+            "subject": "Nuevo: inicia sesión con Google o Apple",
+            "html": get_base_template(content, "Inicio de sesión con Google y Apple")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:
@@ -1050,7 +1050,7 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
 
 
 def send_social_login_broadcast(to_emails_with_names: List[dict]) -> dict:
-    """Envia el anuncio de social login a multiples usuarios."""
+    """Envía el anuncio de social login a múltiples usuarios."""
     results = {"sent": 0, "failed": 0, "errors": []}
 
     for item in to_emails_with_names:
@@ -1064,8 +1064,8 @@ def send_social_login_broadcast(to_emails_with_names: List[dict]) -> dict:
     return results
 
 
-TRIAL_EXPIRING_D3_SUBJECT = "Te quedan 3 dias de Xpedit Pro"
-TRIAL_EXPIRING_D1_SUBJECT = "Manana se acaba tu prueba Pro"
+TRIAL_EXPIRING_D3_SUBJECT = "Te quedan 3 días de Xpedit Pro"
+TRIAL_EXPIRING_D1_SUBJECT = "Mañana se acaba tu prueba Pro"
 
 
 def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
@@ -1209,7 +1209,7 @@ def send_trial_last_day_email(to_email: str, user_name: str) -> dict:
             "to": [to_email],
             "reply_to": REPLY_TO,
             "subject": TRIAL_EXPIRING_D1_SUBJECT,
-            "html": get_base_template(content, "Manana acaba tu prueba Pro")
+            "html": get_base_template(content, "Mañana acaba tu prueba Pro")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:
@@ -1246,7 +1246,7 @@ def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> d
             <h3 style="margin: 0 0 12px 0; color: #166534; font-size: 15px;">Recupera tus funciones {plan_display}:</h3>
             <ul style="margin: 0; padding-left: 20px; color: #166534; font-size: 14px; line-height: 2;">
                 <li>Optimizaci&oacute;n IA &mdash; ahorra hasta 30% en km y combustible</li>
-                <li>Paradas ilimitadas por ruta</li>
+                <li>Paradas ilimitadas por d&iacute;a</li>
                 <li>Prueba de entrega con foto y firma</li>
                 <li>Soporte prioritario</li>
             </ul>
@@ -1262,7 +1262,7 @@ def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> d
         </div>
 
         <p style="margin: 20px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
-            Mientras tanto, puedes seguir usando el plan Gratis con hasta 20 paradas por ruta.
+            Mientras tanto, puedes seguir usando el plan Gratis con hasta 10 paradas al d&iacute;a.
         </p>
 
         <p style="margin: 15px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
@@ -1288,8 +1288,8 @@ def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> d
 
 
 def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str, tokens: Optional[dict] = None) -> dict:
-    """Email de feedback post-trial: se envia 8 dias despues de expirar el trial.
-    Pregunta al usuario por que no continuo con 4 opciones de 1 click.
+    """Email de feedback post-trial: se envía 8 días después de expirar el trial.
+    Pregunta al usuario por qué no continuó con 4 opciones de 1 click.
 
     `tokens` is a dict mapping reason → HMAC token; required by the backend
     /feedback/trial endpoint to validate that the click came from a legit
@@ -1353,8 +1353,8 @@ def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str, tok
             "from": FROM_EMAIL,
             "to": [to_email],
             "reply_to": "direccion@taespack.com",
-            "subject": "Tu prueba de Xpedit ha terminado - nos encantaria saber por que",
-            "html": get_base_template(content, "Tu opinion nos importa")
+            "subject": "Tu prueba de Xpedit ha terminado — nos encantaría saber por qué",
+            "html": get_base_template(content, "Tu opinión nos importa")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:
@@ -1419,8 +1419,8 @@ def send_survey_email(to_email: str, user_name: str, campaign_id: str, driver_id
             "from": FROM_EMAIL,
             "to": [to_email],
             "reply_to": "direccion@taespack.com",
-            "subject": "Hemos mejorado Xpedit - queremos escucharte",
-            "html": get_base_template(content, "Tu opinion nos importa")
+            "subject": "Hemos mejorado Xpedit — queremos escucharte",
+            "html": get_base_template(content, "Tu opinión nos importa")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:
