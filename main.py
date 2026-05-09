@@ -4779,15 +4779,400 @@ def _msi_extract_stops_with_gemini(
         raise HTTPException(status_code=502, detail="Invalid JSON from Gemini")
 
 
+# --- Day 2: normalization, geocoding, confidence ---
+#
+# Gemini returns raw text fields. To make the stops actually usable we:
+#   1) Normalize each stop (clean fields, defensively re-split floor_etc from
+#      street if the model leaked it through).
+#   2) Geocode each stop with Google Geocoding using country:ES +
+#      postal_code anchor + (round 2) centroid bounds for stops that failed
+#      round 1.
+#   3) Compute a HIGH/MEDIUM/LOW confidence per stop combining extraction
+#      confidence, geocoder location_type, and presence of inferred fields.
+#   4) For LOW, fetch up to 3 autocomplete candidates so the user can pick.
+
+# Spanish 5-digit postal codes: first 2 digits → province. Static map (52
+# provinces inc. Ceuta/Melilla). Used as a defensive anchor when Gemini
+# extracts CP but no province (or wrong province).
+_MSI_CP_PROVINCE_MAP = {
+    "01": "Álava",         "02": "Albacete",      "03": "Alicante",
+    "04": "Almería",       "05": "Ávila",         "06": "Badajoz",
+    "07": "Baleares",      "08": "Barcelona",     "09": "Burgos",
+    "10": "Cáceres",       "11": "Cádiz",         "12": "Castellón",
+    "13": "Ciudad Real",   "14": "Córdoba",       "15": "A Coruña",
+    "16": "Cuenca",        "17": "Girona",        "18": "Granada",
+    "19": "Guadalajara",   "20": "Guipúzcoa",     "21": "Huelva",
+    "22": "Huesca",        "23": "Jaén",          "24": "León",
+    "25": "Lleida",        "26": "La Rioja",      "27": "Lugo",
+    "28": "Madrid",        "29": "Málaga",        "30": "Murcia",
+    "31": "Navarra",       "32": "Ourense",       "33": "Asturias",
+    "34": "Palencia",      "35": "Las Palmas",    "36": "Pontevedra",
+    "37": "Salamanca",     "38": "Santa Cruz de Tenerife",
+    "39": "Cantabria",     "40": "Segovia",       "41": "Sevilla",
+    "42": "Soria",         "43": "Tarragona",     "44": "Teruel",
+    "45": "Toledo",        "46": "Valencia",      "47": "Valladolid",
+    "48": "Vizcaya",       "49": "Zamora",        "50": "Zaragoza",
+    "51": "Ceuta",         "52": "Melilla",
+}
+
+# Regex patterns to detect floor/portal/staircase fragments that occasionally
+# leak into `street`. Word-bounded so they never match substrings inside a
+# longer word (e.g. "esc" must not match the "esc" inside "Desconocida").
+_MSI_FLOOR_RE = re.compile(
+    r"(?:,\s*|\s+)(?P<frag>"
+    r"(?:\bpiso\b|\bpta\b|\bpuerta\b|\besc\b|\bescalera\b|\bportal\b|\bbloque\b|\bblq\b|"
+    r"\d+\s*[ºªo]\s*[A-Za-zÀ-ÿ]?(?:\s+(?:izda|dcha|izquierda|derecha))?|"
+    r"\b\d+[A-Za-z]\b"
+    r")(?:[^,]*?))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _msi_postal_code_to_province(cp: Optional[str]) -> Optional[str]:
+    """Map Spanish 5-digit postal code first 2 digits to province name."""
+    if not cp:
+        return None
+    digits = re.sub(r"\D", "", cp)
+    if len(digits) >= 2:
+        return _MSI_CP_PROVINCE_MAP.get(digits[:2])
+    return None
+
+
+def _msi_normalize_extracted_stop(stop: dict) -> dict:
+    """Defensive cleanup of one stop dict from Gemini. Returns mutated dict.
+
+    - Trim whitespace on string fields
+    - Reject garbage placeholders FIRST so they don't survive later steps
+    - Strip non-digits from postal_code, take first 5
+    - If `street` ends with a floor/portal fragment that Gemini missed,
+      move it to `floor_etc` so it never reaches the geocoder
+    - If province is missing but postal_code is valid Spanish CP, infer it
+    """
+    # Trim everything
+    for k in ("name", "street", "number", "floor_etc", "city",
+              "province", "phone", "tracking_number", "notes"):
+        if isinstance(stop.get(k), str):
+            stop[k] = stop[k].strip()
+
+    # Reject placeholder/garbage values BEFORE other transforms so they
+    # never reach the floor splitter or the geocoder.
+    GARBAGE = {
+        "DIRECCIÓN DESCONOCIDA", "DIRECCION DESCONOCIDA", "TBD", "S/I", "N/A",
+        "PENDIENTE", "—", "-", "?", "??", "DESCONOCIDA", "DESCONOCIDO",
+    }
+    for fld in ("street", "city", "province"):
+        v = (stop.get(fld) or "").upper().strip()
+        if v in GARBAGE:
+            stop[fld] = ""
+
+    # Postal code: keep only digits, take first 5
+    if stop.get("postal_code"):
+        digits = re.sub(r"\D", "", stop["postal_code"])
+        stop["postal_code"] = digits[:5] if len(digits) >= 5 else ""
+
+    # Defensive: re-split floor_etc from street if Gemini missed it
+    street = stop.get("street") or ""
+    if street and not stop.get("floor_etc"):
+        m = _MSI_FLOOR_RE.search(street)
+        if m:
+            frag = m.group("frag").strip(", ").strip()
+            # Only split when the fragment is plausibly a floor/portal — not
+            # the whole street (e.g. "4ºB" alone shouldn't replace "Mayor").
+            remaining = street[: m.start()].strip(" ,")
+            if remaining and len(remaining) >= 3:
+                stop["street"] = remaining
+                stop["floor_etc"] = frag
+
+    # Anchor province from CP if missing. Use direct dict access (not
+    # `setdefault(...) or []`) — when the existing list is empty it is
+    # falsy and `or` would shadow the real list with a fresh one,
+    # silently dropping the append.
+    if not stop.get("province"):
+        inferred = _msi_postal_code_to_province(stop.get("postal_code"))
+        if inferred:
+            stop["province"] = inferred
+            cif = stop.get("context_inferred_fields")
+            if not isinstance(cif, list):
+                cif = []
+                stop["context_inferred_fields"] = cif
+            if "province" not in cif:
+                cif.append("province")
+            cpf = stop.get("confidence_per_field")
+            if not isinstance(cpf, dict):
+                cpf = {}
+                stop["confidence_per_field"] = cpf
+            cpf["province"] = max(0.85, cpf.get("province", 0.0))
+
+    return stop
+
+
+def _msi_compute_centroid_bbox(coords: list) -> Optional[dict]:
+    """Given list of {lat, lng}, return a bounding box dict {ne_lat, ne_lng,
+    sw_lat, sw_lng} centered on the centroid with ~30 km padding. Returns
+    None if fewer than 2 valid coords (insufficient signal)."""
+    valid = [c for c in coords if c and c.get("lat") is not None and c.get("lng") is not None]
+    if len(valid) < 2:
+        return None
+    avg_lat = sum(c["lat"] for c in valid) / len(valid)
+    avg_lng = sum(c["lng"] for c in valid) / len(valid)
+    # ~30km bbox: 0.27° lat, 0.40° lng at lat=40
+    lat_pad = 0.27
+    lng_pad = 0.40 / max(math.cos(math.radians(avg_lat)), 1e-6)
+    return {
+        "sw_lat": avg_lat - lat_pad, "sw_lng": avg_lng - lng_pad,
+        "ne_lat": avg_lat + lat_pad, "ne_lng": avg_lng + lng_pad,
+    }
+
+
+async def _msi_geocode_one(
+    client: "httpx.AsyncClient",
+    stop: dict,
+    country: str = "ES",
+    bbox: Optional[dict] = None,
+) -> dict:
+    """Single async call to Google Geocoding for one stop.
+
+    Returns a dict augmenting the stop:
+      { lat, lng, formatted_address, location_type, place_id, status }
+    where status ∈ {"ok", "zero_results", "error"}.
+
+    NEVER includes floor_etc in the geocoded address — that's preserved
+    separately for the driver's delivery_instructions.
+    """
+    if not GOOGLE_API_KEY:
+        return {"status": "error", "error": "no_api_key"}
+
+    parts = []
+    if stop.get("street"):
+        parts.append(stop["street"])
+    if stop.get("number"):
+        parts.append(stop["number"])
+    if stop.get("city"):
+        parts.append(stop["city"])
+    if stop.get("province"):
+        parts.append(stop["province"])
+    address_query = ", ".join(p for p in parts if p)
+
+    if not address_query.strip():
+        return {"status": "zero_results"}
+
+    components_parts = [f"country:{country}"]
+    if stop.get("postal_code"):
+        components_parts.append(f"postal_code:{stop['postal_code']}")
+
+    params = {
+        "address": address_query,
+        "components": "|".join(components_parts),
+        "language": "es",
+        "region": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    if bbox:
+        params["bounds"] = f"{bbox['sw_lat']},{bbox['sw_lng']}|{bbox['ne_lat']},{bbox['ne_lng']}"
+
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params=params,
+            timeout=10.0,
+        )
+        data = resp.json()
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:100]}
+
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return {"status": "zero_results"}
+    if status != "OK" or not data.get("results"):
+        return {"status": "error", "error": status or "unknown"}
+
+    r = data["results"][0]
+    geom = r.get("geometry", {})
+    return {
+        "status": "ok",
+        "lat": geom.get("location", {}).get("lat"),
+        "lng": geom.get("location", {}).get("lng"),
+        "formatted_address": r.get("formatted_address", ""),
+        "location_type": geom.get("location_type", ""),  # ROOFTOP|RANGE_INTERPOLATED|GEOMETRIC_CENTER|APPROXIMATE
+        "place_id": r.get("place_id", ""),
+    }
+
+
+def _msi_classify_confidence(stop: dict, geo: dict) -> str:
+    """Combine Gemini extraction confidence + Google location_type + inferred
+    fields → discrete bucket. Used to color the UI chip and decide whether to
+    auto-add or force user confirmation.
+
+    HIGH (≥0.85)  : ROOFTOP/RANGE_INTERPOLATED, no critical inferred fields,
+                    extraction confidence on street ≥ 0.85.
+    MEDIUM (0.60-0.85) : GEOMETRIC_CENTER with CP match, OR inferred city,
+                    OR slightly low extraction confidence.
+    LOW (<0.60)   : APPROXIMATE, geocoder failed, or low extraction confidence.
+    """
+    if geo.get("status") != "ok":
+        return "low"
+    location_type = geo.get("location_type", "")
+    cif = stop.get("context_inferred_fields") or []
+    cpf = stop.get("confidence_per_field") or {}
+    street_conf = cpf.get("street", 0.5)
+    city_conf = cpf.get("city", 0.5)
+
+    if location_type in ("ROOFTOP", "RANGE_INTERPOLATED"):
+        if street_conf >= 0.85 and "street" not in cif:
+            return "high"
+        return "medium"
+
+    if location_type == "GEOMETRIC_CENTER" and stop.get("postal_code"):
+        if street_conf >= 0.7 and city_conf >= 0.5:
+            return "medium"
+
+    return "low"
+
+
+async def _msi_get_candidates_for_stop(
+    client: "httpx.AsyncClient",
+    stop: dict,
+    bbox: Optional[dict] = None,
+    max_candidates: int = 3,
+) -> list:
+    """Last resort for LOW-confidence stops: hit Google Places Autocomplete
+    biased to the centroid bbox so the user can pick from real options.
+
+    Returns a list of {description, place_id} dicts (max `max_candidates`).
+    """
+    if not GOOGLE_API_KEY:
+        return []
+    query_bits = [stop.get("street") or "", stop.get("number") or "", stop.get("city") or ""]
+    query = " ".join(b for b in query_bits if b).strip()
+    if not query:
+        return []
+    params = {"input": query, "language": "es", "key": GOOGLE_API_KEY,
+              "components": "country:es"}
+    if bbox:
+        avg_lat = (bbox["sw_lat"] + bbox["ne_lat"]) / 2
+        avg_lng = (bbox["sw_lng"] + bbox["ne_lng"]) / 2
+        params["location"] = f"{avg_lat},{avg_lng}"
+        params["radius"] = "30000"
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+            params=params,
+            timeout=8.0,
+        )
+        data = resp.json()
+    except Exception:
+        return []
+    if data.get("status") != "OK":
+        return []
+    out = []
+    for p in (data.get("predictions") or [])[:max_candidates]:
+        out.append({"description": p.get("description", ""), "place_id": p.get("place_id", "")})
+    return out
+
+
+async def _msi_normalize_and_geocode(
+    stops_raw: list,
+    route_context: Optional[MSIRouteContext],
+) -> list:
+    """Full pipeline: normalize each stop, geocode in 2 rounds with anchors,
+    compute confidence, fetch candidates for LOW. Returns enriched stops list."""
+    country = (route_context.country if route_context and route_context.country else "ES").upper()
+
+    # Step 1: normalize all stops
+    stops = [_msi_normalize_extracted_stop(dict(s)) for s in stops_raw]
+
+    if not stops:
+        return []
+
+    client = google_maps_client()
+
+    # Step 2: round 1 — geocode all in parallel with country + CP anchors
+    round1_results = await asyncio.gather(
+        *[_msi_geocode_one(client, s, country=country) for s in stops],
+        return_exceptions=True,
+    )
+
+    coords_for_centroid = []
+    for s, geo in zip(stops, round1_results):
+        if isinstance(geo, dict) and geo.get("status") == "ok":
+            s["_geo"] = geo
+            coords_for_centroid.append({"lat": geo["lat"], "lng": geo["lng"]})
+        else:
+            s["_geo"] = {"status": (geo.get("status") if isinstance(geo, dict) else "error")}
+
+    bbox = _msi_compute_centroid_bbox(coords_for_centroid)
+
+    # Step 3: round 2 — re-geocode failures using centroid bbox bias
+    if bbox:
+        retry_indices = [i for i, s in enumerate(stops) if s["_geo"].get("status") != "ok"]
+        if retry_indices:
+            retry_results = await asyncio.gather(
+                *[_msi_geocode_one(client, stops[i], country=country, bbox=bbox)
+                  for i in retry_indices],
+                return_exceptions=True,
+            )
+            for i, geo in zip(retry_indices, retry_results):
+                if isinstance(geo, dict) and geo.get("status") == "ok":
+                    stops[i]["_geo"] = geo
+
+    # Step 4: classify confidence + fetch candidates for LOW in parallel
+    candidate_tasks = {}
+    for i, s in enumerate(stops):
+        s["confidence"] = _msi_classify_confidence(s, s["_geo"])
+        if s["confidence"] == "low":
+            candidate_tasks[i] = _msi_get_candidates_for_stop(client, s, bbox=bbox)
+    if candidate_tasks:
+        candidates_by_idx = await asyncio.gather(
+            *candidate_tasks.values(), return_exceptions=True
+        )
+        for idx, cands in zip(candidate_tasks.keys(), candidates_by_idx):
+            stops[idx]["candidates"] = cands if isinstance(cands, list) else []
+
+    # Step 5: shape output, drop internal _geo, expose flat fields the client expects
+    out = []
+    for s in stops:
+        geo = s.pop("_geo", {}) or {}
+        flat_address_parts = [
+            s.get("street") or "",
+            (s.get("number") or "").strip(),
+        ]
+        flat_address = " ".join(p for p in flat_address_parts if p).strip()
+        if s.get("postal_code"):
+            flat_address = f"{flat_address}, {s['postal_code']}".strip(", ")
+        if s.get("city"):
+            flat_address = f"{flat_address} {s['city']}".strip()
+
+        s["coords"] = (
+            {"lat": geo["lat"], "lng": geo["lng"]} if geo.get("status") == "ok" else None
+        )
+        s["formatted_address"] = geo.get("formatted_address") or flat_address
+        s["place_id"] = geo.get("place_id", "")
+        s["delivery_instructions"] = (s.get("floor_etc") or "").strip()
+        s["geocoding_status"] = geo.get("status", "error")
+        s.setdefault("candidates", [])
+        out.append(s)
+
+    return out
+
+
 @app.post(
     "/ocr/screenshots-batch",
     tags=["ocr", "msi"],
     summary="Importar paradas desde 1-10 pantallazos (Pro+ feature)",
 )
 async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_user)):
-    """Multi-Screenshot Importer Day 1: extract stops from a batch of carrier-app
-    screenshots using Gemini 2.5 Pro. Returns structured stops; geocoding +
-    normalization will land in Day 2.
+    """Multi-Screenshot Importer: extract stops from a batch of carrier-app
+    screenshots using Gemini 2.5 Pro, then normalize and geocode them.
+
+    Pipeline:
+      1. Verify Pro+/yearly/trial eligibility
+      2. Per-tier daily quota (5 trial, 50 Pro+)
+      3. Gemini multi-image extraction with structured output
+      4. Normalize each stop (split floor_etc, infer province from CP, scrub)
+      5. Geocode round 1 with country:ES + CP anchors (parallel)
+      6. Compute centroid bbox; re-geocode failures (round 2) with bounds bias
+      7. Classify confidence HIGH/MEDIUM/LOW
+      8. For LOW, fetch up to 3 autocomplete candidates so user can pick
 
     Gate: Pro+ paid OR Pro yearly OR active Pro trial. Pro paid monthly is NOT
     eligible (this is the Pro+ differentiator).
@@ -4817,8 +5202,18 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
             sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=502, detail="Extraction failed")
 
-    processing_ms = int((time.perf_counter() - t_start) * 1000)
-    stops = gemini_result.get("stops") or []
+    extraction_ms = int((time.perf_counter() - t_start) * 1000)
+    raw_stops = gemini_result.get("stops") or []
+
+    # Day 2 pipeline: normalize + geocode + confidence + candidates
+    t_pipe = time.perf_counter()
+    enriched_stops = await _msi_normalize_and_geocode(raw_stops, req.route_context)
+    pipeline_ms = int((time.perf_counter() - t_pipe) * 1000)
+
+    # Stats for observability
+    by_conf = {"high": 0, "medium": 0, "low": 0}
+    for s in enriched_stops:
+        by_conf[s.get("confidence", "low")] = by_conf.get(s.get("confidence", "low"), 0) + 1
 
     if SENTRY_DSN:
         sentry_sdk.add_breadcrumb(
@@ -4827,11 +5222,15 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
             level="info",
             data={
                 "n_images": len(req.images),
-                "n_stops": len(stops),
+                "n_stops": len(enriched_stops),
                 "carrier_detected": gemini_result.get("carrier_detected"),
                 "carrier_hint": req.carrier_hint,
                 "tier": tier,
-                "processing_ms": processing_ms,
+                "extraction_ms": extraction_ms,
+                "pipeline_ms": pipeline_ms,
+                "n_high": by_conf["high"],
+                "n_medium": by_conf["medium"],
+                "n_low": by_conf["low"],
             },
         )
 
@@ -4839,10 +5238,13 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
         "success": True,
         "carrier_detected": gemini_result.get("carrier_detected", "generic"),
         "language": gemini_result.get("language", "es"),
-        "stops_count": len(stops),
-        "stops": stops,
+        "stops_count": len(enriched_stops),
+        "stops": enriched_stops,
         "global_inference_notes": gemini_result.get("global_inference_notes", ""),
-        "processing_ms": processing_ms,
+        "confidence_summary": by_conf,
+        "extraction_ms": extraction_ms,
+        "pipeline_ms": pipeline_ms,
+        "processing_ms": extraction_ms + pipeline_ms,
         "model": _MSI_MODEL,
         "tier": tier,
     }
