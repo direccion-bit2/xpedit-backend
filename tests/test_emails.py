@@ -453,6 +453,82 @@ class TestSendTrialExpiringEmail:
         assert result["success"] is False
 
 
+class TestSendTrialValueRecapEmail:
+    """Tests for send_trial_value_recap_email (D-2 mid-trial KPI surface)."""
+
+    def test_success_with_kpis(self):
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.return_value = {"id": "msg_recap"}
+            from emails import send_trial_value_recap_email
+            result = send_trial_value_recap_email(
+                "user@test.com", "Ana", routes_optimized=4, stops_completed=18, total_km=42.5
+            )
+        assert result["success"] is True
+        # Verify the body actually carries the numbers — guards against silent format string
+        # regressions like a stray %s when the KPIs are 0/1.
+        call_args = mock_resend.Emails.send.call_args.kwargs or mock_resend.Emails.send.call_args[0][0]
+        if isinstance(call_args, dict):
+            body = call_args.get("html", "")
+        else:
+            body = call_args[0].get("html", "")
+        assert ">4<" in body and ">18<" in body
+
+    def test_zero_routes_pluralization(self):
+        # Edge case: a user could be in D-2 with 0 routes optimized (signed up, never used).
+        # We still want to send (so they don't disappear), but pluralization must not crash.
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.return_value = {"id": "msg_recap_zero"}
+            from emails import send_trial_value_recap_email
+            result = send_trial_value_recap_email(
+                "user@test.com", "", routes_optimized=0, stops_completed=0, total_km=0.0
+            )
+        assert result["success"] is True
+
+    def test_singular_pluralization(self):
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.return_value = {"id": "msg_recap_one"}
+            from emails import send_trial_value_recap_email
+            result = send_trial_value_recap_email(
+                "user@test.com", "Solo", routes_optimized=1, stops_completed=1, total_km=3.7
+            )
+        assert result["success"] is True
+
+    def test_error_handling(self):
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.side_effect = Exception("Resend down")
+            from emails import send_trial_value_recap_email
+            result = send_trial_value_recap_email(
+                "user@test.com", "User", 3, 9, 27.0
+            )
+        assert result["success"] is False
+
+
+class TestSendActiveFreeProInviteEmail:
+    """Tests for send_active_free_pro_invite_email (B5 active-free invite)."""
+
+    def test_success(self):
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.return_value = {"id": "msg_invite"}
+            from emails import send_active_free_pro_invite_email
+            result = send_active_free_pro_invite_email(
+                "user@test.com", "Beatriz", routes_optimized_30d=8
+            )
+        assert result["success"] is True
+        # Subject must include the route count so the open-rate metrics tie back to engagement.
+        # send() is called with a single positional dict in this codebase.
+        payload = mock_resend.Emails.send.call_args.args[0]
+        assert "8" in payload.get("subject", "")
+
+    def test_error_handling(self):
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.side_effect = Exception("API error")
+            from emails import send_active_free_pro_invite_email
+            result = send_active_free_pro_invite_email(
+                "user@test.com", "User", 5
+            )
+        assert result["success"] is False
+
+
 class TestSendTrialExpiredEmail:
     """Tests for send_trial_expired_email"""
 

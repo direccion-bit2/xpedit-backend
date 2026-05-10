@@ -81,8 +81,11 @@ else:
     logger.warning("SENTRY_DSN not configured — backend errors will NOT be reported")
 
 from emails import (
+    ACTIVE_FREE_PRO_INVITE_SUBJECT,
     TRIAL_EXPIRING_D1_SUBJECT,
     TRIAL_EXPIRING_D3_SUBJECT,
+    TRIAL_VALUE_RECAP_SUBJECT,
+    send_active_free_pro_invite_email,
     send_alert_email,
     send_broadcast_email,
     send_custom_email,
@@ -101,6 +104,7 @@ from emails import (
     send_trial_expiring_email,
     send_trial_feedback_email,
     send_trial_last_day_email,
+    send_trial_value_recap_email,
     send_upcoming_email,
     send_welcome_email,
 )
@@ -7592,13 +7596,64 @@ async def send_weekly_reengagement_push():
             sentry_sdk.capture_exception(e)
 
 
-async def check_expiring_trials():
-    """Daily conversion touchpoints: D-3 reminder + D-1 final urgency.
+def _compute_trial_kpis(driver_id: str, signup_at: datetime) -> dict:
+    """Sum routes optimized + stops completed + km traveled for a driver since
+    `signup_at`. Used by the D-2 value-recap email so the user sees concrete
+    numbers instead of an abstract upgrade ask.
 
-    Runs once a day. Picks ONLY users whose trial expires in [3, 4) days (D-3 cohort)
-    or in [1, 2) days (D-1 cohort) and sends the corresponding template. email_log
-    dedup ensures each user receives each touch at most once even if the cron retries
-    or the window slightly shifts day-to-day.
+    Bounded to the trial window (signup_at..now) — we don't want to leak
+    pre-signup activity (which shouldn't exist anyway, but defensive).
+    """
+    routes_optimized, stops_completed, total_km = 0, 0, 0.0
+    try:
+        # Routes with optimized_hash IS NOT NULL = the user actually pressed
+        # "Optimizar". A created-but-never-optimized route doesn't count.
+        r = (
+            supabase.table("routes")
+            .select("id, total_distance_km, optimized_hash")
+            .eq("driver_id", driver_id)
+            .is_("deleted_at", "null")
+            .gte("created_at", signup_at.isoformat())
+            .execute()
+        )
+        if r.data:
+            for row in r.data:
+                if row.get("optimized_hash"):
+                    routes_optimized += 1
+                if row.get("total_distance_km"):
+                    try:
+                        total_km += float(row["total_distance_km"])
+                    except (TypeError, ValueError):
+                        pass
+
+        s = (
+            supabase.table("stops")
+            .select("id", count="exact")
+            .eq("driver_id", driver_id)
+            .eq("status", "completed")
+            .is_("deleted_at", "null")
+            .gte("created_at", signup_at.isoformat())
+            .execute()
+        )
+        stops_completed = s.count or 0
+    except Exception as e:
+        logger.warning(f"Trial KPI compute failed for {driver_id}: {e}")
+    return {
+        "routes_optimized": routes_optimized,
+        "stops_completed": stops_completed,
+        "total_km": round(total_km, 1),
+    }
+
+
+async def check_expiring_trials():
+    """Daily conversion touchpoints: D-3 reminder + D-2 value recap + D-1 urgency + D-1 push.
+
+    Runs once a day. Picks users whose trial expires in [3,4) days (D-3 cohort),
+    [2,3) days (D-2 cohort) or [1,2) days (D-1 cohort) and sends the corresponding
+    template. email_log dedup ensures each touch is sent at most once.
+
+    D-1 also fires a push notification (best-effort, fire-and-forget) so users who
+    don't open email still see the final urgency.
     """
     EXCLUDED_IDS = [
         "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
@@ -7611,14 +7666,14 @@ async def check_expiring_trials():
     try:
         now = datetime.now(timezone.utc)
 
-        # Single query covering both windows. We split into D-3 / D-1 in Python
-        # so we only hit Supabase once.
+        # Single query covering all three windows (24h..96h). We split into
+        # D-3 / D-2 / D-1 in Python so we only hit Supabase once.
         window_start = (now + timedelta(days=1)).isoformat()
         window_end = (now + timedelta(days=4)).isoformat()
 
         result = (
             supabase.table("drivers")
-            .select("id, email, name, promo_plan, promo_plan_expires_at, subscription_source")
+            .select("id, email, name, promo_plan, promo_plan_expires_at, subscription_source, push_token, created_at")
             .in_("promo_plan", ["pro", "pro_plus"])
             .eq("is_ambassador", False)
             .is_("subscription_source", "null")  # already-paying users skip
@@ -7630,12 +7685,12 @@ async def check_expiring_trials():
         )
 
         if not result.data:
-            logger.info("Trial expiry check: no trials in D-3 or D-1 windows")
+            logger.info("Trial expiry check: no trials in D-3, D-2 or D-1 windows")
             if SENTRY_DSN:
                 sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
             return
 
-        sent_d3, sent_d1, skipped, failed = 0, 0, 0, 0
+        sent_d3, sent_d2, sent_d1, pushed_d1, skipped, failed = 0, 0, 0, 0, 0, 0
         for driver in result.data:
             if driver["id"] in EXCLUDED_IDS or not driver.get("email"):
                 skipped += 1
@@ -7643,15 +7698,18 @@ async def check_expiring_trials():
             expires_at = datetime.fromisoformat(driver["promo_plan_expires_at"].replace("Z", "+00:00"))
             hours_left = (expires_at - now).total_seconds() / 3600
 
-            # Bucket selection: D-1 takes precedence if both could match (shouldn't happen).
+            # Bucket selection: most-urgent wins if windows overlap (shouldn't happen).
             if 24 <= hours_left < 48:
                 template_subject = TRIAL_EXPIRING_D1_SUBJECT
                 template_kind = "d1"
+            elif 48 <= hours_left < 72:
+                template_subject = TRIAL_VALUE_RECAP_SUBJECT
+                template_kind = "d2"
             elif 72 <= hours_left < 96:
                 template_subject = TRIAL_EXPIRING_D3_SUBJECT
                 template_kind = "d3"
             else:
-                # Outside our two cohorts (e.g. 50h or 25h gap day) — skip silently.
+                # Outside our three cohorts (e.g. exactly 24h or 48h boundary) — skip silently.
                 skipped += 1
                 continue
 
@@ -7673,12 +7731,29 @@ async def check_expiring_trials():
                 email_result = send_trial_expiring_email(
                     driver["email"], driver.get("name", ""), driver["promo_plan"], days_left
                 )
+            elif template_kind == "d2":
+                # D-2 needs concrete KPIs — query routes + stops since signup.
+                signup_str = driver.get("created_at") or driver["promo_plan_expires_at"]
+                try:
+                    signup_at = datetime.fromisoformat(signup_str.replace("Z", "+00:00"))
+                except Exception:
+                    signup_at = now - timedelta(days=7)
+                kpis = _compute_trial_kpis(driver["id"], signup_at)
+                email_result = send_trial_value_recap_email(
+                    driver["email"],
+                    driver.get("name", ""),
+                    kpis["routes_optimized"],
+                    kpis["stops_completed"],
+                    kpis["total_km"],
+                )
             else:  # d1
                 email_result = send_trial_last_day_email(driver["email"], driver.get("name", ""))
 
             if email_result.get("success"):
                 if template_kind == "d3":
                     sent_d3 += 1
+                elif template_kind == "d2":
+                    sent_d2 += 1
                 else:
                     sent_d1 += 1
                 try:
@@ -7693,17 +7768,190 @@ async def check_expiring_trials():
                     # Log failure isn't fatal — the email already went out. Worst case the user
                     # gets one duplicate next run; that's acceptable.
                     pass
+
+                # D-1: also fire a push so users who skip email still see urgency.
+                # Best-effort, no email_log dedup since email_log already gates the email.
+                if template_kind == "d1" and driver.get("push_token"):
+                    try:
+                        push_ok = await send_push_to_token(
+                            driver["push_token"],
+                            "Mañana acaba tu prueba Pro",
+                            "Mantén Pro por 4,99€/mes y sigue sin límites de paradas.",
+                            data={"type": "trial_d1", "deeplink": "xpedit://upgrade"},
+                        )
+                        if push_ok:
+                            pushed_d1 += 1
+                    except Exception as push_err:
+                        logger.warning(f"Trial D-1 push failed for {driver['id']}: {push_err}")
             else:
                 failed += 1
                 logger.warning(f"Trial expiry email failed for {driver['id']}: {email_result.get('error')}")
 
-        logger.info(f"Trial expiry: D-3={sent_d3} D-1={sent_d1} skipped={skipped} failed={failed} of {len(result.data)} candidates")
+        logger.info(
+            f"Trial expiry: D-3={sent_d3} D-2={sent_d2} D-1={sent_d1} push_D-1={pushed_d1} "
+            f"skipped={skipped} failed={failed} of {len(result.data)} candidates"
+        )
         if SENTRY_DSN:
             sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
     except Exception as e:
         logger.error(f"Trial expiry check failed: {e}")
         if SENTRY_DSN:
             sentry_check_in(monitor_slug="check-expiring-trials", status="error")
+            sentry_sdk.capture_exception(e)
+
+
+async def invite_active_free_to_trial():
+    """Weekly job: surface 7-day Pro trial to free users who're already engaged.
+
+    Audience criteria (ALL must hold):
+      - promo_plan IS NULL (not in trial, not paying via promo)
+      - subscription_source IS NULL (not paying via stripe/revenuecat)
+      - email IS NOT NULL
+      - is_ambassador = false
+      - signed up >= 14 days ago (skips users still in their natural trial window)
+      - >= 5 routes with optimized_hash IS NOT NULL in the last 30 days
+      - never received this email before (email_log dedup by subject prefix)
+
+    Sends email + push (best-effort). The CTA deep-links to xpedit://trial which
+    the app routes to claimTrial() — device_id + IP abuse guards already in place
+    inside that endpoint, so re-attempts by users who already burned their trial
+    fall through gracefully.
+
+    Runs Mondays 11:00 UTC (= 12:00 CET / 13:00 CEST). Weekly cadence keeps the
+    audience fresh without burning attention.
+    """
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",  # Demo Xpedit
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",  # Apple Reviewer
+    ]
+    if SENTRY_DSN:
+        sentry_check_in(monitor_slug="invite-active-free-to-trial", status="in_progress")
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff_signup = (now - timedelta(days=14)).isoformat()
+        cutoff_routes = (now - timedelta(days=30)).isoformat()
+
+        # Step 1: pull free + email-able + not-too-fresh drivers via paginated
+        # helper (Supabase Cloud caps server-side at 1000 rows).
+        free_drivers = []
+        page_size = 1000
+        offset = 0
+        while True:
+            page = (
+                supabase.table("drivers")
+                .select("id, email, name, push_token")
+                .is_("promo_plan", "null")
+                .is_("subscription_source", "null")
+                .eq("is_ambassador", False)
+                .not_.is_("email", "null")
+                .lt("created_at", cutoff_signup)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            if not page.data:
+                break
+            free_drivers.extend(page.data)
+            if len(page.data) < page_size:
+                break
+            offset += page_size
+
+        if not free_drivers:
+            logger.info("Active-free invite: no eligible drivers")
+            if SENTRY_DSN:
+                sentry_check_in(monitor_slug="invite-active-free-to-trial", status="ok")
+            return
+
+        sent, pushed, skipped, failed = 0, 0, 0, 0
+        for driver in free_drivers:
+            if driver["id"] in EXCLUDED_IDS:
+                skipped += 1
+                continue
+
+            # Step 2: count optimized routes in last 30d for this driver. Cheap
+            # per-driver count vs single huge query — keeps RAM bounded for
+            # 800+ drivers and lets us shortcut at >=5.
+            try:
+                rcount = (
+                    supabase.table("routes")
+                    .select("id", count="exact")
+                    .eq("driver_id", driver["id"])
+                    .not_.is_("optimized_hash", "null")
+                    .is_("deleted_at", "null")
+                    .gte("created_at", cutoff_routes)
+                    .limit(1)
+                    .execute()
+                )
+                routes_30d = rcount.count or 0
+            except Exception as q_err:
+                logger.warning(f"Active-free invite: route count failed for {driver['id']}: {q_err}")
+                skipped += 1
+                continue
+
+            if routes_30d < 5:
+                skipped += 1
+                continue
+
+            # Step 3: dedup against prior sends. We use a LIKE on the formatted
+            # subject so any past invite (regardless of route count number)
+            # blocks future invites for this user.
+            existing = (
+                supabase.table("email_log")
+                .select("id")
+                .eq("recipient_email", driver["email"])
+                .like("subject", "Has optimizado%rutas. Prueba Pro%")
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                skipped += 1
+                continue
+
+            email_result = send_active_free_pro_invite_email(
+                driver["email"], driver.get("name", ""), routes_30d
+            )
+            if not email_result.get("success"):
+                failed += 1
+                logger.warning(f"Active-free invite email failed for {driver['id']}: {email_result.get('error')}")
+                continue
+
+            sent += 1
+            try:
+                supabase.table("email_log").insert({
+                    "recipient_email": driver["email"],
+                    "recipient_name": driver.get("name"),
+                    "subject": ACTIVE_FREE_PRO_INVITE_SUBJECT.format(n=routes_30d),
+                    "body": f"active-free invite (auto, {routes_30d} routes/30d)",
+                    "message_id": email_result.get("id"),
+                }).execute()
+            except Exception:
+                pass  # Log failure isn't fatal; email already sent.
+
+            # Best-effort push alongside the email — silent if no token.
+            if driver.get("push_token"):
+                try:
+                    push_ok = await send_push_to_token(
+                        driver["push_token"],
+                        f"Has optimizado {routes_30d} rutas con Xpedit",
+                        "Prueba Pro 7 días gratis. Sin tarjeta.",
+                        data={"type": "active_free_invite", "deeplink": "xpedit://trial"},
+                    )
+                    if push_ok:
+                        pushed += 1
+                except Exception as push_err:
+                    logger.warning(f"Active-free invite push failed for {driver['id']}: {push_err}")
+
+        logger.info(
+            f"Active-free invite: sent={sent} pushed={pushed} skipped={skipped} failed={failed} "
+            f"of {len(free_drivers)} eligible candidates"
+        )
+        if SENTRY_DSN:
+            sentry_check_in(monitor_slug="invite-active-free-to-trial", status="ok")
+    except Exception as e:
+        logger.error(f"Active-free invite failed: {e}")
+        if SENTRY_DSN:
+            sentry_check_in(monitor_slug="invite-active-free-to-trial", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -8621,7 +8869,17 @@ async def start_monitoring_jobs():
         id="reactivation_push_followup",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET), reactivation followup (hourly :15)")
+    # Weekly invite for active free users (Mondays 11:00 UTC = 12:00 CET / 13:00 CEST)
+    social_scheduler.add_job(
+        invite_active_free_to_trial,
+        "cron",
+        day_of_week="mon",
+        hour=11,
+        minute=0,
+        id="invite_active_free_to_trial",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET), reactivation followup (hourly :15), active-free invite (Mon 11:00 UTC)")
 
 
 async def periodic_health_check():
