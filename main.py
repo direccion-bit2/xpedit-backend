@@ -3,6 +3,7 @@ Xpedit API - Backend de optimización de rutas
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac as _hmac
 import json
@@ -4581,47 +4582,19 @@ async def get_company_subscription(company_id: str, user=Depends(get_current_use
 
 
 # === OCR PROXY ===
+#
+# Single-label extractor (one shipping label photo → 5 fields). Uses Gemini
+# 2.5 Flash with structured JSON output. Migrated from Anthropic Claude
+# Haiku 10 may 2026 (#244) for cost (~3-5x cheaper) and to consolidate AI
+# stack (MSI already on Gemini, removes the Anthropic API key dependency).
+#
+# Response schema is intentionally identical to the previous one:
+# `{success, content}` where `content` is a JSON string. The `data` field is
+# new (parsed dict, same content) so newer clients can skip the JSON.parse.
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+_OCR_LABEL_MODEL = "gemini-2.5-flash"
 
-
-class OCRLabelRequest(BaseModel):
-    image_base64: str = Field(..., max_length=10_000_000)  # ~7.5MB max image
-    media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/jpeg"
-
-
-@app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
-async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
-    """Extrae datos de una etiqueta de envío (nombre, dirección, ciudad, CP, provincia) usando IA. La API key se mantiene en el servidor."""
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="OCR service not configured")
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 500,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": request.media_type,
-                                    "data": request.image_base64,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": """Esta es una foto de una etiqueta de envío de paquetería (iMile, Shein, etc.).
+_OCR_LABEL_PROMPT = """Esta es una foto de una etiqueta de envío de paquetería (iMile, Shein, etc.).
 IMPORTANTE: La imagen puede estar ROTADA 90°, 180° o 270°. Analiza la orientación del texto primero.
 
 Busca la sección "TO" o destinatario que contiene:
@@ -4631,38 +4604,87 @@ Busca la sección "TO" o destinatario que contiene:
 - Código postal (5 dígitos, ej: 11630)
 - Provincia (ej: Cádiz)
 
-Responde ÚNICAMENTE con este JSON (sin explicaciones):
-{
-  "name": "Nombre completo del destinatario",
-  "street": "Calle y número exacto",
-  "city": "Ciudad/Localidad",
-  "postalCode": "Código postal de 5 dígitos",
-  "province": "Provincia"
+CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada. Si un campo no es legible, devuelve string vacío para ese campo, nunca inventes datos."""
+
+_OCR_LABEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name":       {"type": "string", "description": "Nombre completo del destinatario"},
+        "street":     {"type": "string", "description": "Calle y número exacto"},
+        "city":       {"type": "string", "description": "Ciudad/Localidad"},
+        "postalCode": {"type": "string", "description": "Código postal de 5 dígitos"},
+        "province":   {"type": "string", "description": "Provincia"},
+    },
+    "required": ["name", "street", "city", "postalCode", "province"],
 }
 
-CRÍTICO: Lee TODA la etiqueta cuidadosamente aunque esté rotada.""",
-                            },
-                        ],
-                    }],
-                },
-            )
 
-        if response.status_code != 200:
-            error_body = response.text[:500]
-            logger.error(f"Anthropic OCR error {response.status_code}: {error_body}")
-            sentry_sdk.capture_message(
-                f"Anthropic OCR error {response.status_code}: {error_body}",
-                level="error",
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=f"OCR API error {response.status_code}: {error_body[:200]}",
-            )
+class OCRLabelRequest(BaseModel):
+    image_base64: str = Field(..., max_length=10_000_000)  # ~7.5MB max image
+    media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/jpeg"
 
-        data = response.json()
-        content = data.get("content", [{}])[0].get("text", "")
-        return {"success": True, "content": content}
 
+def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
+    """Synchronous Gemini call for label OCR. Wrap in asyncio.to_thread() from
+    the async caller — google-genai SDK is blocking. Returns a dict that
+    matches `_OCR_LABEL_SCHEMA`. Raises HTTPException on Gemini errors."""
+    from google.genai import types
+
+    client = get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="OCR service not configured")
+
+    parts = [
+        types.Part.from_text(text=_OCR_LABEL_PROMPT),
+        types.Part.from_bytes(
+            data=base64.b64decode(image_base64),
+            mime_type=media_type,
+        ),
+    ]
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=_OCR_LABEL_SCHEMA,
+        temperature=0.1,
+        max_output_tokens=500,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=_OCR_LABEL_MODEL,
+            contents=[types.Content(role="user", parts=parts)],
+            config=config,
+        )
+    except Exception as e:
+        logger.error(f"Gemini OCR error: {type(e).__name__}: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=502, detail=f"OCR API error: {str(e)[:200]}")
+
+    text = (response.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="Empty response from Gemini")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"OCR Gemini returned invalid JSON: {e}; text[:200]={text[:200]}")
+        raise HTTPException(status_code=502, detail="Invalid JSON from Gemini")
+
+
+@app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
+async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
+    """Extrae datos de una etiqueta de envío (nombre, dirección, ciudad, CP,
+    provincia) con Gemini Vision. La API key se mantiene en el servidor."""
+    if not get_gemini_client():
+        raise HTTPException(status_code=503, detail="OCR service not configured")
+
+    try:
+        data = await asyncio.to_thread(
+            _ocr_label_with_gemini,
+            request.image_base64,
+            request.media_type,
+        )
+        return {"success": True, "content": json.dumps(data, ensure_ascii=False), "data": data}
     except HTTPException:
         raise
     except Exception as e:
