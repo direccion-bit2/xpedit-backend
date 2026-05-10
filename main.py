@@ -6957,7 +6957,20 @@ def compute_daily_health_digest() -> dict:
     last_24h = (now_utc - timedelta(hours=24)).isoformat()
     last_7d = (now_utc - timedelta(days=7)).isoformat()
 
-    def count(table: str, filters: list, timestamp_col: str, since: str) -> int:
+    # Track whether any count() call failed so we can flag the digest as
+    # "partially unreliable" instead of silently sending 0s. See incident
+    # 2026-05-09: the digest mailed all-zeros while DB had real data.
+    digest_errors: list[str] = []
+
+    def count(table: str, filters: list, timestamp_col: str, since: str) -> Optional[int]:
+        """Returns the row count or None on failure.
+
+        We DO NOT swallow errors as 0 because that's indistinguishable from
+        a real zero (e.g. a quiet day) — the email would tell the user the
+        whole platform is dead when in fact only the metrics fetch failed.
+        Returning None lets the caller render "?" / "ERROR" instead, and
+        we capture the failure to Sentry so we know the digest is unreliable.
+        """
         q = supabase.table(table).select("id", count="exact")
         for f in filters:
             col, op, val = f
@@ -6966,52 +6979,62 @@ def compute_daily_health_digest() -> dict:
         try:
             return q.execute().count or 0
         except Exception as e:
-            logger.warning(f"Health digest count failed [{table}]: {e}")
-            return 0
+            err_msg = f"Health digest count failed [{table}]: {type(e).__name__}: {e}"
+            logger.warning(err_msg)
+            digest_errors.append(f"{table}/{timestamp_col}")
+            if SENTRY_DSN:
+                sentry_sdk.capture_message(err_msg, level="warning")
+            return None
 
-    def baseline_avg(count_7d: int, count_24h: int) -> float:
+    def baseline_avg(count_7d: Optional[int], count_24h: Optional[int]) -> Optional[float]:
+        # If either side failed, baseline is meaningless.
+        if count_7d is None or count_24h is None:
+            return None
         # 6 previous days average (exclude today)
         return max(0.0, (count_7d - count_24h) / 6.0)
 
+    def _metric_value_or_error(value: Optional[int]) -> tuple:
+        """For metrics where None means lookup failure, returns (display_value,
+        status). When value is None, status='error' so the email shows it
+        explicitly as broken instead of green/zero."""
+        if value is None:
+            return ("?", "error")
+        return (value, None)
+
     metrics: list[dict] = []
+
+    def _build_metric(label: str, value: Optional[int], baseline: Optional[float], min_expected: int) -> dict:
+        """Wraps the common pattern: if either value or baseline is None,
+        the metric is rendered as 'error' so the email never shows a fake 0."""
+        if value is None:
+            return {"label": label, "value": "?", "baseline": "—", "status": "error",
+                    "note": "Lookup falló — ver Sentry para diagnóstico."}
+        bl = round(baseline, 1) if baseline is not None else None
+        return {"label": label, "value": value, "baseline": bl,
+                "status": _status_from_value(value, baseline or 0.0, min_expected=min_expected)}
 
     # 1. Signups (new drivers) 24h vs 6d baseline
     signups_24h = count("drivers", [], "created_at", last_24h)
     signups_7d = count("drivers", [], "created_at", last_7d)
-    base_signups = baseline_avg(signups_7d, signups_24h)
-    metrics.append({
-        "label": "Nuevos registros (24h)",
-        "value": signups_24h,
-        "baseline": round(base_signups, 1),
-        "status": _status_from_value(signups_24h, base_signups, min_expected=2),
-    })
+    metrics.append(_build_metric("Nuevos registros (24h)", signups_24h,
+                                 baseline_avg(signups_7d, signups_24h), min_expected=2))
 
     # 2. Routes created 24h
     routes_24h = count("routes", [], "created_at", last_24h)
     routes_7d = count("routes", [], "created_at", last_7d)
-    base_routes = baseline_avg(routes_7d, routes_24h)
-    metrics.append({
-        "label": "Rutas creadas (24h)",
-        "value": routes_24h,
-        "baseline": round(base_routes, 1),
-        "status": _status_from_value(routes_24h, base_routes, min_expected=3),
-    })
+    metrics.append(_build_metric("Rutas creadas (24h)", routes_24h,
+                                 baseline_avg(routes_7d, routes_24h), min_expected=3))
 
     # 3. Stops created 24h
     stops_24h = count("stops", [], "created_at", last_24h)
     stops_7d = count("stops", [], "created_at", last_7d)
-    base_stops = baseline_avg(stops_7d, stops_24h)
-    metrics.append({
-        "label": "Paradas creadas (24h)",
-        "value": stops_24h,
-        "baseline": round(base_stops, 1),
-        "status": _status_from_value(stops_24h, base_stops, min_expected=20),
-    })
+    metrics.append(_build_metric("Paradas creadas (24h)", stops_24h,
+                                 baseline_avg(stops_7d, stops_24h), min_expected=20))
 
     # 3b. Stop processing rate (completed+failed / total created 24h).
     # Guards against the April 2026 silent sync bug where 93% of stops stayed
     # "pending" in DB. A healthy day is >= 50%. Below 30% is likely broken sync.
-    stops_processed_24h = 0
+    stops_processed_24h: Optional[int] = None
     try:
         processed_res = (
             supabase.table("stops")
@@ -7023,7 +7046,12 @@ def compute_daily_health_digest() -> dict:
         stops_processed_24h = processed_res.count or 0
     except Exception as e:
         logger.warning(f"Health digest stops processed count failed: {e}")
-    if stops_24h > 0:
+        digest_errors.append("stops/processed")
+        if SENTRY_DSN:
+            sentry_sdk.capture_message(
+                f"Health digest stops processed count failed: {e}", level="warning",
+            )
+    if stops_24h is not None and stops_processed_24h is not None and stops_24h > 0:
         processing_rate = 100.0 * stops_processed_24h / stops_24h
         if processing_rate < 30:
             rate_status = "bad"
@@ -7043,19 +7071,30 @@ def compute_daily_health_digest() -> dict:
         })
 
     # 4. Active drivers 24h (drivers who created at least one route)
+    active_24h: Optional[int] = None
     try:
         active_rows = (
             supabase.table("routes").select("driver_id").gte("created_at", last_24h).execute()
         )
         active_24h = len({r["driver_id"] for r in (active_rows.data or []) if r.get("driver_id")})
-    except Exception:
-        active_24h = 0
-    metrics.append({
-        "label": "Drivers activos (24h)",
-        "value": active_24h,
-        "baseline": None,
-        "status": "ok" if active_24h > 0 else "warn",
-    })
+    except Exception as e:
+        logger.warning(f"Health digest active_24h failed: {e}")
+        digest_errors.append("routes/active_drivers")
+        if SENTRY_DSN:
+            sentry_sdk.capture_message(f"Health digest active_24h failed: {e}", level="warning")
+    if active_24h is None:
+        metrics.append({
+            "label": "Drivers activos (24h)",
+            "value": "?", "baseline": "—", "status": "error",
+            "note": "Lookup falló — ver Sentry para diagnóstico.",
+        })
+    else:
+        metrics.append({
+            "label": "Drivers activos (24h)",
+            "value": active_24h,
+            "baseline": None,
+            "status": "ok" if active_24h > 0 else "warn",
+        })
 
     # 5-6. Google Sign-In — Android vs iOS (7d) via public.google_signin_stats RPC
     # (auth schema is not exposed to PostgREST, so we use a SECURITY DEFINER function).
@@ -7092,17 +7131,12 @@ def compute_daily_health_digest() -> dict:
     # 7. Trial claims 24h
     trial_claims_24h = count("trial_claims", [], "claimed_at", last_24h)
     trial_claims_7d = count("trial_claims", [], "claimed_at", last_7d)
-    base_trials = baseline_avg(trial_claims_7d, trial_claims_24h)
-    metrics.append({
-        "label": "Trials nuevos (24h)",
-        "value": trial_claims_24h,
-        "baseline": round(base_trials, 1),
-        "status": _status_from_value(trial_claims_24h, base_trials, min_expected=1),
-    })
+    metrics.append(_build_metric("Trials nuevos (24h)", trial_claims_24h,
+                                 baseline_avg(trial_claims_7d, trial_claims_24h), min_expected=1))
 
     # 8. Paid users — use daily_metrics_snapshot for 7d delta (drivers table has no updated_at)
-    paid_today = 0
-    paid_7d_ago = 0
+    paid_today: Optional[int] = None
+    paid_7d_ago: Optional[int] = None
     try:
         today_snap = (
             supabase.table("daily_metrics_snapshot")
@@ -7127,25 +7161,37 @@ def compute_daily_health_digest() -> dict:
             paid_7d_ago = old_snap.data[0].get("paid_users", 0) or 0
     except Exception as e:
         logger.warning(f"Health digest paid users snapshot failed: {e}")
+        digest_errors.append("daily_metrics_snapshot")
+        if SENTRY_DSN:
+            sentry_sdk.capture_message(
+                f"Health digest paid users snapshot failed: {e}", level="warning",
+            )
 
-    conversions_delta = paid_today - paid_7d_ago
-    if conversions_delta > 0:
-        conv_status = "ok"
-        conv_note = ""
-    elif conversions_delta == 0:
-        conv_status = "warn"
-        conv_note = "Sin nuevas conversiones esta semana."
+    if paid_today is None or paid_7d_ago is None:
+        metrics.append({
+            "label": "Paid users totales",
+            "value": "?", "baseline": "—", "status": "error",
+            "note": "Snapshot diario no disponible — ver Sentry.",
+        })
     else:
-        conv_status = "bad"
-        conv_note = f"Han cancelado {abs(conversions_delta)} suscripcion(es) esta semana."
+        conversions_delta = paid_today - paid_7d_ago
+        if conversions_delta > 0:
+            conv_status = "ok"
+            conv_note = ""
+        elif conversions_delta == 0:
+            conv_status = "warn"
+            conv_note = "Sin nuevas conversiones esta semana."
+        else:
+            conv_status = "bad"
+            conv_note = f"Han cancelado {abs(conversions_delta)} suscripcion(es) esta semana."
 
-    metrics.append({
-        "label": "Paid users totales",
-        "value": f"{paid_today} (delta 7d: {conversions_delta:+d})",
-        "baseline": None,
-        "status": conv_status,
-        "note": conv_note,
-    })
+        metrics.append({
+            "label": "Paid users totales",
+            "value": f"{paid_today} (delta 7d: {conversions_delta:+d})",
+            "baseline": None,
+            "status": conv_status,
+            "note": conv_note,
+        })
 
     # 9. Backend self-health
     try:
@@ -7159,9 +7205,20 @@ def compute_daily_health_digest() -> dict:
     except Exception:
         pass
 
+    # Surface digest-level health: if any sub-query failed, mail subject prefix
+    # becomes "DIGEST-ERROR" so it's visually distinct from real ALERT/WARN/OK.
+    if digest_errors:
+        if SENTRY_DSN:
+            sentry_sdk.capture_message(
+                f"Daily Health digest had {len(digest_errors)} failed lookups: "
+                f"{', '.join(digest_errors)}. Some metrics shown as '?' in email.",
+                level="warning",
+            )
+
     return {
         "date": date_str,
         "metrics": metrics,
+        "digest_errors": digest_errors,
     }
 
 

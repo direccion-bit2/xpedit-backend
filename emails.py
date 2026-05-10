@@ -1432,8 +1432,12 @@ def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
     date_str = html_escape(digest.get("date", ""))
 
     def row(label: str, value, baseline, status: str, note: str = "") -> str:
-        color = {"ok": "#22c55e", "warn": "#f59e0b", "bad": "#ef4444"}.get(status, "#6b7280")
-        icon = {"ok": "&#10003;", "warn": "!", "bad": "&#10007;"}.get(status, "&middot;")
+        color = {
+            "ok": "#22c55e", "warn": "#f59e0b", "bad": "#ef4444", "error": "#7c3aed",
+        }.get(status, "#6b7280")
+        icon = {
+            "ok": "&#10003;", "warn": "!", "bad": "&#10007;", "error": "?",
+        }.get(status, "&middot;")
         baseline_txt = f" &middot; baseline 7d: <strong>{baseline}</strong>" if baseline is not None else ""
         note_html = (
             f"<div style='color:{color}; font-size:13px; margin-top:4px;'>{html_escape(note)}</div>" if note else ""
@@ -1461,7 +1465,22 @@ def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
 
     alerts_count = sum(1 for m in metrics if m.get("status") == "bad")
     warns_count = sum(1 for m in metrics if m.get("status") == "warn")
-    if alerts_count > 0:
+    error_count = sum(1 for m in metrics if m.get("status") == "error")
+    digest_errors = digest.get("digest_errors") or []
+
+    # Error state takes precedence so the user knows the digest itself is unreliable
+    # (lookup failures), separate from real "bad" metrics about the platform.
+    if error_count > 0 or digest_errors:
+        summary_color = "#7c3aed"  # purple = "data missing"
+        bits = []
+        if error_count > 0:
+            bits.append(f"{error_count} m&eacute;trica{'s' if error_count != 1 else ''} sin datos")
+        if alerts_count > 0:
+            bits.append(f"{alerts_count} alerta{'s' if alerts_count != 1 else ''}")
+        if warns_count > 0:
+            bits.append(f"{warns_count} aviso{'s' if warns_count != 1 else ''}")
+        header_summary = " &middot; ".join(bits) or "Datos incompletos"
+    elif alerts_count > 0:
         summary_color = "#ef4444"
         header_summary = f"{alerts_count} alerta{'s' if alerts_count != 1 else ''} &middot; {warns_count} aviso{'s' if warns_count != 1 else ''}"
     elif warns_count > 0:
@@ -1471,6 +1490,20 @@ def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
         summary_color = "#22c55e"
         header_summary = "Todo en verde"
 
+    # Banner explaining unreliable lookup state — only when relevant
+    error_banner = ""
+    if error_count > 0 or digest_errors:
+        failed_list = ", ".join(digest_errors) if digest_errors else "varias consultas"
+        error_banner = f"""
+        <div style="background:#faf5ff; border:1px solid #d8b4fe; border-radius:10px;
+                    padding:12px 16px; margin-bottom:16px; color:#5b21b6; font-size:13px;">
+            <strong>Aviso del digest:</strong> {error_count} m&eacute;trica{'s' if error_count != 1 else ''}
+            no se pudieron leer ({html_escape(failed_list)}). Los valores marcados con
+            <strong>?</strong> NO significan cero — significan que la consulta fall&oacute;.
+            Revisa Sentry para diagnosticar antes de tomar decisiones a partir de este email.
+        </div>
+        """
+
     content = f"""
         <h2 style="margin: 0 0 4px 0; color: #0f172a; font-size: 22px; font-weight: 700;">Xpedit Daily Health</h2>
         <p style="margin: 0 0 24px 0; color: #64748b; font-size: 14px;">{date_str}</p>
@@ -1478,6 +1511,8 @@ def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
         <div style="background:{summary_color}; color:white; padding:14px 18px; border-radius:10px; margin-bottom:22px; font-weight:600; font-size:15px;">
             {header_summary}
         </div>
+
+        {error_banner}
 
         <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 24px;">
             {rows_html}
@@ -1492,7 +1527,14 @@ def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
         </p>
     """
 
-    subject_prefix = "ALERT" if alerts_count > 0 else ("WARN" if warns_count > 0 else "OK")
+    if error_count > 0 or digest_errors:
+        subject_prefix = "DIGEST-ERROR"
+    elif alerts_count > 0:
+        subject_prefix = "ALERT"
+    elif warns_count > 0:
+        subject_prefix = "WARN"
+    else:
+        subject_prefix = "OK"
     subject = f"[{subject_prefix}] Xpedit Daily Health — {date_str}"
 
     try:

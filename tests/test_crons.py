@@ -965,7 +965,9 @@ class TestComputeDailyHealthDigest:
         for m in digest["metrics"]:
             assert "label" in m, f"metric missing label: {m}"
             assert "status" in m, f"metric missing status: {m}"
-            assert m["status"] in ("ok", "warn", "bad"), f"invalid status: {m}"
+            # 'error' added 2026-05-10 (TODO #247): distinguishes a real 0
+            # from a failed lookup, email shows '?' instead of fake 0.
+            assert m["status"] in ("ok", "warn", "bad", "error"), f"invalid status: {m}"
 
     def test_survives_google_signin_rpc_failure(self):
         """RPC to google_signin_stats can fail — digest must still produce
