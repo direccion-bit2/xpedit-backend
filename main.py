@@ -791,6 +791,7 @@ class AssignDriversRequest(BaseModel):
 
 class GeocodeRequest(BaseModel):
     address: str = Field(..., min_length=3)
+    country: str | None = None  # ISO-2 (ES, MX, AR…) — biases search and adds components filter
 
 
 class StopCreate(BaseModel):
@@ -1229,27 +1230,56 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
 
 @app.post("/geocode", tags=["optimize"], summary="Geocodificar dirección")
 async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
-    """Convierte una dirección de texto en coordenadas (lat/lng) usando Nominatim."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
+    """Convierte una dirección de texto en coordenadas (lat/lng) usando Google Geocoding API.
+
+    Maneja business names (farmacias, hoteles), direcciones con sufijos raros
+    y CPs parciales mucho mejor que Nominatim. Acepta `country` ISO-2 opcional
+    para sesgar resultados al país del driver.
+    """
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Geocoding service not configured")
+
+    params = {
+        "address": request.address,
+        "language": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    if request.country:
+        cc = request.country.strip().upper()
+        if cc:
+            params["region"] = cc.lower()
+            params["components"] = f"country:{cc}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": request.address, "format": "json", "limit": 1},
-                headers={"User-Agent": "Xpedit/1.0"},
-                timeout=10.0
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params=params,
+                timeout=10.0,
             )
             data = response.json()
-            if not data:
-                return {"success": False, "error": "Dirección no encontrada"}
-            return {
-                "success": True,
-                "lat": float(data[0]["lat"]),
-                "lng": float(data[0]["lon"]),
-                "display_name": data[0]["display_name"]
-            }
-        except Exception as e:
-            logger.error(f"Geocode error: {e}")
-            raise HTTPException(status_code=500, detail="Error interno del servidor")
+    except Exception as e:
+        logger.error(f"Geocode error: {e}")
+        raise HTTPException(status_code=502, detail="Geocoding service error")
+
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return {"success": False, "error": "Dirección no encontrada"}
+    if status != "OK" or not data.get("results"):
+        logger.warning(f"Geocode returned status={status} for '{request.address[:80]}'")
+        return {"success": False, "error": "Dirección no encontrada"}
+
+    r = data["results"][0]
+    geom = r.get("geometry", {}) or {}
+    loc = geom.get("location", {}) or {}
+    return {
+        "success": True,
+        "lat": loc.get("lat"),
+        "lng": loc.get("lng"),
+        "display_name": r.get("formatted_address", ""),
+        "place_id": r.get("place_id", ""),
+        "location_type": geom.get("location_type", ""),
+    }
 
 
 # === ENDPOINTS AVANZADOS DE OPTIMIZACIÓN ===
