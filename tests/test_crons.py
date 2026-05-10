@@ -276,16 +276,26 @@ class TestSendWeeklyReengagementPush:
 
 # ===================== CHECK EXPIRING TRIALS =====================
 
-def _expiry_dispatch(drivers_data, email_log_existing=False):
+def _expiry_dispatch(drivers_data, email_log_existing=False, routes_count=0, stops_count=0):
     """Build a side_effect for supabase.table(name) used by check_expiring_trials.
 
     drivers query → returns the supplied driver rows.
     email_log query (dedup probe) → returns either empty (no prior send) or one row.
     email_log INSERT → goes through the same chain harmlessly.
+    routes / stops → consumed by _compute_trial_kpis on the D-2 cohort, harmless
+                     for D-3/D-1 (those buckets don't query KPIs).
     """
     def dispatch(name):
         if name == "drivers":
             return _FixedResultChain(data=drivers_data)
+        if name == "routes":
+            # Each row needs total_distance_km + optimized_hash for the KPI sum.
+            return _FixedResultChain(
+                data=[{"total_distance_km": 12.5, "optimized_hash": "h"}] * routes_count,
+                count=routes_count,
+            )
+        if name == "stops":
+            return _FixedResultChain(data=[], count=stops_count)
         # email_log: only the dedup SELECT needs realistic data; INSERT is fire-and-forget
         return _FixedResultChain(data=[{"id": "prior"}] if email_log_existing else [])
     return dispatch
@@ -347,16 +357,20 @@ class TestCheckExpiringTrials:
         mock_d3.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_2day_cohort_outside_buckets_skipped(self):
-        # Trial expires in 2 days + 6h → 54h, NOT in [24h,48h) NOR [72h,96h) → no send
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=6)).isoformat()
+    async def test_outside_all_buckets_skipped(self):
+        # Trial expires in ~5 days (>96h) → outside D-3/D-2/D-1 windows entirely.
+        # Used to be the "2 day cohort" test; now D-2 IS handled, so we move
+        # outside to a cleanly-skipped value.
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         drivers = [{
-            "id": "driver-mid",
+            "id": "driver-far",
             "email": "user@test.com",
             "name": "User",
             "promo_plan": "pro",
             "promo_plan_expires_at": expires_at,
             "subscription_source": None,
+            "created_at": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+            "push_token": None,
         }]
 
         mock_sb = make_mock_supabase()
@@ -365,12 +379,85 @@ class TestCheckExpiringTrials:
         with patch("main.supabase", mock_sb), \
              patch("main.SENTRY_DSN", ""), \
              patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_value_recap_email") as mock_d2, \
+             patch("main.send_trial_last_day_email") as mock_d1:
+            from main import check_expiring_trials
+            await check_expiring_trials()
+
+        mock_d3.assert_not_called()
+        mock_d2.assert_not_called()
+        mock_d1.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_d2_cohort_sends_value_recap_email(self):
+        # Trial expires in 2d + 12h → 60h → falls in [48h, 72h) D-2 bucket.
+        # D-2 also fires _compute_trial_kpis, so the mock provides routes/stops.
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=12)).isoformat()
+        signup_at = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        drivers = [{
+            "id": "driver-d2",
+            "email": "user@test.com",
+            "name": "Test User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+            "created_at": signup_at,
+            "push_token": None,
+        }]
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(
+            side_effect=_expiry_dispatch(drivers, routes_count=4, stops_count=18)
+        )
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expiring_email") as mock_d3, \
+             patch("main.send_trial_value_recap_email", return_value={"success": True, "id": "msg2"}) as mock_d2, \
              patch("main.send_trial_last_day_email") as mock_d1:
             from main import check_expiring_trials
             await check_expiring_trials()
 
         mock_d3.assert_not_called()
         mock_d1.assert_not_called()
+        mock_d2.assert_called_once()
+        # Verify the KPIs computed from the mocks land in the email args.
+        call_args = mock_d2.call_args
+        assert call_args.args[2] == 4  # routes_optimized
+        assert call_args.args[3] == 18  # stops_completed
+        # 4 routes * 12.5 km = 50.0 km (matches dispatch fixture)
+        assert call_args.args[4] == 50.0  # total_km
+
+    @pytest.mark.asyncio
+    async def test_d1_cohort_also_sends_push_when_token_present(self):
+        # D-1 driver with a push_token → email + push both fire.
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=1, hours=12)).isoformat()
+        drivers = [{
+            "id": "driver-d1-push",
+            "email": "user@test.com",
+            "name": "User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+            "created_at": (datetime.now(timezone.utc) - timedelta(days=6)).isoformat(),
+            "push_token": "ExponentPushToken[abc123]",
+        }]
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=_expiry_dispatch(drivers))
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_last_day_email", return_value={"success": True, "id": "msg-d1"}) as mock_d1, \
+             patch("main.send_push_to_token", new=AsyncMock(return_value=True)) as mock_push:
+            from main import check_expiring_trials
+            await check_expiring_trials()
+
+        mock_d1.assert_called_once()
+        mock_push.assert_awaited_once()
+        # Push payload carries the deep link so the app routes to the upgrade screen.
+        push_kwargs = mock_push.call_args.kwargs
+        assert push_kwargs.get("data", {}).get("deeplink") == "xpedit://upgrade"
 
     @pytest.mark.asyncio
     async def test_dedup_via_email_log(self):

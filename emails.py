@@ -1066,6 +1066,8 @@ def send_social_login_broadcast(to_emails_with_names: List[dict]) -> dict:
 
 TRIAL_EXPIRING_D3_SUBJECT = "Te quedan 3 días de Xpedit Pro"
 TRIAL_EXPIRING_D1_SUBJECT = "Mañana se acaba tu prueba Pro"
+TRIAL_VALUE_RECAP_SUBJECT = "Lo que has conseguido con Xpedit Pro esta semana"
+ACTIVE_FREE_PRO_INVITE_SUBJECT = "Has optimizado {n} rutas. Prueba Pro 7 días sin tarjeta"
 
 
 def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
@@ -1210,6 +1212,178 @@ def send_trial_last_day_email(to_email: str, user_name: str) -> dict:
             "reply_to": REPLY_TO,
             "subject": TRIAL_EXPIRING_D1_SUBJECT,
             "html": get_base_template(content, "Mañana acaba tu prueba Pro")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_active_free_pro_invite_email(
+    to_email: str,
+    user_name: str,
+    routes_optimized_30d: int,
+) -> dict:
+    """Free users who optimised >=5 routes in 30d but never converted get a
+    direct, non-aggressive invite to claim their 7-day Pro trial. The pitch
+    leads with their own activity to anchor the ask in real usage.
+
+    Different from the win-back email: this targets *active* users who simply
+    haven't been pushed toward Pro, not lapsed/churned ones.
+    """
+    user_name = html_escape(user_name or "")
+    cta_deeplink = "xpedit://trial"
+    subject = ACTIVE_FREE_PRO_INVITE_SUBJECT.format(n=routes_optimized_30d)
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #dbeafe; border-radius: 50%; padding: 18px;">
+                <span style="font-size: 36px;">&#128640;</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 16px 0; color: #1e40af; font-size: 26px; text-align: center;">
+            Has optimizado {routes_optimized_30d} rutas
+        </h2>
+
+        <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Has usado Xpedit para optimizar <strong>{routes_optimized_30d} rutas</strong> en los &uacute;ltimos 30 d&iacute;as.
+            Eso significa que ya nos conoces. Te toca probar lo siguiente: <strong>Pro</strong>, sin tarjeta, durante 7 d&iacute;as.
+        </p>
+
+        <div style="background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-radius: 12px; padding: 20px; margin: 22px 0; border: 1px solid #bfdbfe;">
+            <p style="margin: 0 0 12px 0; color: #1e3a8a; font-size: 15px; font-weight: 600;">
+                Lo que desbloqueas con Pro:
+            </p>
+            <ul style="margin: 0; padding-left: 22px; color: #1e3a8a; font-size: 14px; line-height: 1.8;">
+                <li>Paradas <strong>ilimitadas</strong> al d&iacute;a (vs 10 en Free)</li>
+                <li>Optimizaci&oacute;n autom&aacute;tica con IA en cada ruta</li>
+                <li>Estad&iacute;sticas + exportaci&oacute;n PDF/Excel</li>
+                <li>Soporte directo por WhatsApp</li>
+            </ul>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="{cta_deeplink}" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 700; font-size: 17px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);">
+                Empezar 7 d&iacute;as gratis
+            </a>
+        </div>
+
+        <p style="margin: 16px 0 0 0; color: #6b7280; font-size: 13px; text-align: center;">
+            Sin tarjeta. Sin compromiso. Cancela cuando quieras.
+        </p>
+
+        <p style="margin: 18px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Dudas? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escr&iacute;benos por WhatsApp</a>.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": subject,
+            "html": get_base_template(content, "Has optimizado varias rutas — prueba Pro")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_trial_value_recap_email(
+    to_email: str,
+    user_name: str,
+    routes_optimized: int,
+    stops_completed: int,
+    total_km: float,
+) -> dict:
+    """D-2 (mid-trial) email: surface the value the user has already gotten so
+    the upgrade decision two days later is anchored to concrete numbers, not
+    abstract willingness-to-pay.
+
+    The hypothesis (handoff 10 may): users who see "you've optimized X routes
+    and saved Y km this week" on day 5 convert measurably higher than those
+    who only get the D-1 urgency push.
+    """
+    user_name = html_escape(user_name or "")
+    cta_deeplink = "xpedit://upgrade"
+
+    # All three KPIs pluralized cleanly. We round km to whole units once it's
+    # >= 10, single decimal otherwise — small numbers feel more honest.
+    km_display = f"{total_km:.1f}" if total_km < 10 else f"{int(round(total_km))}"
+    routes_label = "ruta optimizada" if routes_optimized == 1 else "rutas optimizadas"
+    stops_label = "parada entregada" if stops_completed == 1 else "paradas entregadas"
+
+    content = f"""
+        <div style="text-align: center; margin-bottom: 25px;">
+            <div style="display: inline-block; background-color: #dcfce7; border-radius: 50%; padding: 18px;">
+                <span style="font-size: 36px;">&#127942;</span>
+            </div>
+        </div>
+
+        <h2 style="margin: 0 0 16px 0; color: #15803d; font-size: 26px; text-align: center;">
+            Buen trabajo esta semana
+        </h2>
+
+        <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
+        </p>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Vamos a medio camino de tu prueba Pro. Esto es lo que has hecho con Xpedit hasta ahora:
+        </p>
+
+        <div style="background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border-radius: 12px; padding: 24px; margin: 22px 0; border: 1px solid #bbf7d0;">
+            <table role="presentation" width="100%" style="border-collapse: collapse;">
+                <tr>
+                    <td style="text-align: center; padding: 8px;">
+                        <div style="font-size: 32px; font-weight: 700; color: #15803d; line-height: 1;">{routes_optimized}</div>
+                        <div style="font-size: 13px; color: #166534; margin-top: 6px;">{routes_label}</div>
+                    </td>
+                    <td style="text-align: center; padding: 8px; border-left: 1px solid #bbf7d0;">
+                        <div style="font-size: 32px; font-weight: 700; color: #15803d; line-height: 1;">{stops_completed}</div>
+                        <div style="font-size: 13px; color: #166534; margin-top: 6px;">{stops_label}</div>
+                    </td>
+                    <td style="text-align: center; padding: 8px; border-left: 1px solid #bbf7d0;">
+                        <div style="font-size: 32px; font-weight: 700; color: #15803d; line-height: 1;">{km_display}</div>
+                        <div style="font-size: 13px; color: #166534; margin-top: 6px;">km recorridos</div>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            En 2 d&iacute;as tu prueba acaba. Si Xpedit te est&aacute; ahorrando tiempo y combustible, mant&eacute;n Pro por
+            <strong>4,99&euro;/mes</strong> y sigue sin l&iacute;mites de paradas, optimizaci&oacute;n autom&aacute;tica
+            y modo offline completo.
+        </p>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="{cta_deeplink}" style="display: inline-block; background: #16a34a; color: #ffffff; text-decoration: none; padding: 16px 40px; border-radius: 10px; font-weight: 700; font-size: 17px; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.3);">
+                Mantener Pro por 4,99&euro;/mes
+            </a>
+        </div>
+
+        <p style="margin: 16px 0 0 0; color: #6b7280; font-size: 13px; text-align: center;">
+            Sin compromiso. Cancela cuando quieras desde la app.
+        </p>
+
+        <p style="margin: 18px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            &iquest;Algo te ha frenado? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Cu&eacute;ntanos por WhatsApp</a>.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": TRIAL_VALUE_RECAP_SUBJECT,
+            "html": get_base_template(content, "Lo que has conseguido con Xpedit Pro")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:
