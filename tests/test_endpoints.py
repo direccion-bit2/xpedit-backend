@@ -733,7 +733,9 @@ class TestOCREndpoint:
 
     @pytest.mark.asyncio
     async def test_ocr_not_configured(self, client):
-        with patch("main.ANTHROPIC_API_KEY", ""):
+        # Migrated to Gemini 2.5 Flash on 2026-05-10 (#244). Service is now
+        # gated by `get_gemini_client()` instead of ANTHROPIC_API_KEY.
+        with patch("main.get_gemini_client", return_value=None):
             response = await client.post("/ocr/label", json={
                 "image_base64": "base64data",
                 "media_type": "image/jpeg"
@@ -742,25 +744,23 @@ class TestOCREndpoint:
 
     @pytest.mark.asyncio
     async def test_ocr_success(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "content": [{"text": '{"name":"Test","street":"Calle 1","city":"Madrid","postalCode":"28001","province":"Madrid"}'}]
-        }
+        gemini_response = MagicMock()
+        gemini_response.text = (
+            '{"name":"Test","street":"Calle 1","city":"Madrid",'
+            '"postalCode":"28001","province":"Madrid"}'
+        )
+        gemini_client = MagicMock()
+        gemini_client.models.generate_content.return_value = gemini_response
 
-        mock_http = AsyncMock()
-        mock_http.post.return_value = mock_response
-        mock_http.__aenter__.return_value = mock_http
-        mock_http.__aexit__.return_value = False
-
-        with patch("main.ANTHROPIC_API_KEY", "test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             response = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg"
             })
         assert response.status_code == 200
-        assert response.json()["success"] is True
+        body = response.json()
+        assert body["success"] is True
+        assert body["data"]["postalCode"] == "28001"
 
 
 # ===================== STATS ENDPOINT =====================
