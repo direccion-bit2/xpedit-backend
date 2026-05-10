@@ -1068,6 +1068,7 @@ TRIAL_EXPIRING_D3_SUBJECT = "Te quedan 3 días de Xpedit Pro"
 TRIAL_EXPIRING_D1_SUBJECT = "Mañana se acaba tu prueba Pro"
 TRIAL_VALUE_RECAP_SUBJECT = "Lo que has conseguido con Xpedit Pro esta semana"
 ACTIVE_FREE_PRO_INVITE_SUBJECT = "Has optimizado {n} rutas. Prueba Pro 7 días sin tarjeta"
+WEEKLY_STATS_SUBJECT = "Tu semana en Xpedit: {stops} paradas entregadas"
 
 
 def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, days_left: int) -> dict:
@@ -1212,6 +1213,103 @@ def send_trial_last_day_email(to_email: str, user_name: str) -> dict:
             "reply_to": REPLY_TO,
             "subject": TRIAL_EXPIRING_D1_SUBJECT,
             "html": get_base_template(content, "Mañana acaba tu prueba Pro")
+        })
+        return {"success": True, "id": response["id"]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_weekly_driver_stats_email(
+    to_email: str,
+    user_name: str,
+    stops_completed: int,
+    routes_optimized: int,
+    total_km: float,
+    peak_day_label: str,
+    peak_day_count: int,
+) -> dict:
+    """Monday-morning recap of the previous 7 days. Designed to be quick
+    to read on mobile (driver checks phone before starting the route)
+    and shareable via WhatsApp screenshot.
+
+    Sent only to drivers with >=5 stops the previous week to avoid
+    spamming inactive accounts with empty digests.
+
+    Handoff B4 (10 may 2026): "este lunes 213 paradas, 6h ahorradas,
+    día pico jueves 47" — we surface the numbers we have available
+    today (paradas, rutas, km, día pico) and skip the time-saved
+    estimate until we have a defensible methodology.
+    """
+    user_name = html_escape(user_name or "")
+    cta_deeplink = "xpedit://"
+    km_display = f"{total_km:.1f}" if total_km < 10 else f"{int(round(total_km))}"
+    stops_label = "parada" if stops_completed == 1 else "paradas"
+    routes_label = "ruta optimizada" if routes_optimized == 1 else "rutas optimizadas"
+    peak_label = "parada" if peak_day_count == 1 else "paradas"
+    subject = WEEKLY_STATS_SUBJECT.format(stops=stops_completed)
+
+    content = f"""
+        <h2 style="margin: 0 0 16px 0; color: #1e3a8a; font-size: 26px;">
+            Tu semana en Xpedit
+        </h2>
+
+        <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Hola{(' <strong>' + user_name + '</strong>') if user_name else ''},
+        </p>
+
+        <p style="margin: 0 0 22px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Esto es lo que has hecho en los últimos 7 días:
+        </p>
+
+        <div style="background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-radius: 12px; padding: 24px; margin: 0 0 22px 0; border: 1px solid #bfdbfe;">
+            <table role="presentation" width="100%" style="border-collapse: collapse;">
+                <tr>
+                    <td style="text-align: center; padding: 8px;">
+                        <div style="font-size: 32px; font-weight: 700; color: #1e40af; line-height: 1;">{stops_completed}</div>
+                        <div style="font-size: 13px; color: #1e3a8a; margin-top: 6px;">{stops_label} entregadas</div>
+                    </td>
+                    <td style="text-align: center; padding: 8px; border-left: 1px solid #bfdbfe;">
+                        <div style="font-size: 32px; font-weight: 700; color: #1e40af; line-height: 1;">{routes_optimized}</div>
+                        <div style="font-size: 13px; color: #1e3a8a; margin-top: 6px;">{routes_label}</div>
+                    </td>
+                    <td style="text-align: center; padding: 8px; border-left: 1px solid #bfdbfe;">
+                        <div style="font-size: 32px; font-weight: 700; color: #1e40af; line-height: 1;">{km_display}</div>
+                        <div style="font-size: 13px; color: #1e3a8a; margin-top: 6px;">km recorridos</div>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <div style="background-color: #fef3c7; border-radius: 10px; padding: 16px 20px; margin: 0 0 22px 0; border-left: 4px solid #f59e0b;">
+            <p style="margin: 0; color: #78350f; font-size: 15px; line-height: 1.5;">
+                Tu día pico fue <strong>{peak_day_label}</strong>: <strong>{peak_day_count} {peak_label}</strong>.
+            </p>
+        </div>
+
+        <div style="text-align: center; margin: 28px 0;">
+            <a href="{cta_deeplink}" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-weight: 700; font-size: 16px;">
+                Abrir Xpedit
+            </a>
+        </div>
+
+        <p style="margin: 18px 0 6px 0; color: #6b7280; font-size: 14px; text-align: center; line-height: 1.5;">
+            ¿Coordinas un equipo? Apunta tu email a la lista del Modo Empresa:<br>
+            <a href="https://www.xpedit.es/empresa" style="color: #2563eb; text-decoration: none; font-weight: 500;">xpedit.es/empresa</a>
+        </p>
+
+        <p style="margin: 18px 0 0 0; color: #9ca3af; font-size: 12px; text-align: center;">
+            Recibes este resumen porque optimizaste rutas la semana pasada.
+            Puedes desactivarlo desde Ajustes &rarr; Notificaciones.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": subject,
+            "html": get_base_template(content, "Tu semana en Xpedit")
         })
         return {"success": True, "id": response["id"]}
     except Exception as e:

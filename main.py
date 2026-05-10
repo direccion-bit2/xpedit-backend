@@ -85,6 +85,7 @@ from emails import (
     TRIAL_EXPIRING_D1_SUBJECT,
     TRIAL_EXPIRING_D3_SUBJECT,
     TRIAL_VALUE_RECAP_SUBJECT,
+    WEEKLY_STATS_SUBJECT,
     send_active_free_pro_invite_email,
     send_alert_email,
     send_broadcast_email,
@@ -106,6 +107,7 @@ from emails import (
     send_trial_last_day_email,
     send_trial_value_recap_email,
     send_upcoming_email,
+    send_weekly_driver_stats_email,
     send_welcome_email,
 )
 from optimizer import (
@@ -7584,6 +7586,173 @@ async def check_expiring_trials():
             sentry_sdk.capture_exception(e)
 
 
+async def send_weekly_driver_stats():
+    """Monday 09:00 CEST: weekly recap of last 7 days to active drivers.
+
+    Audience criteria:
+      - email IS NOT NULL, is_ambassador = false
+      - >=5 stops completed in the last 7 days (skip inactive accounts —
+        empty digest is worse than no digest)
+      - excluded internal IDs (admin/test/demo/Apple reviewer)
+      - dedup via email_log on the WEEKLY_STATS_SUBJECT prefix so a job
+        retry never double-sends within the same week
+
+    Body fields per driver:
+      - stops_completed (count)
+      - routes_optimized (count of routes with optimized_hash)
+      - total_km (sum of routes.total_distance_km, rounded)
+      - peak_day (weekday with most stops + count)
+
+    Time-saved estimate intentionally omitted until we have a defensible
+    methodology; the handoff allowed the omission ("estimado por
+    algoritmo simple" was a rough idea, not a confirmed metric).
+
+    Handoff B4 (10 may 2026).
+    """
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",
+    ]
+    if SENTRY_DSN:
+        sentry_check_in(monitor_slug="weekly-driver-stats", status="in_progress")
+    try:
+        now = datetime.now(timezone.utc)
+        week_start = (now - timedelta(days=7)).isoformat()
+
+        # Audience: pull every email-able driver and compute stops in
+        # Python. Per-driver counts via Supabase would be N round-trips
+        # for ~800 drivers; one bulk pull is faster and bounded.
+        drivers_resp = (
+            supabase.table("drivers")
+            .select("id, email, name")
+            .eq("is_ambassador", False)
+            .not_.is_("email", "null")
+            .execute()
+        )
+        if not drivers_resp.data:
+            logger.info("Weekly stats: no eligible drivers")
+            if SENTRY_DSN:
+                sentry_check_in(monitor_slug="weekly-driver-stats", status="ok")
+            return
+
+        eligible = [d for d in drivers_resp.data if d["id"] not in EXCLUDED_IDS]
+
+        sent, skipped, failed = 0, 0, 0
+        # Spanish weekday labels for the peak-day callout
+        WEEKDAY_LABELS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+        for driver in eligible:
+            try:
+                # Stops completed in last 7d, with completed_at to bucket by day.
+                stops_resp = (
+                    supabase.table("stops")
+                    .select("completed_at")
+                    .eq("driver_id", driver["id"])
+                    .eq("status", "completed")
+                    .is_("deleted_at", "null")
+                    .gte("completed_at", week_start)
+                    .execute()
+                )
+                stops_data = stops_resp.data or []
+                if len(stops_data) < 5:
+                    skipped += 1
+                    continue
+
+                # Bucket by weekday (Europe/Madrid for the user's local sense).
+                day_counts: dict[int, int] = {}
+                for row in stops_data:
+                    ts = row.get("completed_at")
+                    if not ts:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Madrid"))
+                        day_counts[dt.weekday()] = day_counts.get(dt.weekday(), 0) + 1
+                    except Exception:
+                        pass
+                if not day_counts:
+                    skipped += 1
+                    continue
+                peak_weekday, peak_count = max(day_counts.items(), key=lambda kv: kv[1])
+
+                # Routes optimized + km in last 7d.
+                routes_resp = (
+                    supabase.table("routes")
+                    .select("total_distance_km, optimized_hash")
+                    .eq("driver_id", driver["id"])
+                    .is_("deleted_at", "null")
+                    .gte("created_at", week_start)
+                    .execute()
+                )
+                routes_optimized = 0
+                total_km = 0.0
+                for r in routes_resp.data or []:
+                    if r.get("optimized_hash"):
+                        routes_optimized += 1
+                    if r.get("total_distance_km"):
+                        try:
+                            total_km += float(r["total_distance_km"])
+                        except (TypeError, ValueError):
+                            pass
+
+                # Dedup via email_log: never send the weekly digest twice
+                # to the same email in the same calendar week.
+                subject = WEEKLY_STATS_SUBJECT.format(stops=len(stops_data))
+                existing = (
+                    supabase.table("email_log")
+                    .select("id")
+                    .eq("recipient_email", driver["email"])
+                    .like("subject", "Tu semana en Xpedit:%")
+                    .gte("created_at", week_start)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data:
+                    skipped += 1
+                    continue
+
+                result = send_weekly_driver_stats_email(
+                    driver["email"],
+                    driver.get("name", ""),
+                    stops_completed=len(stops_data),
+                    routes_optimized=routes_optimized,
+                    total_km=round(total_km, 1),
+                    peak_day_label=WEEKDAY_LABELS[peak_weekday],
+                    peak_day_count=peak_count,
+                )
+                if not result.get("success"):
+                    failed += 1
+                    logger.warning(f"Weekly stats email failed for {driver['id']}: {result.get('error')}")
+                    continue
+
+                sent += 1
+                try:
+                    supabase.table("email_log").insert({
+                        "recipient_email": driver["email"],
+                        "recipient_name": driver.get("name"),
+                        "subject": subject,
+                        "body": f"weekly stats (auto, {len(stops_data)} stops)",
+                        "message_id": result.get("id"),
+                    }).execute()
+                except Exception:
+                    pass
+            except Exception as inner:
+                logger.warning(f"Weekly stats: per-driver failure {driver.get('id')}: {inner}")
+                failed += 1
+
+        logger.info(
+            f"Weekly stats: sent={sent} skipped={skipped} failed={failed} of {len(eligible)} eligible"
+        )
+        if SENTRY_DSN:
+            sentry_check_in(monitor_slug="weekly-driver-stats", status="ok")
+    except Exception as e:
+        logger.error(f"Weekly stats failed: {e}")
+        if SENTRY_DSN:
+            sentry_check_in(monitor_slug="weekly-driver-stats", status="error")
+            sentry_sdk.capture_exception(e)
+
+
 async def invite_active_free_to_trial():
     """Weekly job: surface 7-day Pro trial to free users who're already engaged.
 
@@ -8661,6 +8830,19 @@ async def start_monitoring_jobs():
         hour=11,
         minute=0,
         id="invite_active_free_to_trial",
+        replace_existing=True,
+    )
+    # Weekly driver stats digest (Mondays 09:00 Europe/Madrid). Earlier than
+    # the active-free invite so the digest lands first in the inbox — the
+    # invite is a softer touch and benefits from arriving second.
+    social_scheduler.add_job(
+        send_weekly_driver_stats,
+        "cron",
+        day_of_week="mon",
+        hour=9,
+        minute=0,
+        timezone=ZoneInfo("Europe/Madrid"),
+        id="weekly_driver_stats",
         replace_existing=True,
     )
     logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET), reactivation followup (hourly :15), active-free invite (Mon 11:00 UTC)")
