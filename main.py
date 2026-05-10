@@ -4537,13 +4537,42 @@ def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
 
     text = (response.text or "").strip()
     if not text:
-        raise HTTPException(status_code=502, detail="Empty response from Gemini")
+        logger.warning("OCR Gemini returned empty text")
+        return {"name": "", "street": "", "city": "", "postalCode": "", "province": ""}
 
+    # Fast path: clean JSON straight from response_schema.
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"OCR Gemini returned invalid JSON: {e}; text[:200]={text[:200]}")
-        raise HTTPException(status_code=502, detail="Invalid JSON from Gemini")
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Tolerant fallback: Gemini occasionally wraps the JSON in ```json...```
+    # fences or prefixes a one-line apology. Strip those and try again.
+    cleaned = text
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```", 2)[1] if "```" in cleaned[3:] else cleaned[3:]
+        if cleaned.lstrip().lower().startswith("json"):
+            cleaned = cleaned.lstrip()[4:]
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Worst case: log to Sentry and return empty fields so the UI doesn't
+    # explode on a hard label. The app shows the user "couldn't read, try
+    # again" instead of a generic 502.
+    logger.error(f"OCR Gemini unparseable response, text[:300]={text[:300]}")
+    sentry_sdk.capture_message(
+        f"OCR Gemini unparseable response: {text[:200]}",
+        level="warning",
+    )
+    return {"name": "", "street": "", "city": "", "postalCode": "", "province": ""}
 
 
 @app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
