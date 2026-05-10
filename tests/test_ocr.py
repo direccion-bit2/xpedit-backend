@@ -1,10 +1,40 @@
-"""Tests for OCR label extraction endpoint (/ocr/label)."""
+"""Tests for OCR label extraction endpoint (/ocr/label).
+
+Migrated from Anthropic Claude → Gemini 2.5 Flash on 2026-05-10 (#244).
+Tests now mock `get_gemini_client()` instead of `httpx.AsyncClient`.
+"""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
+
+
+def _gemini_response(payload: dict | str | None) -> MagicMock:
+    """Build a fake Gemini response.text wrapper.
+
+    - If payload is a dict, it's JSON-encoded into response.text.
+    - If payload is a string, used verbatim (handy for malformed JSON tests).
+    - If payload is None, response.text is empty.
+    """
+    resp = MagicMock()
+    if payload is None:
+        resp.text = ""
+    elif isinstance(payload, str):
+        resp.text = payload
+    else:
+        resp.text = json.dumps(payload, ensure_ascii=False)
+    return resp
+
+
+def _patched_client(generate_return=None, generate_side_effect=None):
+    """Build a fake Gemini client whose .models.generate_content returns/raises."""
+    client = MagicMock()
+    if generate_side_effect is not None:
+        client.models.generate_content.side_effect = generate_side_effect
+    else:
+        client.models.generate_content.return_value = generate_return
+    return client
 
 
 class TestOCRLabelAuth:
@@ -37,23 +67,24 @@ class TestOCRLabelValidation:
 
     @pytest.mark.asyncio
     async def test_valid_media_types_accepted(self, client):
-        """All four allowed media types should pass validation (may fail on API call, not validation)."""
+        """All four allowed media types should pass validation. We force the
+        Gemini client to be missing so we know it's a 503 (service not
+        configured), proving validation passed."""
         for media_type in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-            with patch("main.ANTHROPIC_API_KEY", ""):
+            with patch("main.get_gemini_client", return_value=None):
                 resp = await client.post("/ocr/label", json={
                     "image_base64": "abc123",
                     "media_type": media_type,
                 })
-                # 503 means validation passed but API key is missing
                 assert resp.status_code == 503
 
 
 class TestOCRLabelServiceNotConfigured:
-    """Tests when ANTHROPIC_API_KEY is not set."""
+    """Tests when the Gemini client is not available."""
 
     @pytest.mark.asyncio
-    async def test_returns_503_when_no_api_key(self, client):
-        with patch("main.ANTHROPIC_API_KEY", ""):
+    async def test_returns_503_when_no_client(self, client):
+        with patch("main.get_gemini_client", return_value=None):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "abc123",
                 "media_type": "image/jpeg",
@@ -67,26 +98,16 @@ class TestOCRLabelSuccess:
 
     @pytest.mark.asyncio
     async def test_successful_extraction(self, client):
-        ocr_result = json.dumps({
+        ocr_payload = {
             "name": "Juan Garcia",
             "street": "Calle Mayor 5",
             "city": "Sevilla",
             "postalCode": "41001",
             "province": "Sevilla",
-        })
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "content": [{"text": ocr_result}],
         }
+        gemini_client = _patched_client(generate_return=_gemini_response(ocr_payload))
 
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "iVBORw0KGgoAAAANSUhEUg==",
                 "media_type": "image/png",
@@ -95,196 +116,97 @@ class TestOCRLabelSuccess:
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
-        assert body["content"] == ocr_result
+        # `content` keeps the legacy JSON-string contract
+        assert json.loads(body["content"]) == ocr_payload
+        # `data` is the new convenience field — same payload, parsed
+        assert body["data"] == ocr_payload
 
     @pytest.mark.asyncio
-    async def test_sends_correct_headers_and_payload(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"content": [{"text": "{}"}]}
+    async def test_calls_gemini_with_correct_model_and_image(self, client):
+        gemini_client = _patched_client(generate_return=_gemini_response({
+            "name": "", "street": "", "city": "", "postalCode": "", "province": "",
+        }))
 
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             await client.post("/ocr/label", json={
-                "image_base64": "dGVzdA==",
+                "image_base64": "dGVzdA==",  # b64('test')
                 "media_type": "image/webp",
             })
 
-        call_args = mock_http_client.post.call_args
-        url = call_args[0][0] if call_args[0] else call_args[1].get("url", "")
-        assert "api.anthropic.com" in url
+        gemini_client.models.generate_content.assert_called_once()
+        kwargs = gemini_client.models.generate_content.call_args.kwargs
+        assert kwargs["model"] == "gemini-2.5-flash"
 
-        headers = call_args[1].get("headers", {})
-        assert headers["x-api-key"] == "sk-ant-test-key"
-        assert headers["anthropic-version"] == "2023-06-01"
+        contents = kwargs["contents"]
+        # contents = [Content(role='user', parts=[text_part, image_part])]
+        assert len(contents) == 1
+        parts = contents[0].parts
+        # Two parts: prompt text + image bytes
+        assert len(parts) == 2
+        # The image part carries the decoded bytes + the requested mime type
+        image_part = parts[1]
+        assert image_part.inline_data.mime_type == "image/webp"
+        assert image_part.inline_data.data == b"test"
 
-        payload = call_args[1].get("json", {})
-        assert payload["model"] == "claude-haiku-4-5-20251001"
-        msg_content = payload["messages"][0]["content"]
-        image_block = msg_content[0]
-        assert image_block["source"]["media_type"] == "image/webp"
-        assert image_block["source"]["data"] == "dGVzdA=="
-
-    @pytest.mark.asyncio
-    async def test_empty_content_array(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"content": [{}]}
-
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
-            resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
-                "media_type": "image/jpeg",
-            })
-
-        assert resp.status_code == 200
-        assert resp.json()["content"] == ""
+        # Config requests structured JSON output
+        config = kwargs["config"]
+        assert config.response_mime_type == "application/json"
 
     @pytest.mark.asyncio
     async def test_default_media_type_is_jpeg(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"content": [{"text": "{}"}]}
+        gemini_client = _patched_client(generate_return=_gemini_response({
+            "name": "", "street": "", "city": "", "postalCode": "", "province": "",
+        }))
 
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
+                "image_base64": "dGVzdA==",
             })
 
         assert resp.status_code == 200
-        payload = mock_http_client.post.call_args[1]["json"]
-        image_block = payload["messages"][0]["content"][0]
-        assert image_block["source"]["media_type"] == "image/jpeg"
+        kwargs = gemini_client.models.generate_content.call_args.kwargs
+        image_part = kwargs["contents"][0].parts[1]
+        assert image_part.inline_data.mime_type == "image/jpeg"
 
 
 class TestOCRLabelErrors:
     """Error handling tests."""
 
     @pytest.mark.asyncio
-    async def test_anthropic_api_non_200(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 429
+    async def test_gemini_raises_returns_502(self, client):
+        gemini_client = _patched_client(generate_side_effect=RuntimeError("rate limited"))
 
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
+                "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
             })
 
         assert resp.status_code == 502
-        assert "OCR API error 429" in resp.json()["detail"]
+        assert "OCR API error" in resp.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_anthropic_api_500(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 500
+    async def test_empty_response_text_returns_502(self, client):
+        gemini_client = _patched_client(generate_return=_gemini_response(None))
 
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
+                "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
             })
 
         assert resp.status_code == 502
-        assert "500" in resp.json()["detail"]
+        assert "Empty" in resp.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_network_timeout(self, client):
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(side_effect=httpx.TimeoutException("Connection timed out"))
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+    async def test_invalid_json_response_returns_502(self, client):
+        gemini_client = _patched_client(generate_return=_gemini_response("not actually json"))
 
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.get_gemini_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
+                "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
             })
 
-        assert resp.status_code == 500
-        assert "Error interno" in resp.json()["detail"]
-
-    @pytest.mark.asyncio
-    async def test_connection_error(self, client):
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(side_effect=httpx.ConnectError("DNS resolution failed"))
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
-            resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
-                "media_type": "image/jpeg",
-            })
-
-        assert resp.status_code == 500
-        assert "Error interno" in resp.json()["detail"]
-
-    @pytest.mark.asyncio
-    async def test_unexpected_exception(self, client):
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(side_effect=RuntimeError("something broke"))
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
-            resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
-                "media_type": "image/jpeg",
-            })
-
-        assert resp.status_code == 500
-        assert "Error interno" in resp.json()["detail"]
-
-    @pytest.mark.asyncio
-    async def test_malformed_json_response(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.side_effect = json.JSONDecodeError("err", "", 0)
-
-        mock_http_client = AsyncMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
-        mock_http_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("main.ANTHROPIC_API_KEY", "sk-ant-test-key"), \
-             patch("main.httpx.AsyncClient", return_value=mock_http_client):
-            resp = await client.post("/ocr/label", json={
-                "image_base64": "abc",
-                "media_type": "image/jpeg",
-            })
-
-        assert resp.status_code == 500
-        assert "Error interno" in resp.json()["detail"]
+        assert resp.status_code == 502
+        assert "Invalid JSON" in resp.json()["detail"]
