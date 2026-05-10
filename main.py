@@ -5516,8 +5516,33 @@ async def delete_account(user=Depends(get_current_user)):
             except Exception as e:
                 deletion_errors.append(f"recurring_places: {e}")
 
-            # Delete other driver-specific data
+            # Delete other driver-specific data. The list MUST cover every
+            # table with a FK to public.drivers having ON DELETE NO ACTION,
+            # otherwise the final `DELETE FROM drivers` blows up on FK
+            # violation (Postgres 23503) and the user is left in limbo:
+            # auth.users alive, drivers row alive, app told them "deleted".
+            #
+            # Incidents 2026-05-09 (zamorakareilys) and 2026-05-10
+            # (arroceriadevicent) hit exactly this — both via missing
+            # trial_claims cleanup. The complete list, derived from
+            # information_schema for FK delete_rule='NO ACTION' on
+            # public.drivers as referenced table:
+            #   trial_claims        (driver_id)
+            #   app_events          (driver_id)
+            #   customer_notifications (driver_id)
+            #   stop_check_ins      (driver_id)
+            #   delivery_proofs     (driver_id)   -- already partially handled by stop_id batch above
+            #   tracking_links      (driver_id)   -- already partially handled by route_id batch above
+            #   location_history    (driver_id)
+            #   daily_usage         (driver_id)
+            #   referrals           (referrer_driver_id, referred_driver_id)
             tables_driver = [
+                ("trial_claims", "driver_id"),
+                ("app_events", "driver_id"),
+                ("customer_notifications", "driver_id"),
+                ("stop_check_ins", "driver_id"),
+                ("delivery_proofs", "driver_id"),
+                ("tracking_links", "driver_id"),
                 ("location_history", "driver_id"),
                 ("daily_usage", "driver_id"),
                 ("referrals", "referrer_driver_id"),
@@ -5534,6 +5559,15 @@ async def delete_account(user=Depends(get_current_user)):
                 supabase.table("drivers").delete().eq("id", driver_id).execute()
             except Exception as e:
                 deletion_errors.append(f"drivers: {e}")
+                # If the driver row didn't go away, the auth.users row will
+                # almost certainly fail too (the gotrue admin endpoint runs
+                # CASCADE checks from auth.users). Sentry-capture for visibility.
+                if SENTRY_DSN:
+                    sentry_sdk.capture_message(
+                        f"delete_account: drivers row for {driver_id} could not be deleted. "
+                        f"FK violation likely — check tables_driver list. Error: {e}",
+                        level="error",
+                    )
 
         # Delete user-level data
         tables_user = [
@@ -5561,17 +5595,63 @@ async def delete_account(user=Depends(get_current_user)):
             logger.error(f"CRITICAL: Failed to delete auth user {user_id}: {e}")
             sentry_sdk.capture_exception(e)
 
+        # Critical post-condition check: did auth.users actually disappear?
+        # If the auth.admin.delete_user step recorded an error, the auth row
+        # is still alive and the user is in limbo: app tells them "OK"
+        # while GDPR says we still hold their data, opening us to AEPD
+        # penalties. We track this via the deletion_errors list — every
+        # exception from auth.admin.delete_user is appended with the prefix
+        # 'auth.admin.delete_user:' (see above). If that prefix is in the
+        # list, treat the auth user as still alive and refuse to return 200.
+        auth_user_still_exists = any(
+            e.startswith("auth.admin.delete_user:") for e in deletion_errors
+        )
+
         # Log any partial failures for GDPR audit trail
         if deletion_errors:
             logger.warning(f"Account deletion partial errors for {user_id}: {deletion_errors}")
             sentry_sdk.capture_message(
-                f"Account deletion had {len(deletion_errors)} errors for user {user_id}",
-                level="warning",
+                f"Account deletion had {len(deletion_errors)} errors for user {user_id}: "
+                f"{'; '.join(deletion_errors[:5])}",
+                level="warning" if not auth_user_still_exists else "error",
             )
 
+        # Decide response status.
+        #   - auth.users still alive → 502: account NOT deleted, the client
+        #     should show the user a real error (not "ok") and let them retry
+        #     or contact support. This is the GDPR-compliant outcome: never
+        #     lie about deletion when the row is still there.
+        #   - errors recorded but auth.users gone → 207 Multi-Status: data
+        #     bulk gone, some auxiliary rows orphaned. User-facing this is
+        #     still a successful delete (their identity is gone), but the
+        #     audit log captures the cleanup gaps.
+        #   - clean run → 200.
+        if auth_user_still_exists:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "deletion_incomplete",
+                    "message": "No hemos podido completar la eliminación. Inténtalo de nuevo o contacta con soporte.",
+                    "errors_count": len(deletion_errors),
+                },
+            )
+        if deletion_errors:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=207,
+                content={
+                    "status": "deleted",
+                    "message": "Cuenta eliminada con incidencias menores en los datos auxiliares.",
+                    "errors_count": len(deletion_errors),
+                },
+            )
         return {"status": "deleted", "message": "Cuenta eliminada correctamente"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Delete account error: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail="Error al eliminar la cuenta")
 
 

@@ -151,3 +151,63 @@ class TestDeleteAccount:
 
         assert response.status_code == 200
         assert response.json()["status"] == "deleted"
+
+    @pytest.mark.asyncio
+    async def test_delete_account_auth_user_failure_returns_502(self, client):
+        """If supabase.auth.admin.delete_user raises, the auth row is still
+        alive — the endpoint MUST NOT lie with 200. GDPR requires we either
+        actually delete or surface the failure. Added 2026-05-10 (#248) after
+        2 incidents of users left in limbo (zamorakareilys + arroceriadevicent)."""
+        with patch("main.supabase") as mock_sb:
+            driver_result = MagicMock(); driver_result.data = [{"id": FAKE_DRIVER_ID}]
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.execute.return_value = driver_result
+                    chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
+                else:
+                    chain.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+                    chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
+                return chain
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            mock_sb.auth.admin.delete_user = MagicMock(
+                side_effect=Exception("Database error deleting user")
+            )
+
+            response = await client.delete("/auth/delete-account")
+
+        assert response.status_code == 502
+        body = response.json()
+        assert body["detail"]["error"] == "deletion_incomplete"
+        assert "errors_count" in body["detail"]
+
+    @pytest.mark.asyncio
+    async def test_delete_account_partial_returns_207(self, client):
+        """If a peripheral table delete fails but auth.users IS deleted, return
+        207 Multi-Status (data gone, audit log notes the gap). The user still
+        has their identity removed — the failure is auxiliary cleanup."""
+        with patch("main.supabase") as mock_sb:
+            driver_result = MagicMock(); driver_result.data = [{"id": FAKE_DRIVER_ID}]
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.execute.return_value = driver_result
+                    chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
+                elif name == "trial_claims":
+                    # Simulate trial_claims delete failing — peripheral.
+                    chain.delete.return_value.eq.return_value.execute.side_effect = (
+                        Exception("transient connection error")
+                    )
+                else:
+                    chain.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+                    chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
+                return chain
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            mock_sb.auth.admin.delete_user = MagicMock(return_value=True)
+
+            response = await client.delete("/auth/delete-account")
+
+        assert response.status_code == 207
+        body = response.json()
+        assert body["status"] == "deleted"
+        assert body["errors_count"] >= 1
