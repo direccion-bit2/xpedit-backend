@@ -727,6 +727,44 @@ class TestPlacesEndpoints:
         assert body["routes"][0]["legs"][0]["steps"][0]["polyline"]["points"] == "step_enc"
 
     @pytest.mark.asyncio
+    async def test_places_directions_waypoints_are_stops_not_via(self, client):
+        """Regresión 11 may 2026: marcar todos los waypoints como `via: True`
+        fusionaba todos los stops en 1 leg, dejando durations/snapped vacíos
+        en el cliente RN. Este test fija el contrato: waypoints SIN prefijo
+        `via:` deben ir como stops reales (omit `via`), y solo los que
+        empiezan con `via:` deben llevar `"via": True`."""
+        captured_body: dict = {}
+
+        def capture_post(*args, **kwargs):
+            # El body de Routes v2 viaja como JSON keyword.
+            captured_body.update(kwargs.get("json", {}))
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"routes": [{"polyline": {"encodedPolyline": "x"}, "legs": []}]}
+            return mock_response
+
+        mock_http = AsyncMock()
+        mock_http.post.side_effect = capture_post
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get(
+                "/places/directions"
+                "?origin=40.416,-3.703&destination=40.453,-3.688"
+                "&waypoints=40.42,-3.70|via:40.43,-3.69|40.44,-3.68"
+            )
+        assert response.status_code == 200
+        intermediates = captured_body.get("intermediates", [])
+        assert len(intermediates) == 3, f"expected 3 intermediates, got {len(intermediates)}"
+        # stop real (sin prefijo `via:`) NO debe llevar `via`
+        assert "via" not in intermediates[0], "real stop should not be marked via"
+        # waypoint con prefijo `via:` SÍ debe llevar `via: True`
+        assert intermediates[1].get("via") is True, "via: prefix should set via=True"
+        # otro stop real → no via
+        assert "via" not in intermediates[2], "real stop should not be marked via"
+
+    @pytest.mark.asyncio
     async def test_places_snap(self, client):
         mock_response = MagicMock()
         mock_response.json.return_value = {

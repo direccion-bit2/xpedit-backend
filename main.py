@@ -5385,12 +5385,21 @@ async def places_directions(
         except Exception as e:
             logger.warning(f"heading waypoint skipped: {e}")
     if waypoints:
+        # El cliente RN pasa waypoints SIN prefijo `via:` cuando son paradas
+        # reales (1 leg por parada para extraer duration/end_location/steps).
+        # Solo el legacy `via:` prefix indica waypoint guía. Routes API v2 usa
+        # `via: True` para "guía no-stop" y omite la propiedad cuando es stop
+        # real. Marcar `via: True` por defecto fusiona todos los waypoints en
+        # 1 leg y rompe el cliente (durations/snapped vacíos). Bug detectado
+        # en smoke staging 11 may 19:48.
         for wp in waypoints.split("|"):
-            if wp.startswith("via:"):
+            is_via = wp.startswith("via:")
+            if is_via:
                 wp = wp[4:]
             if wp:
                 w = _routes_v2_waypoint(wp)
-                w["via"] = True
+                if is_via:
+                    w["via"] = True
                 intermediates.append(w)
 
     body: dict = {
