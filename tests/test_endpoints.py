@@ -691,20 +691,40 @@ class TestPlacesEndpoints:
 
     @pytest.mark.asyncio
     async def test_places_directions(self, client):
+        # 11 may 2026: migrado a Routes API v2 (POST + shape distinto).
+        # Backend mapea respuesta v2 → shape Directions legacy para el cliente RN.
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
-            "status": "OK",
-            "routes": [{"overview_polyline": {"points": "abc"}}]
+            "routes": [{
+                "duration": "180s",
+                "distanceMeters": 5400,
+                "polyline": {"encodedPolyline": "abc"},
+                "legs": [{
+                    "duration": "180s",
+                    "distanceMeters": 5400,
+                    "endLocation": {"latLng": {"latitude": 40.453, "longitude": -3.688}},
+                    "steps": [{"polyline": {"encodedPolyline": "step_enc"}}],
+                }],
+            }]
         }
 
         mock_http = AsyncMock()
-        mock_http.get.return_value = mock_response
+        mock_http.post.return_value = mock_response
         mock_http.__aenter__.return_value = mock_http
         mock_http.__aexit__.return_value = False
 
         with patch("main.httpx.AsyncClient", return_value=mock_http):
             response = await client.get("/places/directions?origin=40.416,-3.703&destination=40.453,-3.688")
         assert response.status_code == 200
+        body = response.json()
+        # El cliente RN espera shape legacy → comprobamos el mapping
+        assert body["status"] == "OK"
+        assert body["routes"][0]["overview_polyline"]["points"] == "abc"
+        assert body["routes"][0]["legs"][0]["duration"]["value"] == 180
+        assert body["routes"][0]["legs"][0]["distance"]["value"] == 5400
+        assert body["routes"][0]["legs"][0]["end_location"]["lat"] == 40.453
+        assert body["routes"][0]["legs"][0]["steps"][0]["polyline"]["points"] == "step_enc"
 
     @pytest.mark.asyncio
     async def test_places_snap(self, client):
