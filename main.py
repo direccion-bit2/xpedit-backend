@@ -840,7 +840,14 @@ async def rate_limit_middleware(request: Request, call_next):
         elif path.startswith("/email"):
             check_rate_limit(f"email:{client_ip}", max_requests=20, window_seconds=60)
         elif path.startswith("/ocr"):
-            check_rate_limit(f"ocr:{client_ip}", max_requests=5, window_seconds=60)
+            # 5/min was set when /ocr only had /ocr/label (1 photo per
+            # request). Now MSI fires up to 10 parallel /ocr/screenshots-batch
+            # calls (one per photo with concurrency=4) so 5/min trips after
+            # the first chunk wave. Per-user daily quota
+            # (check_ocr_image_quota) is the real spend gate; this
+            # middleware limit is just abuse-prevention. Bump it to a
+            # number that comfortably fits a normal 10-photo import.
+            check_rate_limit(f"ocr:{client_ip}", max_requests=60, window_seconds=60)
         elif path.startswith("/location"):
             check_rate_limit(f"location:{client_ip}", max_requests=60, window_seconds=60)
         elif path.startswith("/routes"):
