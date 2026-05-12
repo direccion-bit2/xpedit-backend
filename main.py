@@ -723,12 +723,44 @@ _OCR_DAILY_IMG_QUOTA = {
 }
 _OCR_QUOTA_WINDOW = 86400  # 24h rolling window.
 
+# Internal testing accounts get unlimited daily quota while we iterate on
+# MSI. Miguel staging + Miguel prod direccion@taespack. These are NOT
+# customer accounts, they're the ones we use to smoke-test every OTA.
+# Update this list when adding/removing dev devices, never expose it.
+_OCR_QUOTA_TESTING_BYPASS = frozenset({
+    "9922cc2e-d88d-4e58-a5f5-8b3d7ca52e40",  # staging@xpedit.es (Miguel DEV)
+    "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # direccion@taespack.com (Miguel prod)
+})
+
+def get_ocr_quota_status(driver_id: str, tier: str) -> dict:
+    """Returns the current OCR daily-image quota state for a driver.
+    Used by GET /ocr/quota so the app can pre-check before sending a
+    batch (Miguel report 12 may 15:13: bad UX when the limit alert
+    fires AFTER the last image is processed). `used` and `remaining`
+    refer to the current rolling 24h window."""
+    if driver_id in _OCR_QUOTA_TESTING_BYPASS:
+        return {"tier": tier, "used": 0, "limit": 9999, "remaining": 9999, "testing_bypass": True}
+    now = time.time()
+    key = f"ocr_imgs:{driver_id}:daily"
+    used = len([t for t in _rate_limits.get(key, []) if t > now - _OCR_QUOTA_WINDOW])
+    limit = _OCR_DAILY_IMG_QUOTA.get(tier, _OCR_DAILY_IMG_QUOTA["free"])
+    return {
+        "tier": tier,
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "testing_bypass": False,
+    }
+
+
 def check_ocr_image_quota(driver_id: str, tier: str, n_images: int):
     """Enforce a per-driver, per-day OCR image quota. Counts IMAGES, not requests.
     Raises 429 if accepting the new images would push the user over their tier's
     daily limit. Adds one timestamp per image so the rolling window math stays
-    cheap (linear in current usage)."""
+    cheap (linear in current usage). Testing accounts bypass the gate."""
     if n_images <= 0:
+        return
+    if driver_id in _OCR_QUOTA_TESTING_BYPASS:
         return
     now = time.time()
     key = f"ocr_imgs:{driver_id}:daily"
@@ -4761,6 +4793,17 @@ def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
         level="warning",
     )
     return {"name": "", "street": "", "city": "", "postalCode": "", "province": ""}
+
+
+@app.get("/ocr/quota", tags=["ocr"], summary="Current daily OCR image quota for this driver")
+async def ocr_quota(user=Depends(get_current_user)):
+    """Returns the caller's current OCR daily image quota state.
+    Used by the app to pre-check before sending a batch — without this
+    pre-check the limit alert fires AFTER the last image is processed
+    (which still costs Gemini money). Miguel report 12 may 15:13 CEST.
+    """
+    tier, driver_id = _resolve_user_tier(user["id"])
+    return get_ocr_quota_status(driver_id or user["id"], tier)
 
 
 @app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
