@@ -1673,14 +1673,17 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 
 @app.patch("/routes/{route_id}/complete", tags=["routes"], summary="Completar ruta")
 async def complete_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como 'completed', registra la hora de finalización
-    y aplica soft-delete a la ruta (cascade a stops vía
-    trg_soft_delete_route_stops). Tras esto, la ruta NUNCA debe volver a
-    aparecer al driver — está finalizada y archivada.
+    """Marca una ruta como 'completed' y registra la hora de finalización.
 
-    Diseñado como mutación server-side con service_role para evitar el
-    bug 42501 que ocurría cuando el JWT del cliente expiraba durante una
-    operación crítica (Sentry REACT-NATIVE-30, 50+ rutas zombi en prod).
+    NO escribe deleted_at: una ruta finalizada debe aparecer en el
+    historial del driver. El que la ruta no reaparezca como "activa" en
+    cold start lo garantiza la app: loadSavedState valida la cache local
+    exigiendo status IN ('pending','in_progress'), y loadActiveRouteFromCloud
+    aplica el mismo filtro.
+
+    Idempotente: si ya estaba completed, re-confirma estado y devuelve
+    already_finalized=true. Diseñado server-side con service_role para
+    evitar 42501 con JWT stale (Sentry REACT-NATIVE-30).
     """
     await verify_route_access(route_id, user)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1688,14 +1691,11 @@ async def complete_route(route_id: str, user=Depends(get_current_user)):
         lambda: supabase.table("routes").update({
             "status": "completed",
             "completed_at": now_iso,
-            "deleted_at": now_iso,
-        }).eq("id", route_id).is_("deleted_at", None).execute()
+        }).eq("id", route_id).neq("status", "completed").execute()
     )
     route = safe_first(result)
     if not route:
-        # Either the route doesn't exist or it was already finalized.
-        # Idempotent success: re-confirm and return current state so the
-        # client cleans up local cache without raising.
+        # Already completed (or doesn't exist). Idempotent path.
         existing = supabase.table("routes").select("id, status, completed_at, deleted_at").eq("id", route_id).limit(1).execute()
         if existing.data:
             return {"success": True, "route": existing.data[0], "already_finalized": True}
