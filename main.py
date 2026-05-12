@@ -4531,15 +4531,25 @@ _OCR_LABEL_SCHEMA = {
 class OCRLabelRequest(BaseModel):
     image_base64: str = Field(..., max_length=10_000_000)  # ~7.5MB max image
     media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/jpeg"
+    # When True the request authorizes the backend to keep the image + the
+    # model/user pair in `ocr_corrections` for OCR improvement (Day-2
+    # learning loop). Default False = no capture, no storage. The app shows
+    # the toggle in Settings and only forwards the True value when explicit
+    # consent has been recorded.
+    consent_to_training: bool = False
 
 
 def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
     """Synchronous Gemini call for label OCR. Wrap in asyncio.to_thread() from
     the async caller — google-genai SDK is blocking. Returns a dict that
-    matches `_OCR_LABEL_SCHEMA`. Raises HTTPException on Gemini errors."""
+    matches `_OCR_LABEL_SCHEMA`. Raises HTTPException on Gemini errors.
+
+    Uses Vertex AI (europe-west4) so the label image — which contains the
+    recipient's full name + address — never leaves the EU and falls under
+    the GCP DPA instead of AI Studio terms."""
     from google.genai import types
 
-    client = get_gemini_client()
+    client = get_gemini_vertex_client()
     if not client:
         raise HTTPException(status_code=503, detail="OCR service not configured")
 
@@ -4612,22 +4622,73 @@ def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
 @app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
 async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
     """Extrae datos de una etiqueta de envío (nombre, dirección, ciudad, CP,
-    provincia) con Gemini Vision. La API key se mantiene en el servidor."""
-    if not get_gemini_client():
+    provincia) con Gemini Vision. La API key se mantiene en el servidor.
+
+    If `consent_to_training` is true, the source image is uploaded to the
+    `ocr-training` bucket and an `ocr_corrections` row is created. The id
+    is returned as `correction_id` so the app can PATCH it later with the
+    user's accepted/edited answer.
+    """
+    if not get_gemini_vertex_client():
         raise HTTPException(status_code=503, detail="OCR service not configured")
 
+    import time
+    t0 = time.perf_counter()
     try:
         data = await asyncio.to_thread(
             _ocr_label_with_gemini,
             request.image_base64,
             request.media_type,
         )
-        return {"success": True, "content": json.dumps(data, ensure_ascii=False), "data": data}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    correction_id: Optional[str] = None
+    if request.consent_to_training:
+        driver_id = _resolve_driver_id_from_user(user["id"])
+        if driver_id:
+            try:
+                image_bytes = base64.b64decode(request.image_base64)
+                storage_path = await asyncio.to_thread(
+                    _upload_ocr_image_sync, driver_id, image_bytes, request.media_type, "label_scan"
+                )
+            except Exception as e:
+                logger.warning(f"label_scan image decode/upload failed: {e}")
+                sentry_sdk.capture_exception(e)
+                storage_path = None
+            parts = data if isinstance(data, dict) else {}
+            # Compose a flat address string for fast diff/search later.
+            extracted_address = ", ".join(
+                p for p in [
+                    parts.get("street"), parts.get("city"),
+                    parts.get("postalCode"), parts.get("province"),
+                ] if p
+            ) or None
+            correction_id = await asyncio.to_thread(
+                _create_ocr_correction_row,
+                driver_id=driver_id,
+                source="label_scan",
+                image_storage_path=storage_path,
+                model_name=_OCR_LABEL_MODEL,
+                model_extracted_address=extracted_address,
+                model_extracted_parts=parts or None,
+                model_confidence=None,
+                carrier_hint=None,
+                country_iso=None,
+                model_latency_ms=latency_ms,
+                consent=True,
+            )
+
+    return {
+        "success": True,
+        "content": json.dumps(data, ensure_ascii=False),
+        "data": data,
+        "correction_id": correction_id,
+    }
 
 
 # === MULTI-SCREENSHOT IMPORTER (Pro+ killer feature) ===
@@ -4663,6 +4724,11 @@ class MSIBatchRequest(BaseModel):
         "ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"
     ]] = None
     route_context: Optional[MSIRouteContext] = None
+    # Opt-in flag for the OCR learning loop. When True the backend uploads
+    # the screenshots to the `ocr-training` bucket and creates one row per
+    # extracted stop in `ocr_corrections`, returning correction_ids that
+    # the app uses to PATCH the user's final answer after review.
+    consent_to_training: bool = False
 
 
 def _verify_msi_access(auth_user_id: str) -> dict:
@@ -4824,10 +4890,14 @@ def _msi_extract_stops_with_gemini(
 ) -> dict:
     """Synchronous helper that calls Gemini 2.5 Pro with multimodal request +
     structured response schema. Returns the parsed JSON dict. Wrap in
-    asyncio.to_thread() from async caller — google-genai SDK is blocking."""
+    asyncio.to_thread() from async caller — google-genai SDK is blocking.
+
+    Uses Vertex AI (europe-west4) so the screenshots — which expose lists of
+    recipients with names and addresses — stay inside the EU and are
+    covered by the Google Cloud DPA, not the AI Studio terms."""
     from google.genai import types
 
-    client = get_gemini_client()
+    client = get_gemini_vertex_client()
     if not client:
         raise HTTPException(status_code=503, detail="Gemini AI no configurado")
 
@@ -5299,6 +5369,51 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
     for s in enriched_stops:
         by_conf[s.get("confidence", "low")] = by_conf.get(s.get("confidence", "low"), 0) + 1
 
+    # OCR learning loop (Day 2). If the driver opted in, upload every
+    # screenshot once to ocr-training and create one ocr_corrections row
+    # per extracted stop. The first image path is reused as the cover for
+    # all rows in this batch (V1 simplification — refining the
+    # image↔stop alignment lives in Day 3).
+    correction_ids: List[Optional[str]] = [None] * len(enriched_stops)
+    if req.consent_to_training and enriched_stops:
+        driver_id = _resolve_driver_id_from_user(auth_user_id)
+        if driver_id:
+            primary_storage_path: Optional[str] = None
+            try:
+                first_bytes = base64.b64decode(req.images[0].image_base64)
+                primary_storage_path = await asyncio.to_thread(
+                    _upload_ocr_image_sync,
+                    driver_id, first_bytes, req.images[0].media_type, "msi",
+                )
+            except Exception as e:
+                logger.warning(f"msi cover image upload failed: {e}")
+                sentry_sdk.capture_exception(e)
+
+            carrier_detected = gemini_result.get("carrier_detected")
+            country = (req.route_context.country if req.route_context else None) or "ES"
+            for i, stop in enumerate(enriched_stops):
+                cid = await asyncio.to_thread(
+                    _create_ocr_correction_row,
+                    driver_id=driver_id,
+                    source="msi",
+                    image_storage_path=primary_storage_path,
+                    model_name=_MSI_MODEL,
+                    model_extracted_address=stop.get("address") or stop.get("street"),
+                    model_extracted_parts={k: stop.get(k) for k in (
+                        "name", "street", "city", "postalCode", "province", "floor_etc",
+                    ) if stop.get(k) is not None},
+                    model_confidence=float(stop.get("extraction_confidence")) if stop.get("extraction_confidence") is not None else None,
+                    carrier_hint=req.carrier_hint or carrier_detected,
+                    country_iso=country,
+                    model_latency_ms=extraction_ms if i == 0 else None,
+                    consent=True,
+                )
+                correction_ids[i] = cid
+                # Mirror the id on the response stop so the app can keep the
+                # association without zipping arrays.
+                if cid:
+                    stop["correction_id"] = cid
+
     if SENTRY_DSN:
         sentry_sdk.add_breadcrumb(
             category="msi",
@@ -5324,6 +5439,7 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
         "language": gemini_result.get("language", "es"),
         "stops_count": len(enriched_stops),
         "stops": enriched_stops,
+        "correction_ids": correction_ids,
         "global_inference_notes": gemini_result.get("global_inference_notes", ""),
         "confidence_summary": by_conf,
         "extraction_ms": extraction_ms,
@@ -5331,6 +5447,215 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
         "processing_ms": extraction_ms + pipeline_ms,
         "model": _MSI_MODEL,
         "tier": tier,
+    }
+
+
+# === OCR LEARNING LOOP (Day 2) ===
+#
+# When the driver opts in to "ayúdame a mejorar Xpedit", each call to
+# /ocr/label or /ocr/screenshots-batch uploads the source image to the
+# `ocr-training` bucket and inserts one row per extracted stop in
+# `ocr_corrections`. The app then PATCHes each row with the driver's
+# accepted/edited address. Admin reviews diffs in /admin/ocr-corrections
+# and promotes the best pairs to is_golden_example=TRUE.
+#
+# No consent  → no upload, no row, no learning. Strict opt-in.
+# Vertex AI processes the image either way (extraction needs it), but
+# the data is not retained past the request unless consent is given.
+
+_OCR_BUCKET = "ocr-training"
+_OCR_EXT_BY_MIME = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def _resolve_driver_id_from_user(auth_user_id: str) -> Optional[str]:
+    """Map an auth.users.id to the corresponding drivers.id. Returns None
+    if the user has no driver row. Used by OCR endpoints that need to write
+    `ocr_corrections.driver_id` (FK to drivers, not auth users)."""
+    try:
+        res = (
+            supabase.table("drivers")
+            .select("id")
+            .eq("user_id", auth_user_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["id"]
+    except Exception as e:
+        logger.error(f"driver lookup failed for user {auth_user_id}: {e}")
+        sentry_sdk.capture_exception(e)
+    return None
+
+
+def _upload_ocr_image_sync(
+    driver_id: str, image_bytes: bytes, media_type: str, source: str
+) -> Optional[str]:
+    """Upload an OCR source image to the `ocr-training` bucket. Returns the
+    storage path on success, None on failure. Synchronous because the
+    supabase Storage SDK is blocking — call via asyncio.to_thread().
+
+    Path layout: {driver_id}/{source}/{uuid4}.{ext}
+      - driver_id at top so RLS policies can scope reads cheaply
+      - source tags the originating endpoint (msi / label_scan)
+      - uuid4 avoids collisions across concurrent requests
+    """
+    ext = _OCR_EXT_BY_MIME.get(media_type, "bin")
+    path = f"{driver_id}/{source}/{uuid_mod.uuid4().hex}.{ext}"
+    try:
+        supabase.storage.from_(_OCR_BUCKET).upload(
+            path,
+            image_bytes,
+            {"content-type": media_type, "upsert": "false"},
+        )
+        return path
+    except Exception as e:
+        logger.warning(f"OCR image upload failed (path={path}): {e}")
+        sentry_sdk.capture_exception(e)
+        return None
+
+
+def _create_ocr_correction_row(
+    *,
+    driver_id: str,
+    source: str,
+    image_storage_path: Optional[str],
+    model_name: str,
+    model_extracted_address: Optional[str],
+    model_extracted_parts: Optional[dict],
+    model_confidence: Optional[float],
+    carrier_hint: Optional[str],
+    country_iso: Optional[str],
+    model_latency_ms: Optional[int],
+    consent: bool,
+    app_version: Optional[str] = None,
+) -> Optional[str]:
+    """Insert a row in `ocr_corrections` describing the model's output for
+    a single extracted stop. Returns the row id, or None if the insert
+    failed. Best-effort: a failure here MUST NOT break the OCR response —
+    the user still gets their addresses, we just lose one training sample.
+    """
+    row = {
+        "driver_id": driver_id,
+        "source": source,
+        "image_storage_path": image_storage_path,
+        "model_name": model_name,
+        "prompt_version": "v1",
+        "model_extracted_address": model_extracted_address,
+        "model_extracted_parts": model_extracted_parts,
+        "model_confidence": model_confidence,
+        "model_latency_ms": model_latency_ms,
+        "carrier_hint": carrier_hint,
+        "country_iso": country_iso,
+        "user_action": "pending",
+        "user_consented_training": consent,
+        "consent_version": "v1" if consent else None,
+        "redaction_status": "pending" if image_storage_path else "not_required",
+        "app_version": app_version,
+    }
+    try:
+        res = supabase.table("ocr_corrections").insert(row).execute()
+        if res.data:
+            return res.data[0]["id"]
+    except Exception as e:
+        logger.warning(f"OCR correction row insert failed: {e}")
+        sentry_sdk.capture_exception(e)
+    return None
+
+
+class OCRCorrectionUpdate(BaseModel):
+    """Body for PATCH /ocr/corrections/{id}. The driver tells us what the
+    final, accepted answer was so we can compare it against what the model
+    produced and grow the training set."""
+    user_final_address: str = Field(..., max_length=500)
+    user_final_lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    user_final_lng: Optional[float] = Field(default=None, ge=-180, le=180)
+    user_action: Literal["accepted", "edited", "rejected"]
+    correction_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
+    corrected_fields: Optional[List[str]] = Field(default=None, max_length=20)
+
+
+@app.patch(
+    "/ocr/corrections/{correction_id}",
+    tags=["ocr"],
+    summary="Driver confirma/edita una extracción OCR (learning loop)",
+)
+async def update_ocr_correction(
+    correction_id: str,
+    body: OCRCorrectionUpdate,
+    user=Depends(get_current_user),
+):
+    """Driver-side endpoint to close the OCR learning loop. The app calls
+    this when the driver taps "Aceptar" or finishes editing an extracted
+    address. We compute `was_corrected` server-side by comparing the user
+    answer with the model output, regardless of what the client sent.
+
+    Auth: any logged-in driver. RLS already constrains drivers to their
+    own corrections, but we double-check here so a leaked id can't be
+    written by a different driver via service_role bypass.
+    """
+    check_rate_limit(f"ocr-corr-patch:{user['id']}", max_requests=120, window_seconds=60)
+
+    driver_id = _resolve_driver_id_from_user(user["id"])
+    if not driver_id:
+        raise HTTPException(status_code=403, detail="Driver profile not found")
+
+    try:
+        existing_res = (
+            supabase.table("ocr_corrections")
+            .select("id,driver_id,model_extracted_address,user_consented_training")
+            .eq("id", correction_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"OCR correction lookup failed: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Lookup failed")
+
+    if not existing_res.data:
+        raise HTTPException(status_code=404, detail="Correction not found")
+    existing = existing_res.data[0]
+    if existing["driver_id"] != driver_id:
+        # Ownership mismatch — never reveal whether the id exists.
+        raise HTTPException(status_code=404, detail="Correction not found")
+    if not existing.get("user_consented_training"):
+        # Row was created before consent flag flipped on, or row belongs to
+        # a non-consented batch. Refuse the update so we never silently
+        # retain a corrected pair without a recorded consent.
+        raise HTTPException(status_code=403, detail="Training consent not recorded for this correction")
+
+    model_addr = (existing.get("model_extracted_address") or "").strip()
+    user_addr = body.user_final_address.strip()
+    was_corrected = body.user_action == "edited" or (
+        body.user_action == "accepted" and model_addr.lower() != user_addr.lower()
+    )
+
+    update = {
+        "user_final_address": user_addr,
+        "user_final_lat": body.user_final_lat,
+        "user_final_lng": body.user_final_lng,
+        "user_action": body.user_action,
+        "user_action_at": datetime.now(timezone.utc).isoformat(),
+        "correction_seconds": body.correction_seconds,
+        "corrected_fields": body.corrected_fields or [],
+        "was_corrected": was_corrected,
+    }
+    try:
+        supabase.table("ocr_corrections").update(update).eq("id", correction_id).execute()
+    except Exception as e:
+        logger.error(f"OCR correction update failed: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Update failed")
+
+    return {
+        "success": True,
+        "correction_id": correction_id,
+        "was_corrected": was_corrected,
     }
 
 
@@ -7024,6 +7349,52 @@ def get_gemini_client():
         from google import genai
         gemini_client = genai.Client(api_key=GOOGLE_AI_API_KEY)
     return gemini_client
+
+
+# === GEMINI VERTEX AI FOR OCR/MSI (personal data → EU region + DPA) ===
+# Used by /ocr/label and /ocr/screenshots-batch (MSI). The text social path
+# stays on AI Studio (no personal data, only marketing prompts).
+#
+# Auth: Application Default Credentials. In Railway set
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON  → JSON blob of service account key
+# (loaded into a tempfile at startup) or
+#   GOOGLE_APPLICATION_CREDENTIALS       → path to mounted key file.
+# Service account needs role "Vertex AI User" on project
+# trim-odyssey-465314-r2.
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "trim-odyssey-465314-r2")
+GCP_VERTEX_LOCATION = os.getenv("GCP_VERTEX_LOCATION", "europe-west4")
+gemini_vertex_client = None
+
+def get_gemini_vertex_client():
+    """Return a google-genai Client wired to Vertex AI (region
+    europe-west4). All processing of label/screenshot images for OCR/MSI
+    must go through this client so that personal data stays inside the EU
+    and is covered by the Google Cloud DPA, not the AI Studio terms."""
+    global gemini_vertex_client
+    if gemini_vertex_client is None:
+        from google import genai
+        # If JSON creds shipped via env, write them to /tmp once so the SDK
+        # can pick them up via Application Default Credentials.
+        creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        if creds_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            creds_path = "/tmp/gcp_vertex_sa.json"
+            try:
+                with open(creds_path, "w") as f:
+                    f.write(creds_json)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+            except Exception as e:
+                logger.error(f"Failed to materialize GCP creds: {e}")
+        try:
+            gemini_vertex_client = genai.Client(
+                vertexai=True,
+                project=GCP_PROJECT_ID,
+                location=GCP_VERTEX_LOCATION,
+            )
+        except Exception as e:
+            logger.error(f"Vertex AI client init failed: {e}")
+            sentry_sdk.capture_exception(e)
+            return None
+    return gemini_vertex_client
 
 XPEDIT_CONTEXT = """Eres el community manager experto de Xpedit, la app española de optimización de rutas para repartidores.
 

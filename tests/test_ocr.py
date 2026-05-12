@@ -1,7 +1,8 @@
 """Tests for OCR label extraction endpoint (/ocr/label).
 
 Migrated from Anthropic Claude → Gemini 2.5 Flash on 2026-05-10 (#244).
-Tests now mock `get_gemini_client()` instead of `httpx.AsyncClient`.
+Moved to Vertex AI europe-west4 on 2026-05-12 (#317) so the recipient PII
+on labels stays inside the EU. Tests now mock `get_gemini_vertex_client()`.
 """
 
 import json
@@ -71,7 +72,7 @@ class TestOCRLabelValidation:
         Gemini client to be missing so we know it's a 503 (service not
         configured), proving validation passed."""
         for media_type in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-            with patch("main.get_gemini_client", return_value=None):
+            with patch("main.get_gemini_vertex_client", return_value=None):
                 resp = await client.post("/ocr/label", json={
                     "image_base64": "abc123",
                     "media_type": media_type,
@@ -84,7 +85,7 @@ class TestOCRLabelServiceNotConfigured:
 
     @pytest.mark.asyncio
     async def test_returns_503_when_no_client(self, client):
-        with patch("main.get_gemini_client", return_value=None):
+        with patch("main.get_gemini_vertex_client", return_value=None):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "abc123",
                 "media_type": "image/jpeg",
@@ -107,7 +108,7 @@ class TestOCRLabelSuccess:
         }
         gemini_client = _patched_client(generate_return=_gemini_response(ocr_payload))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "iVBORw0KGgoAAAANSUhEUg==",
                 "media_type": "image/png",
@@ -127,7 +128,7 @@ class TestOCRLabelSuccess:
             "name": "", "street": "", "city": "", "postalCode": "", "province": "",
         }))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",  # b64('test')
                 "media_type": "image/webp",
@@ -158,7 +159,7 @@ class TestOCRLabelSuccess:
             "name": "", "street": "", "city": "", "postalCode": "", "province": "",
         }))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
             })
@@ -176,7 +177,7 @@ class TestOCRLabelErrors:
     async def test_gemini_raises_returns_502(self, client):
         gemini_client = _patched_client(generate_side_effect=RuntimeError("rate limited"))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
@@ -191,7 +192,7 @@ class TestOCRLabelErrors:
         The UI shows 'couldn't read, try again' instead of a generic 502."""
         gemini_client = _patched_client(generate_return=_gemini_response(None))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
@@ -208,7 +209,7 @@ class TestOCRLabelErrors:
         fallback so the UI doesn't crash on a hard-to-read label."""
         gemini_client = _patched_client(generate_return=_gemini_response("not actually json at all"))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
@@ -226,7 +227,7 @@ class TestOCRLabelErrors:
         fenced = '```json\n{"name":"Ana","street":"Av Marina 8","city":"Cadiz","postalCode":"11001","province":"Cadiz"}\n```'
         gemini_client = _patched_client(generate_return=_gemini_response(fenced))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",
@@ -244,7 +245,7 @@ class TestOCRLabelErrors:
         text = 'Here is the data:\n{"name":"Luis","street":"C/ Sol 3","city":"Sevilla","postalCode":"41001","province":"Sevilla"}'
         gemini_client = _patched_client(generate_return=_gemini_response(text))
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             resp = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg",

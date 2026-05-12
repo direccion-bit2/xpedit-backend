@@ -921,9 +921,10 @@ class TestOCREndpoint:
 
     @pytest.mark.asyncio
     async def test_ocr_not_configured(self, client):
-        # Migrated to Gemini 2.5 Flash on 2026-05-10 (#244). Service is now
-        # gated by `get_gemini_client()` instead of ANTHROPIC_API_KEY.
-        with patch("main.get_gemini_client", return_value=None):
+        # Migrated to Gemini 2.5 Flash on 2026-05-10 (#244). Moved to Vertex
+        # AI europe-west4 on 2026-05-12 (#317), so the gate is now
+        # `get_gemini_vertex_client()`.
+        with patch("main.get_gemini_vertex_client", return_value=None):
             response = await client.post("/ocr/label", json={
                 "image_base64": "base64data",
                 "media_type": "image/jpeg"
@@ -940,7 +941,7 @@ class TestOCREndpoint:
         gemini_client = MagicMock()
         gemini_client.models.generate_content.return_value = gemini_response
 
-        with patch("main.get_gemini_client", return_value=gemini_client):
+        with patch("main.get_gemini_vertex_client", return_value=gemini_client):
             response = await client.post("/ocr/label", json={
                 "image_base64": "dGVzdA==",
                 "media_type": "image/jpeg"
