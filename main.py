@@ -1673,19 +1673,72 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 
 @app.patch("/routes/{route_id}/complete", tags=["routes"], summary="Completar ruta")
 async def complete_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como 'completed' y registra la hora de finalización."""
+    """Marca una ruta como 'completed', registra la hora de finalización
+    y aplica soft-delete a la ruta (cascade a stops vía
+    trg_soft_delete_route_stops). Tras esto, la ruta NUNCA debe volver a
+    aparecer al driver — está finalizada y archivada.
+
+    Diseñado como mutación server-side con service_role para evitar el
+    bug 42501 que ocurría cuando el JWT del cliente expiraba durante una
+    operación crítica (Sentry REACT-NATIVE-30, 50+ rutas zombi en prod).
+    """
     await verify_route_access(route_id, user)
     now_iso = datetime.now(timezone.utc).isoformat()
     result = await asyncio.to_thread(
         lambda: supabase.table("routes").update({
             "status": "completed",
             "completed_at": now_iso,
-        }).eq("id", route_id).execute()
+            "deleted_at": now_iso,
+        }).eq("id", route_id).is_("deleted_at", None).execute()
     )
     route = safe_first(result)
     if not route:
+        # Either the route doesn't exist or it was already finalized.
+        # Idempotent success: re-confirm and return current state so the
+        # client cleans up local cache without raising.
+        existing = supabase.table("routes").select("id, status, completed_at, deleted_at").eq("id", route_id).limit(1).execute()
+        if existing.data:
+            return {"success": True, "route": existing.data[0], "already_finalized": True}
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
     return {"success": True, "route": route}
+
+
+@app.patch("/routes/{route_id}/clear", tags=["routes"], summary="Limpiar ruta (archivar sin marcarla completada)")
+async def clear_route(route_id: str, user=Depends(get_current_user)):
+    """Archiva una ruta sin marcarla como completada. Usado cuando el
+    driver pulsa "limpiar ruta" para empezar de cero antes de terminar
+    el reparto, o cuando descarta una ruta importada por error.
+
+    Server-side soft-delete con service_role: evita 42501 cuando el JWT
+    del cliente está stale. La cascada a stops la hace el trigger
+    trg_soft_delete_route_stops automáticamente.
+
+    Idempotente: si la ruta ya está archivada, devuelve 200 con
+    `already_archived=true` para que la app limpie local-state sin error.
+    """
+    await verify_route_access(route_id, user)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").update({
+            "status": "cancelled",
+            "deleted_at": now_iso,
+        }).eq("id", route_id).is_("deleted_at", None).execute()
+    )
+    route = safe_first(result)
+    if not route:
+        existing = supabase.table("routes").select("id, status, deleted_at").eq("id", route_id).limit(1).execute()
+        if existing.data:
+            return {"success": True, "route": existing.data[0], "already_archived": True}
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+
+    # Count stops cascaded by the trigger so the client can show a
+    # confirmation toast ("ruta y 7 paradas archivadas").
+    stops_count = supabase.table("stops").select("id", count="exact").eq("route_id", route_id).not_.is_("deleted_at", None).execute()
+    return {
+        "success": True,
+        "route": route,
+        "stops_cleared": stops_count.count or 0,
+    }
 
 
 @app.delete("/routes/{route_id}", tags=["routes"], summary="Eliminar ruta")
