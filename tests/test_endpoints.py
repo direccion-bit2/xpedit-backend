@@ -765,6 +765,136 @@ class TestPlacesEndpoints:
         assert "via" not in intermediates[2], "real stop should not be marked via"
 
     @pytest.mark.asyncio
+    async def test_places_directions_returns_navigation_fields(self, client):
+        """Regresión 12 may 2026 (incidente white screen "Calculando ruta..."):
+        el primer mapper v2→legacy solo cubrió los campos para pintar la
+        polyline del mapa. El flujo de navegación turn-by-turn
+        (services/directions.ts::getNavigationRoute) accede a `html_instructions`,
+        `maneuver`, `start_location`, `step.distance.value`, `step.duration.value`
+        y `route.bounds.{northeast,southwest}`. Cuando esos campos llegaban
+        undefined → TypeError → null → la app se quedaba en "Calculando ruta…".
+        Este test garantiza que el mapper completo los emite."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "routes": [{
+                "duration": "180s",
+                "distanceMeters": 5400,
+                "polyline": {"encodedPolyline": "overview_enc"},
+                "viewport": {
+                    "low": {"latitude": 40.40, "longitude": -3.72},
+                    "high": {"latitude": 40.46, "longitude": -3.68},
+                },
+                "legs": [{
+                    "duration": "180s",
+                    "distanceMeters": 5400,
+                    "startLocation": {"latLng": {"latitude": 40.416, "longitude": -3.703}},
+                    "endLocation": {"latLng": {"latitude": 40.453, "longitude": -3.688}},
+                    "steps": [
+                        {
+                            "polyline": {"encodedPolyline": "step1_enc"},
+                            "startLocation": {"latLng": {"latitude": 40.416, "longitude": -3.703}},
+                            "endLocation": {"latLng": {"latitude": 40.420, "longitude": -3.700}},
+                            "distanceMeters": 320,
+                            "staticDuration": "45s",
+                            "navigationInstruction": {
+                                "instructions": "Gira a la derecha en Calle Mayor",
+                                "maneuver": "TURN_RIGHT",
+                            },
+                        },
+                        {
+                            "polyline": {"encodedPolyline": "step2_enc"},
+                            "startLocation": {"latLng": {"latitude": 40.420, "longitude": -3.700}},
+                            "endLocation": {"latLng": {"latitude": 40.453, "longitude": -3.688}},
+                            "distanceMeters": 5080,
+                            "staticDuration": "135s",
+                            "navigationInstruction": {
+                                "instructions": "Continúa recto",
+                                "maneuver": "STRAIGHT",
+                            },
+                        },
+                    ],
+                }],
+            }]
+        }
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/directions?origin=40.416,-3.703&destination=40.453,-3.688")
+
+        assert response.status_code == 200
+        body = response.json()
+        route = body["routes"][0]
+
+        # bounds (route.bounds.northeast/southwest) — el cliente lo usa para fitBounds.
+        assert route["bounds"]["northeast"]["lat"] == 40.46
+        assert route["bounds"]["northeast"]["lng"] == -3.68
+        assert route["bounds"]["southwest"]["lat"] == 40.40
+        assert route["bounds"]["southwest"]["lng"] == -3.72
+
+        leg = route["legs"][0]
+        assert leg["start_location"]["lat"] == 40.416  # leg.start_location
+
+        steps = leg["steps"]
+        assert len(steps) == 2
+
+        # Step 1 — Gira a la derecha
+        s1 = steps[0]
+        assert s1["html_instructions"] == "Gira a la derecha en Calle Mayor"
+        assert s1["maneuver"] == "TURN_RIGHT"
+        assert s1["start_location"] == {"lat": 40.416, "lng": -3.703}
+        assert s1["end_location"] == {"lat": 40.420, "lng": -3.700}
+        assert s1["distance"]["value"] == 320
+        assert s1["duration"]["value"] == 45
+
+        # Step 2 — Continúa recto
+        s2 = steps[1]
+        assert s2["html_instructions"] == "Continúa recto"
+        assert s2["maneuver"] == "STRAIGHT"
+        assert s2["distance"]["value"] == 5080
+        assert s2["duration"]["value"] == 135
+
+    @pytest.mark.asyncio
+    async def test_places_directions_fieldmask_requests_navigation_fields(self, client):
+        """Si el fieldMask no pide navigationInstruction/startLocation/etc,
+        aunque el mapper exista, Google no devuelve los campos y la navegación
+        se rompe. Este test fija el contrato del fieldMask."""
+        captured_headers: dict = {}
+
+        def capture_post(*args, **kwargs):
+            captured_headers.update(kwargs.get("headers", {}))
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"routes": []}
+            return mock_response
+
+        mock_http = AsyncMock()
+        mock_http.post.side_effect = capture_post
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/directions?origin=40.416,-3.703&destination=40.453,-3.688")
+
+        assert response.status_code == 200
+        field_mask = captured_headers.get("X-Goog-FieldMask", "")
+        # Campos críticos para navegación turn-by-turn:
+        for required in [
+            "routes.viewport",
+            "routes.legs.startLocation",
+            "routes.legs.steps.startLocation",
+            "routes.legs.steps.endLocation",
+            "routes.legs.steps.distanceMeters",
+            "routes.legs.steps.staticDuration",
+            "routes.legs.steps.navigationInstruction",
+        ]:
+            assert required in field_mask, f"fieldMask is missing {required!r}"
+
+    @pytest.mark.asyncio
     async def test_places_snap(self, client):
         mock_response = MagicMock()
         mock_response.json.return_value = {

@@ -5282,22 +5282,34 @@ def _routes_v2_waypoint(coord: str) -> dict:
     return {"address": coord}
 
 
+def _parse_routes_v2_duration(value) -> int:
+    """Routes v2 devuelve duración como `'123s'`. Convierte a int segundos."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).rstrip("s"))
+    except (ValueError, TypeError):
+        return 0
+
+
 def _routes_v2_to_directions_shape(routes_v2_data: dict) -> dict:
     """Mapea la respuesta de Routes API v2 al shape histórico de Directions API
-    para que el cliente RN (`useRoutes.fetchDirectionsChunk`) no necesite cambios.
+    para que el cliente RN funcione sin cambios, EN AMBOS flujos:
 
-    Routes API v2:
-        { routes: [{ legs: [{ duration: '123s', distanceMeters: N,
-                              endLocation: { latLng: {latitude, longitude} },
-                              steps: [{ polyline: { encodedPolyline } }] }],
-                     polyline: { encodedPolyline } }] }
+      A) Polyline del mapa: `useRoutes.fetchDirectionsChunk` — lee
+         `leg.duration.value`, `leg.end_location`, `step.polyline.points`.
+      B) Navegación turn-by-turn: `services/directions.ts::getNavigationRoute`
+         (invocado por `useNavigationFlow`) — lee adicionalmente
+         `step.html_instructions`, `step.maneuver`, `step.start_location`,
+         `step.distance.value`, `step.duration.value` y `route.bounds`.
 
-    Directions legacy (lo que espera el cliente):
-        { status: 'OK', routes: [{ legs: [{ duration: { value },
-                                            distance: { value },
-                                            end_location: { lat, lng },
-                                            steps: [{ polyline: { points } }] }],
-                                   overview_polyline: { points } }] }
+    El bug del 12 may 2026 (white screen "Calculando ruta..." en navegación)
+    fue causado por NO mapear los campos del flujo B: el mapper se diseñó
+    pensando solo en A. Esta versión completa los 6 campos faltantes
+    (instructions, maneuver, start_location, step.distance, step.duration,
+    bounds → viewport en v2).
     """
     if not routes_v2_data or "routes" not in routes_v2_data or not routes_v2_data["routes"]:
         return {"status": "ZERO_RESULTS", "routes": []}
@@ -5306,48 +5318,111 @@ def _routes_v2_to_directions_shape(routes_v2_data: dict) -> dict:
     for r in routes_v2_data["routes"]:
         out_legs = []
         for leg in r.get("legs", []):
-            dur_str = leg.get("duration", "0s")
-            try:
-                dur_value = int(dur_str.rstrip("s")) if isinstance(dur_str, str) else int(dur_str)
-            except (ValueError, TypeError):
-                dur_value = 0
-            dist_value = int(leg.get("distanceMeters", 0))
-            end_loc = leg.get("endLocation", {}).get("latLng", {})
+            dur_value = _parse_routes_v2_duration(leg.get("duration"))
+            dist_value = int(leg.get("distanceMeters", 0) or 0)
+            end_loc = (leg.get("endLocation", {}) or {}).get("latLng", {}) or {}
+            start_loc_leg = (leg.get("startLocation", {}) or {}).get("latLng", {}) or {}
             out_steps = []
             for step in leg.get("steps", []):
-                enc = step.get("polyline", {}).get("encodedPolyline")
-                if enc:
-                    out_steps.append({"polyline": {"points": enc}})
+                enc = (step.get("polyline", {}) or {}).get("encodedPolyline")
+                if not enc:
+                    # Sin polyline el cliente no puede pintar el segmento; saltar.
+                    continue
+                step_dur = _parse_routes_v2_duration(step.get("staticDuration"))
+                step_dist = int(step.get("distanceMeters", 0) or 0)
+                step_start = (step.get("startLocation", {}) or {}).get("latLng", {}) or {}
+                step_end = (step.get("endLocation", {}) or {}).get("latLng", {}) or {}
+                nav_instruction = step.get("navigationInstruction", {}) or {}
+                instructions_text = nav_instruction.get("instructions", "") or ""
+                maneuver = nav_instruction.get("maneuver", "") or ""
+                out_steps.append({
+                    "polyline": {"points": enc},
+                    # html_instructions: Routes v2 ya devuelve texto plano; el
+                    # cliente espera string que pasa por `cleanInstruction` (strip
+                    # de tags HTML). Plano funciona porque strip no-op sobre él.
+                    "html_instructions": instructions_text,
+                    # maneuver: enum v2 (`TURN_LEFT`, `MERGE_LEFT`...). Cliente
+                    # lo usa como string libre, no compara contra valores legacy.
+                    "maneuver": maneuver,
+                    "distance": {
+                        "value": step_dist,
+                        "text": f"{step_dist} m" if step_dist < 1000 else f"{step_dist / 1000:.1f} km",
+                    },
+                    "duration": {
+                        "value": step_dur,
+                        "text": f"{step_dur // 60} min" if step_dur >= 60 else f"{step_dur} s",
+                    },
+                    "start_location": {
+                        "lat": step_start.get("latitude", 0),
+                        "lng": step_start.get("longitude", 0),
+                    },
+                    "end_location": {
+                        "lat": step_end.get("latitude", 0),
+                        "lng": step_end.get("longitude", 0),
+                    },
+                })
             out_legs.append({
                 "duration": {"value": dur_value, "text": f"{dur_value // 60} min"},
                 "distance": {"value": dist_value, "text": f"{dist_value / 1000:.1f} km"},
+                "start_location": {
+                    "lat": start_loc_leg.get("latitude", 0),
+                    "lng": start_loc_leg.get("longitude", 0),
+                },
                 "end_location": {
                     "lat": end_loc.get("latitude", 0),
                     "lng": end_loc.get("longitude", 0),
                 },
                 "steps": out_steps,
             })
-        overview = r.get("polyline", {}).get("encodedPolyline", "")
+        overview = (r.get("polyline", {}) or {}).get("encodedPolyline", "")
+        # bounds: el cliente usa `route.bounds.northeast/southwest` para encajar
+        # la cámara. Routes v2 lo llama `viewport` con `low/high` (cada uno
+        # `{latitude, longitude}`). low=SW, high=NE.
+        viewport = r.get("viewport", {}) or {}
+        vp_low = viewport.get("low", {}) or {}
+        vp_high = viewport.get("high", {}) or {}
+        bounds = {
+            "northeast": {
+                "lat": vp_high.get("latitude", 0),
+                "lng": vp_high.get("longitude", 0),
+            },
+            "southwest": {
+                "lat": vp_low.get("latitude", 0),
+                "lng": vp_low.get("longitude", 0),
+            },
+        }
         out_routes.append({
             "legs": out_legs,
             "overview_polyline": {"points": overview},
+            "bounds": bounds,
         })
     return {"status": "OK", "routes": out_routes}
 
 
 # Routes API v2 — reemplazo de la antigua Directions API.
-# fieldMask minimalista: solo lo que el cliente RN consume realmente
-# (steps.polyline, leg.endLocation, leg.duration, leg.distanceMeters).
-# Pedir más campos los facturaría como tier `Advanced` (más caro).
+# fieldMask: TODO lo que el cliente RN consume (ambos flujos A y B descritos
+# en `_routes_v2_to_directions_shape`). Esto incluye instrucciones turn-by-turn
+# que faltaban en la versión 12 may (causa del white screen "Calculando ruta…").
+# Sigue dentro del tier Basic — los campos extra están en el Advanced tier
+# SOLO cuando se piden con `routes.travelAdvisory` o `legs.travelAdvisory`,
+# que aquí NO pedimos. `navigationInstruction`, `staticDuration` y `viewport`
+# son Basic.
 _ROUTES_V2_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 _ROUTES_V2_FIELD_MASK = (
     "routes.duration,"
     "routes.distanceMeters,"
     "routes.polyline.encodedPolyline,"
+    "routes.viewport,"
     "routes.legs.duration,"
     "routes.legs.distanceMeters,"
+    "routes.legs.startLocation,"
     "routes.legs.endLocation,"
-    "routes.legs.steps.polyline.encodedPolyline"
+    "routes.legs.steps.polyline.encodedPolyline,"
+    "routes.legs.steps.startLocation,"
+    "routes.legs.steps.endLocation,"
+    "routes.legs.steps.distanceMeters,"
+    "routes.legs.steps.staticDuration,"
+    "routes.legs.steps.navigationInstruction"
 )
 
 
