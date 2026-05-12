@@ -5286,23 +5286,40 @@ async def _msi_normalize_and_geocode(
     out = []
     for s in stops:
         geo = s.pop("_geo", {}) or {}
-        flat_address_parts = [
-            s.get("street") or "",
-            (s.get("number") or "").strip(),
-        ]
-        flat_address = " ".join(p for p in flat_address_parts if p).strip()
-        if s.get("postal_code"):
-            flat_address = f"{flat_address}, {s['postal_code']}".strip(", ")
-        if s.get("city"):
-            flat_address = f"{flat_address} {s['city']}".strip()
+
+        # A stop is "insufficient" if it doesn't carry a deliverable
+        # street. City alone ("San José del Valle") is NOT enough — the
+        # driver can't deliver to a town, only to an address. Treat those
+        # the same as fully empty extractions so the review sheet forces
+        # the driver to fill them in. Their corrections are the highest-
+        # value training signal: the model was confidently wrong.
+        is_empty = not (s.get("street") or "").strip()
+
+        if is_empty:
+            flat_address = ""
+        else:
+            flat_address_parts = [
+                s.get("street") or "",
+                (s.get("number") or "").strip(),
+            ]
+            flat_address = " ".join(p for p in flat_address_parts if p).strip()
+            if s.get("postal_code"):
+                flat_address = f"{flat_address}, {s['postal_code']}".strip(", ")
+            if s.get("city"):
+                flat_address = f"{flat_address} {s['city']}".strip()
 
         s["coords"] = (
             {"lat": geo["lat"], "lng": geo["lng"]} if geo.get("status") == "ok" else None
         )
-        s["formatted_address"] = geo.get("formatted_address") or flat_address
+        s["formatted_address"] = "" if is_empty else (geo.get("formatted_address") or flat_address)
         s["place_id"] = geo.get("place_id", "")
         s["delivery_instructions"] = (s.get("floor_etc") or "").strip()
-        s["geocoding_status"] = geo.get("status", "error")
+        s["geocoding_status"] = "empty_extraction" if is_empty else geo.get("status", "error")
+        s["is_empty_extraction"] = is_empty
+        if is_empty:
+            # Force confidence to low so the UI surfaces the row in red
+            # and keeps the driver from blindly clicking through.
+            s["confidence"] = "low"
         s.setdefault("candidates", [])
         out.append(s)
 
@@ -5359,6 +5376,35 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
     extraction_ms = int((time.perf_counter() - t_start) * 1000)
     raw_stops = gemini_result.get("stops") or []
 
+    # Guarantee one row per source image. If Gemini didn't return any stop
+    # for image `i`, inject an empty placeholder so the driver can still see
+    # that image in the review sheet and type the address by hand. Those
+    # corrections are the highest-value training signal — the model
+    # otherwise never sees its own worst cases.
+    seen_image_idxs: set[int] = set()
+    for s in raw_stops:
+        if not isinstance(s, dict):
+            continue
+        idx = s.get("source_image_idx")
+        if isinstance(idx, int):
+            seen_image_idxs.add(idx)
+    for idx in range(len(req.images)):
+        if idx in seen_image_idxs:
+            continue
+        raw_stops.append({
+            "source_image_idx": idx,
+            "street": "",
+            "number": "",
+            "floor_etc": "",
+            "postal_code": "",
+            "city": "",
+            "province": "",
+            "name": "",
+            "raw_text": "",
+            "confidence_per_field": {},
+            "context_inferred_fields": [],
+        })
+
     # Day 2 pipeline: normalize + geocode + confidence + candidates
     t_pipe = time.perf_counter()
     enriched_stops = await _msi_normalize_and_geocode(raw_stops, req.route_context)
@@ -5369,34 +5415,48 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
     for s in enriched_stops:
         by_conf[s.get("confidence", "low")] = by_conf.get(s.get("confidence", "low"), 0) + 1
 
-    # OCR learning loop (Day 2). If the driver opted in, upload every
-    # screenshot once to ocr-training and create one ocr_corrections row
-    # per extracted stop. The first image path is reused as the cover for
-    # all rows in this batch (V1 simplification — refining the
-    # image↔stop alignment lives in Day 3).
+    # OCR learning loop (Day 2). If the driver opted in, upload EVERY
+    # screenshot once and create one ocr_corrections row per stop in the
+    # response (including empty-extraction placeholders). Each row points
+    # to the storage path of its source image via `source_image_idx`, so
+    # when the driver later fills in a missing address that signal lands
+    # next to the exact image the model failed on.
     correction_ids: List[Optional[str]] = [None] * len(enriched_stops)
     if req.consent_to_training and enriched_stops:
         driver_id = _resolve_driver_id_from_user(auth_user_id)
         if driver_id:
-            primary_storage_path: Optional[str] = None
-            try:
-                first_bytes = base64.b64decode(req.images[0].image_base64)
-                primary_storage_path = await asyncio.to_thread(
-                    _upload_ocr_image_sync,
-                    driver_id, first_bytes, req.images[0].media_type, "msi",
+            # Upload every image once, in parallel. Path indexed by image idx.
+            async def _upload_idx(idx: int, img: MSIScreenshotImage) -> tuple[int, Optional[str]]:
+                try:
+                    raw = base64.b64decode(img.image_base64)
+                except Exception as e:
+                    logger.warning(f"msi image[{idx}] decode failed: {e}")
+                    sentry_sdk.capture_exception(e)
+                    return idx, None
+                path = await asyncio.to_thread(
+                    _upload_ocr_image_sync, driver_id, raw, img.media_type, "msi",
                 )
-            except Exception as e:
-                logger.warning(f"msi cover image upload failed: {e}")
-                sentry_sdk.capture_exception(e)
+                return idx, path
+
+            upload_results = await asyncio.gather(
+                *[_upload_idx(i, img) for i, img in enumerate(req.images)],
+                return_exceptions=True,
+            )
+            paths_by_idx: dict[int, Optional[str]] = {}
+            for r in upload_results:
+                if isinstance(r, tuple):
+                    paths_by_idx[r[0]] = r[1]
 
             carrier_detected = gemini_result.get("carrier_detected")
             country = (req.route_context.country if req.route_context else None) or "ES"
             for i, stop in enumerate(enriched_stops):
+                src_idx = stop.get("source_image_idx")
+                storage_path = paths_by_idx.get(src_idx) if isinstance(src_idx, int) else None
                 cid = await asyncio.to_thread(
                     _create_ocr_correction_row,
                     driver_id=driver_id,
                     source="msi",
-                    image_storage_path=primary_storage_path,
+                    image_storage_path=storage_path,
                     model_name=_MSI_MODEL,
                     model_extracted_address=stop.get("address") or stop.get("street"),
                     model_extracted_parts={k: stop.get(k) for k in (

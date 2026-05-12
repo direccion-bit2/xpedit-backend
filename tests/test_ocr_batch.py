@@ -247,7 +247,16 @@ class TestMSIExtraction:
         body = resp.json()
         assert body["carrier_detected"] == "ctt"
         assert body["language"] == "es"
-        assert body["stops_count"] == 1
+        # 1 real stop + 1 empty-extraction placeholder for image idx 1
+        # which Gemini didn't return any stop for. Driver must see one
+        # row per source image so they can fill in misses by hand.
+        assert body["stops_count"] == 2
+        empty_stops = [s for s in body["stops"] if s.get("is_empty_extraction")]
+        assert len(empty_stops) == 1
+        assert empty_stops[0]["source_image_idx"] == 1
+        assert empty_stops[0]["confidence"] == "low"
+        assert empty_stops[0]["formatted_address"] == ""
+        assert empty_stops[0]["geocoding_status"] == "empty_extraction"
         assert body["model"] == "gemini-2.5-pro"
         assert body["processing_ms"] >= 0
 
