@@ -50,12 +50,23 @@ if SENTRY_DSN:
     from sentry_sdk.integrations.logging import LoggingIntegration
     from sentry_sdk.integrations.starlette import StarletteIntegration
 
+    # Release SHA dinámico — Railway expone RAILWAY_GIT_COMMIT_SHA por deploy.
+    # 12 may 2026 audit: el release estaba hardcoded a 1.1.4 desde hace 30 días,
+    # eso rompe regression detection (Sentry no podía decir "qué commit introdujo
+    # el bug"). SENTRY_RELEASE permite override manual desde Railway si hace falta.
+    _release_sha = (
+        os.getenv("SENTRY_RELEASE")
+        or os.getenv("RAILWAY_GIT_COMMIT_SHA")
+        or "unknown"
+    )
+    _release = f"xpedit-backend@{_release_sha[:12]}" if _release_sha != "unknown" else "xpedit-backend@unknown"
+
     sentry_sdk.init(
         dsn=SENTRY_DSN,
         traces_sample_rate=1.0,  # 100% temporarily until we trust ingestion; drop to 0.1 once stable
         profiles_sample_rate=0.1,
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
-        release="xpedit-backend@1.1.4",
+        release=_release,
         send_default_pii=False,
         debug=SENTRY_DEBUG,
         attach_stacktrace=True,
@@ -63,7 +74,12 @@ if SENTRY_DSN:
             FastApiIntegration(transaction_style="endpoint"),
             StarletteIntegration(transaction_style="endpoint"),
             AsyncioIntegration(),
-            LoggingIntegration(level=logging.INFO, event_level=logging.ERROR),
+            # 12 may 2026 audit: event_level subido de ERROR a WARNING.
+            # Miguel pidió "RUIDO a tope en Sentry, ya silenciaremos lo que sobre".
+            # Esto captura los logger.warning de "Stripe webhook signature fail",
+            # "Google Places fallback", "RevenueCat missing app_user_id", etc, que
+            # antes se quedaban solo en Railway logs y nadie miraba.
+            LoggingIntegration(level=logging.INFO, event_level=logging.WARNING),
         ],
     )
     logger.info(f"Sentry initialized (DSN configured, debug={SENTRY_DEBUG})")
