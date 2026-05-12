@@ -727,9 +727,17 @@ _OCR_QUOTA_WINDOW = 86400  # 24h rolling window.
 # MSI. Miguel staging + Miguel prod direccion@taespack. These are NOT
 # customer accounts, they're the ones we use to smoke-test every OTA.
 # Update this list when adding/removing dev devices, never expose it.
+# IMPORTANT: include BOTH `drivers.id` AND `auth.users.id` for each account.
+# When _resolve_user_tier fails for any reason, the code falls back to
+# auth_user_id as the quota_key — so if only one of the two is in the set,
+# bypass silently stops working in that failure path.
 _OCR_QUOTA_TESTING_BYPASS = frozenset({
-    "9922cc2e-d88d-4e58-a5f5-8b3d7ca52e40",  # staging@xpedit.es (Miguel DEV)
-    "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # direccion@taespack.com (Miguel prod)
+    # staging@xpedit.es (Miguel DEV staging)
+    "9922cc2e-d88d-4e58-a5f5-8b3d7ca52e40",  # drivers.id
+    "8f852b60-25a2-4180-a66f-8947a9325945",  # auth.users.id
+    # direccion@taespack.com (Miguel prod)
+    "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # drivers.id
+    "fe94de32-7f04-4f4f-83fc-b4264eedeaaa",  # auth.users.id
 })
 
 def get_ocr_quota_status(driver_id: str, tier: str) -> dict:
