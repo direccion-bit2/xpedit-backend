@@ -690,6 +690,83 @@ def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60)
         raise HTTPException(status_code=429, detail="Demasiadas solicitudes. Inténtalo en unos minutos.")
     _rate_limits[key].append(now)
 
+
+# Daily OCR image quota per user/tier.
+# IMPORTANT: this counts IMAGES, not requests. Day 12 may 2026 the MSI client
+# was changed to chunk a 10-image import into 4 serial /ocr/screenshots-batch
+# requests (3+3+3+1) to avoid gateway timeouts. A per-request limit would
+# have shrunk the effective daily quota 4× without anyone noticing.
+# Same bucket is shared by /ocr/label (label scan, 1 img/req) and
+# /ocr/screenshots-batch (MSI, 1-3 img/req post-chunking) so an abuser can't
+# bypass the limit by mixing endpoints. Limit is per driver_id (not IP) so
+# device changes don't reset the quota either.
+_OCR_DAILY_IMG_QUOTA = {
+    "free": 5,         # Lets a free user try /ocr/label a couple of times.
+    "trial": 50,       # Generous for the 7-day trial — encourages using MSI.
+    "pro": 100,        # Pro paid monthly (not the killer flow but still allowed).
+    "pro_yearly": 300,
+    "pro_plus": 300,
+}
+_OCR_QUOTA_WINDOW = 86400  # 24h rolling window.
+
+def check_ocr_image_quota(driver_id: str, tier: str, n_images: int):
+    """Enforce a per-driver, per-day OCR image quota. Counts IMAGES, not requests.
+    Raises 429 if accepting the new images would push the user over their tier's
+    daily limit. Adds one timestamp per image so the rolling window math stays
+    cheap (linear in current usage)."""
+    if n_images <= 0:
+        return
+    now = time.time()
+    key = f"ocr_imgs:{driver_id}:daily"
+    max_imgs = _OCR_DAILY_IMG_QUOTA.get(tier, _OCR_DAILY_IMG_QUOTA["free"])
+    _rate_limits[key] = [t for t in _rate_limits[key] if t > now - _OCR_QUOTA_WINDOW]
+    if len(_rate_limits[key]) + n_images > max_imgs:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "daily_image_quota_exceeded",
+                "message": f"Límite diario alcanzado ({max_imgs} imágenes/día). Vuelve a probar mañana.",
+                "tier": tier,
+                "used": len(_rate_limits[key]),
+                "limit": max_imgs,
+            },
+        )
+    for _ in range(n_images):
+        _rate_limits[key].append(now)
+
+
+def _resolve_user_tier(auth_user_id: str) -> tuple[str, Optional[str]]:
+    """Returns (tier, driver_id). Tier ∈ {'free','trial','pro','pro_yearly','pro_plus'}.
+    Used for OCR quota enforcement on endpoints that don't require Pro+ gating
+    (like /ocr/label, which free users can still hit a few times per day)."""
+    try:
+        d = supabase.table("drivers").select(
+            "id, promo_plan, promo_plan_expires_at, subscription_source, subscription_period"
+        ).eq("user_id", auth_user_id).single().execute()
+        row = d.data or {}
+    except Exception:
+        return "free", None
+    driver_id = row.get("id")
+    promo = row.get("promo_plan")
+    expires_raw = row.get("promo_plan_expires_at")
+    sub_src = row.get("subscription_source")
+    sub_period = row.get("subscription_period")
+    if promo == "pro_plus" and sub_src in ("stripe", "revenuecat"):
+        return "pro_plus", driver_id
+    if sub_period == "yearly":
+        return "pro_yearly", driver_id
+    if promo == "pro" and sub_src in ("stripe", "revenuecat"):
+        return "pro", driver_id
+    # Trial: promo='pro'|'pro_plus' AND no paid subscription AND expires_at in future
+    if promo in ("pro", "pro_plus") and sub_src is None and expires_raw:
+        try:
+            expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+            if expires_at > datetime.now(timezone.utc):
+                return "trial", driver_id
+        except (ValueError, AttributeError):
+            pass
+    return "free", driver_id
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     """Apply rate limiting to sensitive endpoints"""
@@ -4685,6 +4762,13 @@ async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
     if not get_gemini_vertex_client():
         raise HTTPException(status_code=503, detail="OCR service not configured")
 
+    # Per-user daily image quota, shared with /ocr/screenshots-batch. Free
+    # tier gets a handful of scans/day; trial and Pro+ get a much higher
+    # cap. Counts 1 image per call (this endpoint is single-image only).
+    tier, driver_id = _resolve_user_tier(user["id"])
+    quota_key = driver_id or user["id"]
+    check_ocr_image_quota(quota_key, tier, 1)
+
     import time
     t0 = time.perf_counter()
     try:
@@ -5446,9 +5530,13 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
     eligibility = _verify_msi_access(auth_user_id)  # raises 403 if not eligible
     tier = eligibility["tier"]
 
-    # Per-tier daily rate limit (window=24h). Reuses helper from main.py:707.
-    daily_quota = 5 if tier == "trial" else 50
-    check_rate_limit(f"msi:{auth_user_id}:daily", max_requests=daily_quota, window_seconds=86400)
+    # Daily IMAGE quota — counts photos, not requests, so the client-side
+    # chunking from 10 imgs into 4 requests doesn't accidentally shrink the
+    # effective limit. Bucket is shared with /ocr/label so a user can't
+    # bypass MSI quota by spamming single-image label scans.
+    _, driver_id = _resolve_user_tier(auth_user_id)
+    quota_key = driver_id or auth_user_id
+    check_ocr_image_quota(quota_key, tier, len(req.images))
 
     t_start = time.perf_counter()
     try:
