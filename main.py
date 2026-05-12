@@ -1673,72 +1673,19 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 
 @app.patch("/routes/{route_id}/complete", tags=["routes"], summary="Completar ruta")
 async def complete_route(route_id: str, user=Depends(get_current_user)):
-    """Marca una ruta como 'completed' y registra la hora de finalización.
-
-    NO escribe deleted_at: una ruta finalizada debe aparecer en el
-    historial del driver. El que la ruta no reaparezca como "activa" en
-    cold start lo garantiza la app: loadSavedState valida la cache local
-    exigiendo status IN ('pending','in_progress'), y loadActiveRouteFromCloud
-    aplica el mismo filtro.
-
-    Idempotente: si ya estaba completed, re-confirma estado y devuelve
-    already_finalized=true. Diseñado server-side con service_role para
-    evitar 42501 con JWT stale (Sentry REACT-NATIVE-30).
-    """
+    """Marca una ruta como 'completed' y registra la hora de finalización."""
     await verify_route_access(route_id, user)
     now_iso = datetime.now(timezone.utc).isoformat()
     result = await asyncio.to_thread(
         lambda: supabase.table("routes").update({
             "status": "completed",
             "completed_at": now_iso,
-        }).eq("id", route_id).neq("status", "completed").execute()
+        }).eq("id", route_id).execute()
     )
     route = safe_first(result)
     if not route:
-        # Already completed (or doesn't exist). Idempotent path.
-        existing = supabase.table("routes").select("id, status, completed_at, deleted_at").eq("id", route_id).limit(1).execute()
-        if existing.data:
-            return {"success": True, "route": existing.data[0], "already_finalized": True}
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
     return {"success": True, "route": route}
-
-
-@app.patch("/routes/{route_id}/clear", tags=["routes"], summary="Limpiar ruta (archivar sin marcarla completada)")
-async def clear_route(route_id: str, user=Depends(get_current_user)):
-    """Archiva una ruta sin marcarla como completada. Usado cuando el
-    driver pulsa "limpiar ruta" para empezar de cero antes de terminar
-    el reparto, o cuando descarta una ruta importada por error.
-
-    Server-side soft-delete con service_role: evita 42501 cuando el JWT
-    del cliente está stale. La cascada a stops la hace el trigger
-    trg_soft_delete_route_stops automáticamente.
-
-    Idempotente: si la ruta ya está archivada, devuelve 200 con
-    `already_archived=true` para que la app limpie local-state sin error.
-    """
-    await verify_route_access(route_id, user)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    result = await asyncio.to_thread(
-        lambda: supabase.table("routes").update({
-            "status": "cancelled",
-            "deleted_at": now_iso,
-        }).eq("id", route_id).is_("deleted_at", None).execute()
-    )
-    route = safe_first(result)
-    if not route:
-        existing = supabase.table("routes").select("id, status, deleted_at").eq("id", route_id).limit(1).execute()
-        if existing.data:
-            return {"success": True, "route": existing.data[0], "already_archived": True}
-        raise HTTPException(status_code=404, detail="Ruta no encontrada")
-
-    # Count stops cascaded by the trigger so the client can show a
-    # confirmation toast ("ruta y 7 paradas archivadas").
-    stops_count = supabase.table("stops").select("id", count="exact").eq("route_id", route_id).not_.is_("deleted_at", None).execute()
-    return {
-        "success": True,
-        "route": route,
-        "stops_cleared": stops_count.count or 0,
-    }
 
 
 @app.delete("/routes/{route_id}", tags=["routes"], summary="Eliminar ruta")
@@ -5315,95 +5262,6 @@ async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
     return {"status": "FALLBACK", "lat": lat, "lng": lng, "formatted_address": ""}
 
 
-def _parse_latlng_pair(coord: str) -> Optional[dict]:
-    """Convierte 'lat,lng' a dict {latitude, longitude} para Routes API v2.
-    Devuelve None si el string no es un par válido (place_id, dirección, etc.)."""
-    if "," not in coord:
-        return None
-    try:
-        lat_str, lng_str = coord.split(",", 1)
-        return {"latitude": float(lat_str.strip()), "longitude": float(lng_str.strip())}
-    except (ValueError, TypeError):
-        return None
-
-
-def _routes_v2_waypoint(coord: str) -> dict:
-    """Construye un waypoint Routes API v2 a partir de coords o dirección."""
-    parsed = _parse_latlng_pair(coord)
-    if parsed:
-        return {"location": {"latLng": parsed}}
-    return {"address": coord}
-
-
-def _routes_v2_to_directions_shape(routes_v2_data: dict) -> dict:
-    """Mapea la respuesta de Routes API v2 al shape histórico de Directions API
-    para que el cliente RN (`useRoutes.fetchDirectionsChunk`) no necesite cambios.
-
-    Routes API v2:
-        { routes: [{ legs: [{ duration: '123s', distanceMeters: N,
-                              endLocation: { latLng: {latitude, longitude} },
-                              steps: [{ polyline: { encodedPolyline } }] }],
-                     polyline: { encodedPolyline } }] }
-
-    Directions legacy (lo que espera el cliente):
-        { status: 'OK', routes: [{ legs: [{ duration: { value },
-                                            distance: { value },
-                                            end_location: { lat, lng },
-                                            steps: [{ polyline: { points } }] }],
-                                   overview_polyline: { points } }] }
-    """
-    if not routes_v2_data or "routes" not in routes_v2_data or not routes_v2_data["routes"]:
-        return {"status": "ZERO_RESULTS", "routes": []}
-
-    out_routes = []
-    for r in routes_v2_data["routes"]:
-        out_legs = []
-        for leg in r.get("legs", []):
-            dur_str = leg.get("duration", "0s")
-            try:
-                dur_value = int(dur_str.rstrip("s")) if isinstance(dur_str, str) else int(dur_str)
-            except (ValueError, TypeError):
-                dur_value = 0
-            dist_value = int(leg.get("distanceMeters", 0))
-            end_loc = leg.get("endLocation", {}).get("latLng", {})
-            out_steps = []
-            for step in leg.get("steps", []):
-                enc = step.get("polyline", {}).get("encodedPolyline")
-                if enc:
-                    out_steps.append({"polyline": {"points": enc}})
-            out_legs.append({
-                "duration": {"value": dur_value, "text": f"{dur_value // 60} min"},
-                "distance": {"value": dist_value, "text": f"{dist_value / 1000:.1f} km"},
-                "end_location": {
-                    "lat": end_loc.get("latitude", 0),
-                    "lng": end_loc.get("longitude", 0),
-                },
-                "steps": out_steps,
-            })
-        overview = r.get("polyline", {}).get("encodedPolyline", "")
-        out_routes.append({
-            "legs": out_legs,
-            "overview_polyline": {"points": overview},
-        })
-    return {"status": "OK", "routes": out_routes}
-
-
-# Routes API v2 — reemplazo de la antigua Directions API.
-# fieldMask minimalista: solo lo que el cliente RN consume realmente
-# (steps.polyline, leg.endLocation, leg.duration, leg.distanceMeters).
-# Pedir más campos los facturaría como tier `Advanced` (más caro).
-_ROUTES_V2_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
-_ROUTES_V2_FIELD_MASK = (
-    "routes.duration,"
-    "routes.distanceMeters,"
-    "routes.polyline.encodedPolyline,"
-    "routes.legs.duration,"
-    "routes.legs.distanceMeters,"
-    "routes.legs.endLocation,"
-    "routes.legs.steps.polyline.encodedPolyline"
-)
-
-
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
@@ -5413,107 +5271,55 @@ async def places_directions(
     heading: Optional[float] = None,
     user=Depends(get_current_user)
 ):
-    """Calcula la ruta entre origin/destination con waypoints opcionales.
+    """Proxy de Google Directions API. Devuelve polylines y pasos de navegación.
 
-    11 may 2026: migrado de Directions API legacy a Routes API v2 para reducir
-    el coste por llamada ~40 % (fieldMask + tier Basic). El shape de respuesta
-    se mantiene compatible con el cliente RN (`useRoutes.fetchDirectionsChunk`)
-    via `_routes_v2_to_directions_shape`.
-
-    Si `heading` (0-360) viene, inserta un waypoint ~50 m delante del coche
+    Si `heading` (0-360) viene, inserta un micro-waypoint ~50 m delante del coche
     en esa dirección. Así el rerouting no propone giros bruscos hacia atrás.
     """
-    intermediates: list[dict] = []
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "key": GOOGLE_API_KEY,
+        "language": "es",
+    }
+    extra_wp = ""
     if heading is not None and "," in origin:
         try:
             lat_str, lng_str = origin.split(",", 1)
             lat, lng = float(lat_str), float(lng_str)
             h = math.radians(heading % 360)
+            # ~50 m ahead in the driver's facing direction (good enough for routing)
             dlat = (50 * math.cos(h)) / 111320.0
             dlng = (50 * math.sin(h)) / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
-            intermediates.append({
-                "location": {"latLng": {"latitude": lat + dlat, "longitude": lng + dlng}},
-                "via": True,
-            })
+            extra_wp = f"via:{lat + dlat:.6f},{lng + dlng:.6f}"
         except Exception as e:
             logger.warning(f"heading waypoint skipped: {e}")
-    if waypoints:
-        # El cliente RN pasa waypoints SIN prefijo `via:` cuando son paradas
-        # reales (1 leg por parada para extraer duration/end_location/steps).
-        # Solo el legacy `via:` prefix indica waypoint guía. Routes API v2 usa
-        # `via: True` para "guía no-stop" y omite la propiedad cuando es stop
-        # real. Marcar `via: True` por defecto fusiona todos los waypoints en
-        # 1 leg y rompe el cliente (durations/snapped vacíos). Bug detectado
-        # en smoke staging 11 may 19:48.
-        for wp in waypoints.split("|"):
-            is_via = wp.startswith("via:")
-            if is_via:
-                wp = wp[4:]
-            if wp:
-                w = _routes_v2_waypoint(wp)
-                if is_via:
-                    w["via"] = True
-                intermediates.append(w)
-
-    body: dict = {
-        "origin": _routes_v2_waypoint(origin),
-        "destination": _routes_v2_waypoint(destination),
-        "travelMode": "DRIVE",
-        "routingPreference": "TRAFFIC_AWARE",
-        "languageCode": "es",
-        "polylineEncoding": "ENCODED_POLYLINE",
-        "computeAlternativeRoutes": False,
-    }
-    if intermediates:
-        body["intermediates"] = intermediates
+    combined_waypoints = "|".join(p for p in [extra_wp, waypoints] if p)
+    if combined_waypoints:
+        params["waypoints"] = combined_waypoints
     if avoid:
-        avoid_set = {a.strip() for a in avoid.split("|")}
-        modifiers = {}
-        if "tolls" in avoid_set:
-            modifiers["avoidTolls"] = True
-        if "highways" in avoid_set:
-            modifiers["avoidHighways"] = True
-        if "ferries" in avoid_set:
-            modifiers["avoidFerries"] = True
-        if modifiers:
-            body["routeModifiers"] = modifiers
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,
-        "X-Goog-FieldMask": _ROUTES_V2_FIELD_MASK,
-    }
-    # Mismo patrón de timeout/retry que la versión legacy: 5 may incident
-    # mostró que bajo pico de OTA reload Google puede tardar >12 s.
+        params["avoid"] = avoid
+    # Timeouts raised from 10s to 20s/25s with one retry on transient errors —
+    # 5 may incident: under FORCE-OTA reload pico, Google sometimes took 12s+
+    # responding to /directions. The 10s timeout was tripping HTTP 500s and
+    # leaving drivers staring at a blank map. Retry pattern matches /places/autocomplete.
     last_error = "no attempt"
     client = google_maps_client()
     for attempt in range(2):
         try:
             timeout = 20.0 if attempt == 0 else 25.0
-            resp = await client.post(
-                _ROUTES_V2_URL,
-                json=body,
-                headers=headers,
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/directions/json",
+                params=params,
                 timeout=timeout,
             )
-            if resp.status_code >= 400:
-                logger.warning(f"routes_v2 HTTP {resp.status_code}: {resp.text[:300]}")
-                if resp.status_code < 500:
-                    # 4xx: error de request del cliente, no reintentar.
-                    return {"status": "REQUEST_DENIED", "routes": [], "error_message": resp.text[:500]}
-                last_error = f"HTTP {resp.status_code}"
-                if attempt == 0:
-                    continue
-                raise HTTPException(status_code=502, detail=f"Routes API 5xx after retry: {last_error}")
-            return _routes_v2_to_directions_shape(resp.json())
-        except HTTPException:
-            raise
+            return resp.json()
         except Exception as e:
             last_error = str(e)
-            logger.warning(f"routes_v2 request error (attempt {attempt + 1}): {e}")
+            logger.warning(f"directions request error (attempt {attempt + 1}): {e}")
             if attempt == 0:
                 continue
-    raise HTTPException(status_code=504, detail=f"Google Routes API timeout after retry: {last_error}")
+    raise HTTPException(status_code=504, detail=f"Google Directions timeout after retry: {last_error}")
 
 
   # Street View proxy removed - app opens Google Maps directly (free, no API cost)
