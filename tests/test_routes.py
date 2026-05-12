@@ -418,10 +418,10 @@ class TestRouteActions:
 
     @pytest.mark.asyncio
     async def test_complete_route(self, client):
-        """Completing a route should succeed with proper access.
-        Post-fix (12 may): complete_route now also soft-deletes the row
-        (deleted_at = NOW()) so the route never reappears to the driver.
-        Cascade to stops is handled by trg_soft_delete_route_stops in DB."""
+        """Completing a route flips status to 'completed' + stamps completed_at.
+        The route stays visible in the history (NO deleted_at): UI / cold-start
+        filters keep it off the home screen by status, not by soft-delete
+        (Miguel, 12 may 2026: finalizada = en historial, no en pantalla)."""
         with patch("main.supabase") as mock_sb:
             route_access = MagicMock()
             route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
@@ -434,7 +434,7 @@ class TestRouteActions:
                 "id": "route-1",
                 "status": "completed",
                 "completed_at": "2026-05-12T11:00:00+00:00",
-                "deleted_at": "2026-05-12T11:00:00+00:00",
+                "deleted_at": None,
             }]
 
             call_count = {"routes": 0}
@@ -447,8 +447,8 @@ class TestRouteActions:
                         # verify_route_access → SELECT id, driver_id
                         chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
                     else:
-                        # UPDATE chain now includes `.is_("deleted_at", None)`
-                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = update_result
+                        # UPDATE chain: .neq('status','completed') for idempotency
+                        chain.update.return_value.eq.return_value.neq.return_value.execute.return_value = update_result
                 elif name == "drivers":
                     chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
                 return chain
@@ -460,13 +460,13 @@ class TestRouteActions:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        # The route ships back with both completed_at and deleted_at set.
         assert data["route"]["completed_at"] is not None
-        assert data["route"]["deleted_at"] is not None
+        # Finalised routes belong in history → no deleted_at.
+        assert data["route"]["deleted_at"] is None
 
     @pytest.mark.asyncio
     async def test_complete_route_already_finalized_is_idempotent(self, client):
-        """If the route was already archived, /complete returns 200 with
+        """If the route was already completed, /complete returns 200 with
         already_finalized=true so the app cleans local state without
         raising. Prevents zombie routes from re-appearing on retry."""
         with patch("main.supabase") as mock_sb:
@@ -476,13 +476,13 @@ class TestRouteActions:
             driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
 
             empty_update = MagicMock()
-            empty_update.data = []  # nothing matched (already archived)
-            already_archived = MagicMock()
-            already_archived.data = [{
+            empty_update.data = []  # nothing matched (already completed)
+            already_completed = MagicMock()
+            already_completed.data = [{
                 "id": "route-1",
                 "status": "completed",
                 "completed_at": "2026-05-12T09:00:00+00:00",
-                "deleted_at": "2026-05-12T09:00:00+00:00",
+                "deleted_at": None,
             }]
 
             call_count = {"routes": 0}
@@ -494,9 +494,9 @@ class TestRouteActions:
                     if call_count["routes"] == 1:
                         chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
                     elif call_count["routes"] == 2:
-                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = empty_update
+                        chain.update.return_value.eq.return_value.neq.return_value.execute.return_value = empty_update
                     else:
-                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = already_archived
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = already_completed
                 elif name == "drivers":
                     chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
                 return chain
