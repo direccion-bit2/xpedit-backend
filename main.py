@@ -4981,6 +4981,34 @@ _MSI_FLOOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Detects whether a string contains a Spanish/LATAM street-type prefix.
+# Used to tell "Calle Real" (deliverable) from "San José del Valle"
+# (just a town the model misclassified into the street field). Covers
+# common ES forms + Catalan (Carrer) and Galician (Rúa). Word-boundary
+# escapes guard against false positives inside other words.
+_MSI_STREET_TYPE_RE = re.compile(
+    r"\b("
+    r"av(?:\.|enida)?|"
+    r"c\/|c\.|calle|"
+    r"plaza|pza|plza|"
+    r"camino|cami|"
+    r"carretera|ctra|crta|cra|"
+    r"traves(?:i|í)a|trav|"
+    r"paseo|p\.º|po|"
+    r"pol(?:\.|í|i)?gono|pol|pg|"
+    r"urbanizaci(?:o|ó)n|urb|"
+    r"r(?:ú|u)a|carrer|"
+    r"v(?:i|í)a|ronda|cuesta|"
+    r"callej(?:o|ó)n|"
+    r"gran\s+v(?:i|í)a|"
+    r"bulevar|bvar|blvd|"
+    r"glorieta|glta|"
+    r"rambla|"
+    r"cl|av\b"
+    r")\b\.?\s",
+    re.IGNORECASE,
+)
+
 
 def _msi_postal_code_to_province(cp: Optional[str]) -> Optional[str]:
     """Map Spanish 5-digit postal code first 2 digits to province name."""
@@ -5287,13 +5315,20 @@ async def _msi_normalize_and_geocode(
     for s in stops:
         geo = s.pop("_geo", {}) or {}
 
-        # A stop is "insufficient" if it doesn't carry a deliverable
-        # street. City alone ("San José del Valle") is NOT enough — the
-        # driver can't deliver to a town, only to an address. Treat those
-        # the same as fully empty extractions so the review sheet forces
-        # the driver to fill them in. Their corrections are the highest-
-        # value training signal: the model was confidently wrong.
-        is_empty = not (s.get("street") or "").strip()
+        # A stop is "insufficient" if it doesn't carry a *deliverable*
+        # street. Two failure modes seen in the field:
+        #   1) street is literally empty → obviously empty.
+        #   2) street has text but it's a city/town name with no number
+        #      and no street-type prefix (e.g. Gemini puts "San José del
+        #      Valle" in street because the label only has CP+town). The
+        #      driver still can't deliver — there's no calle.
+        # We accept a street only if it has a digit (likely number) OR a
+        # recognised street-type word (Avda, C/, Plaza, Camino, …). Any
+        # other case is treated as empty and the row goes red.
+        street_text = (s.get("street") or "").strip()
+        has_digit = bool(re.search(r"\d", street_text))
+        has_street_type = bool(_MSI_STREET_TYPE_RE.search(street_text))
+        is_empty = not street_text or (not has_digit and not has_street_type)
 
         if is_empty:
             flat_address = ""
