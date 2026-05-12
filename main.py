@@ -4879,6 +4879,8 @@ Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distinta
 6. Para `floor_etc` extrae expresiones como "4ºB", "Esc 2", "Pta 3", "Portal C", "1º derecha". Estas NUNCA van junto a la calle, van separadas para añadirlas a las notas del repartidor.
 7. Si una imagen no contiene una lista de paradas (foto random, captura no relacionada), simplemente no añadas paradas de ahí.
 8. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
+9. **Texto rotado**: las etiquetas físicas pueden estar rotadas 90° o 180° sobre el sobre. Lee la imagen mentalmente desde TODAS las orientaciones lógicas y busca la calle también verticalmente. Pista: si encuentras CP+ciudad pero NO calle, casi seguro la calle está rotada al lado del barcode o debajo del nombre del destinatario. Busca patrones tipo "Avda", "Av.", "Calle", "C/", "Plaza", "Pza", "Camino", "Rúa", "Carrer", "Cuesta", "Travesía", "Paseo", "Polígono" seguidos de número.
+10. **Nunca dejes street vacío** si la imagen tiene texto rotado que podría ser una calle. Prefiere extraer "Avda La Independencia 55" con confidence 0.7 antes que dejar street vacío.
 
 Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
 
