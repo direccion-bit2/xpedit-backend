@@ -224,3 +224,15 @@ def clear_rate_limits():
     _rate_limits.clear()
     yield
     _rate_limits.clear()
+
+
+@pytest.fixture(autouse=True)
+def _default_ocr_tier(monkeypatch):
+    """All OCR endpoints (`/ocr/label`, `/ocr/screenshots-batch`) now look up
+    the caller's tier to enforce a per-driver daily image quota. Existing
+    OCR tests don't seed a tier — they care about the OCR logic itself,
+    not the quota gate — so default to a healthy Pro+ user with a fake
+    driver_id. Tests that need to exercise the quota path (free=0, trial=30)
+    can override this with their own monkeypatch.setattr inside the test."""
+    import main
+    monkeypatch.setattr(main, "_resolve_user_tier", lambda _uid: ("pro_plus", "test-driver-id"))

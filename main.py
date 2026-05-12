@@ -701,11 +701,25 @@ def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60)
 # bypass the limit by mixing endpoints. Limit is per driver_id (not IP) so
 # device changes don't reset the quota either.
 _OCR_DAILY_IMG_QUOTA = {
-    "free": 5,         # Lets a free user try /ocr/label a couple of times.
-    "trial": 50,       # Generous for the 7-day trial — encourages using MSI.
-    "pro": 100,        # Pro paid monthly (not the killer flow but still allowed).
-    "pro_yearly": 300,
-    "pro_plus": 300,
+    # Limits set by Miguel 12 may 2026 14:29 CEST. Rationale: cost per
+    # image ~$0.01 (Gemini + Geocoding). We don't size for worst-case
+    # where every user maxes out every day; average use is much lower
+    # and the heavy outlier is acceptable to lose money on as long as
+    # the P50 stays profitable. If demand grows past sustainable, we
+    # revisit pricing (either raise plan price or move MSI to an
+    # add-on).  yearly users get the same daily quota as monthly —
+    # Miguel: "ten en cuenta que no todos van a usar esa función
+    # entonces no es realista calcular como si todos gastaran al
+    # tope".
+    "free": 0,         # Locked. Free users see the paywall.
+    "trial": 30,       # 7-day trial: enough to feel the value.
+    "pro": 20,         # /ocr/label only — MSI is Pro+ gated upstream.
+    "pro_yearly": 20,  # Same as monthly intentionally.
+    "pro_plus": 50,
+    # `_verify_msi_access` returns 'pro_yearly' for any sub_period='yearly',
+    # so a Pro+ yearly user also resolves to 'pro_yearly' here. That keeps
+    # yearly users at 20/day across the board, which protects the lower
+    # price-per-month of the yearly plan.
 }
 _OCR_QUOTA_WINDOW = 86400  # 24h rolling window.
 
