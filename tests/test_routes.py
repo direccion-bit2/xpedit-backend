@@ -461,7 +461,10 @@ class TestRouteActions:
 
     @pytest.mark.asyncio
     async def test_complete_route(self, client):
-        """Completing a route should succeed with proper access."""
+        """Completing a route should succeed with proper access.
+        Post-fix (12 may): complete_route now also soft-deletes the row
+        (deleted_at = NOW()) so the route never reappears to the driver.
+        Cascade to stops is handled by trg_soft_delete_route_stops in DB."""
         with patch("main.supabase") as mock_sb:
             route_access = MagicMock()
             route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
@@ -470,7 +473,12 @@ class TestRouteActions:
             driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
 
             update_result = MagicMock()
-            update_result.data = [{"id": "route-1", "status": "completed"}]
+            update_result.data = [{
+                "id": "route-1",
+                "status": "completed",
+                "completed_at": "2026-05-12T11:00:00+00:00",
+                "deleted_at": "2026-05-12T11:00:00+00:00",
+            }]
 
             call_count = {"routes": 0}
 
@@ -479,9 +487,11 @@ class TestRouteActions:
                 if name == "routes":
                     call_count["routes"] += 1
                     if call_count["routes"] == 1:
+                        # verify_route_access → SELECT id, driver_id
                         chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
                     else:
-                        chain.update.return_value.eq.return_value.execute.return_value = update_result
+                        # UPDATE chain now includes `.is_("deleted_at", None)`
+                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = update_result
                 elif name == "drivers":
                     chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
                 return chain
@@ -493,6 +503,161 @@ class TestRouteActions:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        # The route ships back with both completed_at and deleted_at set.
+        assert data["route"]["completed_at"] is not None
+        assert data["route"]["deleted_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_complete_route_already_finalized_is_idempotent(self, client):
+        """If the route was already archived, /complete returns 200 with
+        already_finalized=true so the app cleans local state without
+        raising. Prevents zombie routes from re-appearing on retry."""
+        with patch("main.supabase") as mock_sb:
+            route_access = MagicMock()
+            route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+
+            empty_update = MagicMock()
+            empty_update.data = []  # nothing matched (already archived)
+            already_archived = MagicMock()
+            already_archived.data = [{
+                "id": "route-1",
+                "status": "completed",
+                "completed_at": "2026-05-12T09:00:00+00:00",
+                "deleted_at": "2026-05-12T09:00:00+00:00",
+            }]
+
+            call_count = {"routes": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "routes":
+                    call_count["routes"] += 1
+                    if call_count["routes"] == 1:
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                    elif call_count["routes"] == 2:
+                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = empty_update
+                    else:
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = already_archived
+                elif name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.patch("/routes/route-1/complete")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data.get("already_finalized") is True
+
+    @pytest.mark.asyncio
+    async def test_clear_route(self, client):
+        """PATCH /routes/{id}/clear archives the route + cascades stops
+        via trigger. Replaces the old client-side `supabase.update` that
+        was hitting RLS 42501 when the JWT went stale (Sentry NATIVE-30)."""
+        with patch("main.supabase") as mock_sb:
+            route_access = MagicMock()
+            route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+
+            update_result = MagicMock()
+            update_result.data = [{
+                "id": "route-1",
+                "status": "cancelled",
+                "deleted_at": "2026-05-12T11:30:00+00:00",
+            }]
+            stops_count = MagicMock()
+            stops_count.count = 5
+
+            call_count = {"routes": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "routes":
+                    call_count["routes"] += 1
+                    if call_count["routes"] == 1:
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                    else:
+                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = update_result
+                elif name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                elif name == "stops":
+                    chain.select.return_value.eq.return_value.not_.is_.return_value.execute.return_value = stops_count
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.patch("/routes/route-1/clear")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["route"]["deleted_at"] is not None
+        assert data["stops_cleared"] == 5
+
+    @pytest.mark.asyncio
+    async def test_clear_route_already_archived_is_idempotent(self, client):
+        """Re-clearing an already-archived route returns 200 + already_archived=true."""
+        with patch("main.supabase") as mock_sb:
+            route_access = MagicMock()
+            route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+            empty_update = MagicMock()
+            empty_update.data = []
+            already_archived = MagicMock()
+            already_archived.data = [{
+                "id": "route-1",
+                "status": "cancelled",
+                "deleted_at": "2026-05-12T08:00:00+00:00",
+            }]
+            call_count = {"routes": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "routes":
+                    call_count["routes"] += 1
+                    if call_count["routes"] == 1:
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                    elif call_count["routes"] == 2:
+                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = empty_update
+                    else:
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = already_archived
+                elif name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.patch("/routes/route-1/clear")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data.get("already_archived") is True
+
+    @pytest.mark.asyncio
+    async def test_clear_route_requires_ownership(self, client):
+        """clear_route must reject a driver who doesn't own the route."""
+        with patch("main.supabase") as mock_sb:
+            route_access = MagicMock()
+            route_access.data = [{"id": "route-1", "driver_id": "different-driver"}]
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "routes":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                elif name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.patch("/routes/route-1/clear")
+
+        assert response.status_code == 403
 
     @pytest.mark.asyncio
     async def test_delete_route(self, client):
