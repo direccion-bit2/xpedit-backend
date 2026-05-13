@@ -1816,6 +1816,62 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
     return {"success": True, "stop": stop}
 
 
+class StopDeleteRequest(BaseModel):
+    # Cliente puede mandar dbId conocido, o (route_id + client_id) cuando la
+    # INSERT inicial aún no ha confirmado el dbId (offline queue drain path).
+    stop_id: Optional[str] = None
+    route_id: Optional[str] = None
+    client_id: Optional[str] = None
+    position: Optional[int] = None
+
+
+@app.post("/stops/delete", tags=["stops"], summary="Soft-delete parada (bypass RLS)")
+async def soft_delete_stop(body: StopDeleteRequest, user=Depends(get_current_user)):
+    # Soft-delete con service_role: la RLS de stops rechaza el UPDATE de
+    # deleted_at por cliente (la SELECT policy filtra deleted_at IS NULL y
+    # Postgres la aplica al row nuevo). Aquí saltamos esa restricción y
+    # validamos ownership manualmente vía verify_stop_access.
+    resolved_id = body.stop_id
+    if not resolved_id:
+        if not body.route_id or not body.client_id:
+            raise HTTPException(status_code=400, detail="stop_id o (route_id+client_id) requerido")
+        # Resolver por (route_id, client_id) — UNIQUE en stops
+        lookup = await asyncio.to_thread(
+            lambda: supabase.table("stops").select("id")
+                .eq("route_id", body.route_id)
+                .eq("client_id", body.client_id)
+                .is_("deleted_at", "null")
+                .limit(1).execute()
+        )
+        row = safe_first(lookup)
+        if not row and body.position is not None:
+            lookup2 = await asyncio.to_thread(
+                lambda: supabase.table("stops").select("id")
+                    .eq("route_id", body.route_id)
+                    .eq("position", body.position)
+                    .is_("deleted_at", "null")
+                    .limit(1).execute()
+            )
+            row = safe_first(lookup2)
+        if not row:
+            # Idempotencia: si la stop ya está borrada o nunca existió,
+            # devolver success para que el drain marque la op como done.
+            return {"success": True, "already_deleted": True}
+        resolved_id = row["id"]
+
+    await verify_stop_access(resolved_id, user)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("stops").update({"deleted_at": now_iso})
+            .eq("id", resolved_id).is_("deleted_at", "null").execute()
+    )
+    stop = safe_first(result)
+    if not stop:
+        # Ya borrado por otra petición concurrente. Idempotente.
+        return {"success": True, "already_deleted": True, "stop_id": resolved_id}
+    return {"success": True, "stop_id": resolved_id}
+
+
 # -- Push Token --
 
 class PushTokenUpdate(BaseModel):
