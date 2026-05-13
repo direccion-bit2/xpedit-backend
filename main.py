@@ -5278,6 +5278,170 @@ async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
     return {"status": "FALLBACK", "lat": lat, "lng": lng, "formatted_address": ""}
 
 
+def _parse_latlng_pair(coord: str) -> Optional[dict]:
+    """Convierte 'lat,lng' a dict {latitude, longitude} para Routes API v2.
+    Devuelve None si el string no es un par válido (place_id, dirección, etc.)."""
+    if "," not in coord:
+        return None
+    try:
+        lat_str, lng_str = coord.split(",", 1)
+        return {"latitude": float(lat_str.strip()), "longitude": float(lng_str.strip())}
+    except (ValueError, TypeError):
+        return None
+
+
+def _routes_v2_waypoint(coord: str) -> dict:
+    """Construye un waypoint Routes API v2 a partir de coords o dirección."""
+    parsed = _parse_latlng_pair(coord)
+    if parsed:
+        return {"location": {"latLng": parsed}}
+    return {"address": coord}
+
+
+def _parse_routes_v2_duration(value) -> int:
+    """Routes v2 devuelve duración como `'123s'`. Convierte a int segundos."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).rstrip("s"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _routes_v2_to_directions_shape(routes_v2_data: dict) -> dict:
+    """Mapea la respuesta de Routes API v2 al shape histórico de Directions API
+    para que el cliente RN funcione sin cambios, EN AMBOS flujos:
+
+      A) Polyline del mapa: `useRoutes.fetchDirectionsChunk` — lee
+         `leg.duration.value`, `leg.end_location`, `step.polyline.points`.
+      B) Navegación turn-by-turn: `services/directions.ts::getNavigationRoute`
+         (invocado por `useNavigationFlow`) — lee adicionalmente
+         `step.html_instructions`, `step.maneuver`, `step.start_location`,
+         `step.distance.value`, `step.duration.value` y `route.bounds`.
+
+    El bug del 12 may 2026 (white screen "Calculando ruta..." en navegación)
+    fue causado por NO mapear los campos del flujo B: el mapper se diseñó
+    pensando solo en A. Esta versión completa los 6 campos faltantes
+    (instructions, maneuver, start_location, step.distance, step.duration,
+    bounds → viewport en v2).
+    """
+    if not routes_v2_data or "routes" not in routes_v2_data or not routes_v2_data["routes"]:
+        return {"status": "ZERO_RESULTS", "routes": []}
+
+    out_routes = []
+    for r in routes_v2_data["routes"]:
+        out_legs = []
+        for leg in r.get("legs", []):
+            dur_value = _parse_routes_v2_duration(leg.get("duration"))
+            dist_value = int(leg.get("distanceMeters", 0) or 0)
+            end_loc = (leg.get("endLocation", {}) or {}).get("latLng", {}) or {}
+            start_loc_leg = (leg.get("startLocation", {}) or {}).get("latLng", {}) or {}
+            out_steps = []
+            for step in leg.get("steps", []):
+                enc = (step.get("polyline", {}) or {}).get("encodedPolyline")
+                if not enc:
+                    # Sin polyline el cliente no puede pintar el segmento; saltar.
+                    continue
+                step_dur = _parse_routes_v2_duration(step.get("staticDuration"))
+                step_dist = int(step.get("distanceMeters", 0) or 0)
+                step_start = (step.get("startLocation", {}) or {}).get("latLng", {}) or {}
+                step_end = (step.get("endLocation", {}) or {}).get("latLng", {}) or {}
+                nav_instruction = step.get("navigationInstruction", {}) or {}
+                instructions_text = nav_instruction.get("instructions", "") or ""
+                maneuver = nav_instruction.get("maneuver", "") or ""
+                out_steps.append({
+                    "polyline": {"points": enc},
+                    # html_instructions: Routes v2 ya devuelve texto plano; el
+                    # cliente espera string que pasa por `cleanInstruction` (strip
+                    # de tags HTML). Plano funciona porque strip no-op sobre él.
+                    "html_instructions": instructions_text,
+                    # maneuver: enum v2 (`TURN_LEFT`, `MERGE_LEFT`...). Cliente
+                    # lo usa como string libre, no compara contra valores legacy.
+                    "maneuver": maneuver,
+                    "distance": {
+                        "value": step_dist,
+                        "text": f"{step_dist} m" if step_dist < 1000 else f"{step_dist / 1000:.1f} km",
+                    },
+                    "duration": {
+                        "value": step_dur,
+                        "text": f"{step_dur // 60} min" if step_dur >= 60 else f"{step_dur} s",
+                    },
+                    "start_location": {
+                        "lat": step_start.get("latitude", 0),
+                        "lng": step_start.get("longitude", 0),
+                    },
+                    "end_location": {
+                        "lat": step_end.get("latitude", 0),
+                        "lng": step_end.get("longitude", 0),
+                    },
+                })
+            out_legs.append({
+                "duration": {"value": dur_value, "text": f"{dur_value // 60} min"},
+                "distance": {"value": dist_value, "text": f"{dist_value / 1000:.1f} km"},
+                "start_location": {
+                    "lat": start_loc_leg.get("latitude", 0),
+                    "lng": start_loc_leg.get("longitude", 0),
+                },
+                "end_location": {
+                    "lat": end_loc.get("latitude", 0),
+                    "lng": end_loc.get("longitude", 0),
+                },
+                "steps": out_steps,
+            })
+        overview = (r.get("polyline", {}) or {}).get("encodedPolyline", "")
+        # bounds: el cliente usa `route.bounds.northeast/southwest` para encajar
+        # la cámara. Routes v2 lo llama `viewport` con `low/high` (cada uno
+        # `{latitude, longitude}`). low=SW, high=NE.
+        viewport = r.get("viewport", {}) or {}
+        vp_low = viewport.get("low", {}) or {}
+        vp_high = viewport.get("high", {}) or {}
+        bounds = {
+            "northeast": {
+                "lat": vp_high.get("latitude", 0),
+                "lng": vp_high.get("longitude", 0),
+            },
+            "southwest": {
+                "lat": vp_low.get("latitude", 0),
+                "lng": vp_low.get("longitude", 0),
+            },
+        }
+        out_routes.append({
+            "legs": out_legs,
+            "overview_polyline": {"points": overview},
+            "bounds": bounds,
+        })
+    return {"status": "OK", "routes": out_routes}
+
+
+# Routes API v2 — reemplazo de la antigua Directions API.
+# fieldMask: TODO lo que el cliente RN consume (ambos flujos A y B descritos
+# en `_routes_v2_to_directions_shape`). Esto incluye instrucciones turn-by-turn
+# que faltaban en la versión 12 may (causa del white screen "Calculando ruta…").
+# Sigue dentro del tier Basic — los campos extra están en el Advanced tier
+# SOLO cuando se piden con `routes.travelAdvisory` o `legs.travelAdvisory`,
+# que aquí NO pedimos. `navigationInstruction`, `staticDuration` y `viewport`
+# son Basic.
+_ROUTES_V2_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+_ROUTES_V2_FIELD_MASK = (
+    "routes.duration,"
+    "routes.distanceMeters,"
+    "routes.polyline.encodedPolyline,"
+    "routes.viewport,"
+    "routes.legs.duration,"
+    "routes.legs.distanceMeters,"
+    "routes.legs.startLocation,"
+    "routes.legs.endLocation,"
+    "routes.legs.steps.polyline.encodedPolyline,"
+    "routes.legs.steps.startLocation,"
+    "routes.legs.steps.endLocation,"
+    "routes.legs.steps.distanceMeters,"
+    "routes.legs.steps.staticDuration,"
+    "routes.legs.steps.navigationInstruction"
+)
+
+
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
@@ -5287,55 +5451,107 @@ async def places_directions(
     heading: Optional[float] = None,
     user=Depends(get_current_user)
 ):
-    """Proxy de Google Directions API. Devuelve polylines y pasos de navegación.
+    """Calcula la ruta entre origin/destination con waypoints opcionales.
 
-    Si `heading` (0-360) viene, inserta un micro-waypoint ~50 m delante del coche
+    11 may 2026: migrado de Directions API legacy a Routes API v2 para reducir
+    el coste por llamada ~40 % (fieldMask + tier Basic). El shape de respuesta
+    se mantiene compatible con el cliente RN (`useRoutes.fetchDirectionsChunk`)
+    via `_routes_v2_to_directions_shape`.
+
+    Si `heading` (0-360) viene, inserta un waypoint ~50 m delante del coche
     en esa dirección. Así el rerouting no propone giros bruscos hacia atrás.
     """
-    params = {
-        "origin": origin,
-        "destination": destination,
-        "key": GOOGLE_API_KEY,
-        "language": "es",
-    }
-    extra_wp = ""
+    intermediates: list[dict] = []
     if heading is not None and "," in origin:
         try:
             lat_str, lng_str = origin.split(",", 1)
             lat, lng = float(lat_str), float(lng_str)
             h = math.radians(heading % 360)
-            # ~50 m ahead in the driver's facing direction (good enough for routing)
             dlat = (50 * math.cos(h)) / 111320.0
             dlng = (50 * math.sin(h)) / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
-            extra_wp = f"via:{lat + dlat:.6f},{lng + dlng:.6f}"
+            intermediates.append({
+                "location": {"latLng": {"latitude": lat + dlat, "longitude": lng + dlng}},
+                "via": True,
+            })
         except Exception as e:
             logger.warning(f"heading waypoint skipped: {e}")
-    combined_waypoints = "|".join(p for p in [extra_wp, waypoints] if p)
-    if combined_waypoints:
-        params["waypoints"] = combined_waypoints
+    if waypoints:
+        # El cliente RN pasa waypoints SIN prefijo `via:` cuando son paradas
+        # reales (1 leg por parada para extraer duration/end_location/steps).
+        # Solo el legacy `via:` prefix indica waypoint guía. Routes API v2 usa
+        # `via: True` para "guía no-stop" y omite la propiedad cuando es stop
+        # real. Marcar `via: True` por defecto fusiona todos los waypoints en
+        # 1 leg y rompe el cliente (durations/snapped vacíos). Bug detectado
+        # en smoke staging 11 may 19:48.
+        for wp in waypoints.split("|"):
+            is_via = wp.startswith("via:")
+            if is_via:
+                wp = wp[4:]
+            if wp:
+                w = _routes_v2_waypoint(wp)
+                if is_via:
+                    w["via"] = True
+                intermediates.append(w)
+
+    body: dict = {
+        "origin": _routes_v2_waypoint(origin),
+        "destination": _routes_v2_waypoint(destination),
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+        "languageCode": "es",
+        "polylineEncoding": "ENCODED_POLYLINE",
+        "computeAlternativeRoutes": False,
+    }
+    if intermediates:
+        body["intermediates"] = intermediates
     if avoid:
-        params["avoid"] = avoid
-    # Timeouts raised from 10s to 20s/25s with one retry on transient errors —
-    # 5 may incident: under FORCE-OTA reload pico, Google sometimes took 12s+
-    # responding to /directions. The 10s timeout was tripping HTTP 500s and
-    # leaving drivers staring at a blank map. Retry pattern matches /places/autocomplete.
+        avoid_set = {a.strip() for a in avoid.split("|")}
+        modifiers = {}
+        if "tolls" in avoid_set:
+            modifiers["avoidTolls"] = True
+        if "highways" in avoid_set:
+            modifiers["avoidHighways"] = True
+        if "ferries" in avoid_set:
+            modifiers["avoidFerries"] = True
+        if modifiers:
+            body["routeModifiers"] = modifiers
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": _ROUTES_V2_FIELD_MASK,
+    }
+    # Mismo patrón de timeout/retry que la versión legacy: 5 may incident
+    # mostró que bajo pico de OTA reload Google puede tardar >12 s.
     last_error = "no attempt"
     client = google_maps_client()
     for attempt in range(2):
         try:
             timeout = 20.0 if attempt == 0 else 25.0
-            resp = await client.get(
-                "https://maps.googleapis.com/maps/api/directions/json",
-                params=params,
+            resp = await client.post(
+                _ROUTES_V2_URL,
+                json=body,
+                headers=headers,
                 timeout=timeout,
             )
-            return resp.json()
+            if resp.status_code >= 400:
+                logger.warning(f"routes_v2 HTTP {resp.status_code}: {resp.text[:300]}")
+                if resp.status_code < 500:
+                    # 4xx: error de request del cliente, no reintentar.
+                    return {"status": "REQUEST_DENIED", "routes": [], "error_message": resp.text[:500]}
+                last_error = f"HTTP {resp.status_code}"
+                if attempt == 0:
+                    continue
+                raise HTTPException(status_code=502, detail=f"Routes API 5xx after retry: {last_error}")
+            return _routes_v2_to_directions_shape(resp.json())
+        except HTTPException:
+            raise
         except Exception as e:
             last_error = str(e)
-            logger.warning(f"directions request error (attempt {attempt + 1}): {e}")
+            logger.warning(f"routes_v2 request error (attempt {attempt + 1}): {e}")
             if attempt == 0:
                 continue
-    raise HTTPException(status_code=504, detail=f"Google Directions timeout after retry: {last_error}")
+    raise HTTPException(status_code=504, detail=f"Google Routes API timeout after retry: {last_error}")
 
 
   # Street View proxy removed - app opens Google Maps directly (free, no API cost)
