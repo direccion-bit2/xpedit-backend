@@ -6764,7 +6764,9 @@ async def health_check():
     # iOS=45 (23 Apr 2026): bN45 contains the AIRGoogleMap nil-guard patch
     # (PR #5873). Older builds (bN39 etc.) crash with REACT-NATIVE-17 on
     # any re-render that touches MapView children — force the App Store update.
-    checks["min_app_version"] = {"android": 0, "ios": 45}
+    # android=32 (13 may 2026): force update tras email winback LATAM por bug RLS soft-delete.
+    # vC32/1.1.7 LIVE en Play Store con OTA daa2975. Drivers vC28-vC31 ven ForceUpdateGate.
+    checks["min_app_version"] = {"android": 32, "ios": 45}
 
     status_code = 200 if healthy else 503
     from fastapi.responses import JSONResponse
