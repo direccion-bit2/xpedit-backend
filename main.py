@@ -4592,7 +4592,7 @@ async def get_company_subscription(company_id: str, user=Depends(get_current_use
 # `{success, content}` where `content` is a JSON string. The `data` field is
 # new (parsed dict, same content) so newer clients can skip the JSON.parse.
 
-_OCR_LABEL_MODEL = "gemini-2.5-flash"
+_OCR_LABEL_MODEL = "gemini-2.5-pro"
 
 _OCR_LABEL_PROMPT = """Esta es una foto de una etiqueta de envío de paquetería (iMile, Shein, etc.).
 IMPORTANTE: La imagen puede estar ROTADA 90°, 180° o 270°. Analiza la orientación del texto primero.
@@ -4646,7 +4646,7 @@ def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
         response_mime_type="application/json",
         response_schema=_OCR_LABEL_SCHEMA,
         temperature=0.1,
-        max_output_tokens=500,
+        max_output_tokens=1024,
     )
 
     try:

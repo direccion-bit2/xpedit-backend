@@ -159,7 +159,8 @@ class TestDeleteAccount:
         actually delete or surface the failure. Added 2026-05-10 (#248) after
         2 incidents of users left in limbo (zamorakareilys + arroceriadevicent)."""
         with patch("main.supabase") as mock_sb:
-            driver_result = MagicMock(); driver_result.data = [{"id": FAKE_DRIVER_ID}]
+            driver_result = MagicMock()
+            driver_result.data = [{"id": FAKE_DRIVER_ID}]
             def table_dispatch(name):
                 chain = MagicMock()
                 if name == "drivers":
@@ -187,7 +188,8 @@ class TestDeleteAccount:
         207 Multi-Status (data gone, audit log notes the gap). The user still
         has their identity removed — the failure is auxiliary cleanup."""
         with patch("main.supabase") as mock_sb:
-            driver_result = MagicMock(); driver_result.data = [{"id": FAKE_DRIVER_ID}]
+            driver_result = MagicMock()
+            driver_result.data = [{"id": FAKE_DRIVER_ID}]
             def table_dispatch(name):
                 chain = MagicMock()
                 if name == "drivers":
