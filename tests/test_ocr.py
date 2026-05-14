@@ -135,7 +135,7 @@ class TestOCRLabelSuccess:
 
         gemini_client.models.generate_content.assert_called_once()
         kwargs = gemini_client.models.generate_content.call_args.kwargs
-        assert kwargs["model"] == "gemini-2.5-flash"
+        assert kwargs["model"] == "gemini-2.5-pro"
 
         contents = kwargs["contents"]
         # contents = [Content(role='user', parts=[text_part, image_part])]
