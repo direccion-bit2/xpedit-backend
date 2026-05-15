@@ -6786,9 +6786,17 @@ async def health_check():
     # iOS=45 (23 Apr 2026): bN45 contains the AIRGoogleMap nil-guard patch
     # (PR #5873). Older builds (bN39 etc.) crash with REACT-NATIVE-17 on
     # any re-render that touches MapView children — force the App Store update.
-    # android=32 (13 may 2026): force update tras email winback LATAM por bug RLS soft-delete.
-    # vC32/1.1.7 LIVE en Play Store con OTA daa2975. Drivers vC28-vC31 ven ForceUpdateGate.
-    checks["min_app_version"] = {"android": 32, "ios": 45}
+    # android=0 (15 may 2026, postmortem): el 13 may pusimos android=32 para
+    # forzar update por el bug RLS soft-delete, pero NO mandamos el email de
+    # aviso ni verificamos que la nueva build estuviera disponible en stores
+    # para todos los países. Resultado: 250+ drivers Android (1.1.5 build 28 y
+    # 1.1.6 build 29) churned 12-15 may, incluyendo 3 paying activos
+    # (silvento555, transporteselninio, nachoalbigerdoval). Bajamos a 0 para
+    # desbloquear de inmediato. El bug RLS soft-delete que motivó el force-update
+    # NO es bloqueante (drivers pueden crear/completar/navegar, solo no borrar
+    # paradas); reactivar este gate exige antes: email/push de aviso + vC32
+    # confirmada en todas las stores + verificación de cohort impactada.
+    checks["min_app_version"] = {"android": 0, "ios": 45}
 
     status_code = 200 if healthy else 503
     from fastapi.responses import JSONResponse
