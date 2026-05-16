@@ -15,6 +15,9 @@ apscheduler==3.10.4
 beautifulsoup4==4.12.3
 lxml==5.3.0
 google-genai>=1.0.0
+# google-auth is required for Vertex AI mode (ADC). Pinned explicitly so we
+# don't depend on it being a transitive of google-genai.
+google-auth>=2.32.0
 sentry-sdk[fastapi]>=2.0.0
 cachetools>=5.3.0
 

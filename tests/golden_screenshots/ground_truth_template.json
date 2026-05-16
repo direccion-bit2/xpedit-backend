@@ -1,0 +1,38 @@
+[
+  {
+    "filename": "ctt_001.jpg",
+    "carrier_hint": "ctt",
+    "expected_stops": [
+      {
+        "street": "Calle Mayor",
+        "number": "5",
+        "floor_etc": "4ºB",
+        "postal_code": "11630",
+        "city": "Arcos de la Frontera",
+        "province": "Cádiz"
+      }
+    ],
+    "notes": "Standard CTT list view, 1 stop, full address legible."
+  },
+  {
+    "filename": "mrw_001.jpg",
+    "carrier_hint": "mrw",
+    "expected_stops": [
+      {
+        "street": "Avenida de la Constitución",
+        "number": "12",
+        "postal_code": "41004",
+        "city": "Sevilla",
+        "province": "Sevilla"
+      },
+      {
+        "street": "Plaza del Salvador",
+        "number": "3",
+        "postal_code": "41004",
+        "city": "Sevilla",
+        "province": "Sevilla"
+      }
+    ],
+    "notes": "MRW two-stop list, partial scroll; tests sequence preservation."
+  }
+]
