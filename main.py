@@ -5153,20 +5153,43 @@ def _msi_build_prompt(carrier_hint: Optional[str], route_context: Optional[MSIRo
         if bits:
             ctx_line = "\nContexto del repartidor: " + "; ".join(bits) + "."
 
-    return f"""Eres un extractor experto de listas de paradas de reparto desde pantallazos de apps de paquetería españolas.{carrier_line}{ctx_line}
+    return f"""Eres un extractor experto de listas de paradas de reparto desde fotos de etiquetas físicas Y pantallazos de apps de paquetería españolas.{carrier_line}{ctx_line}
 
-Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distintas posiciones) o listas distintas. Tu tarea:
+Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distintas posiciones), etiquetas físicas individuales de paquetes, o listas distintas. Tu tarea:
 
 1. Detecta cada parada/envío único. Si la misma parada aparece en 2 imágenes (porque el usuario hizo scroll), inclúyela UNA sola vez (con `source_image_idx` = la imagen donde se ve más completa).
-2. Extrae los campos: name (destinatario), street (solo nombre de calle), number (número), floor_etc (piso/escalera/portal/puerta — NUNCA juntar con street), postal_code (5 dígitos), city, province, phone, tracking_number, notes.
+
+2. Extrae los campos: name (destinatario, persona física), street (solo nombre de calle), number (número), floor_etc (piso/escalera/portal/puerta — NUNCA juntar con street), postal_code (5 dígitos), city, province, phone, tracking_number, notes.
+
 3. Para cada campo extraído anota un `confidence_per_field` entre 0 y 1 (1 = totalmente legible y seguro).
-4. **Inferencia contextual**: si una parada no muestra ciudad/provincia pero el resto de la lista sí, infiere usándolas. Marca esos campos en `context_inferred_fields` y baja su confidence a ≤0.7. Si la mayoría de paradas son de Sevilla y una parada solo muestra calle, asume Sevilla con confidence 0.6 y anota.
-5. **NUNCA inventes**. Si no puedes leer un campo y NO hay contexto suficiente, deja el campo vacío (string vacía).
-6. Para `floor_etc` extrae expresiones como "4ºB", "Esc 2", "Pta 3", "Portal C", "1º derecha". Estas NUNCA van junto a la calle, van separadas para añadirlas a las notas del repartidor.
-7. Si una imagen no contiene una lista de paradas (foto random, captura no relacionada), simplemente no añadas paradas de ahí.
-8. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
-9. **Texto rotado**: las etiquetas físicas pueden estar rotadas 90° o 180° sobre el sobre. Lee la imagen mentalmente desde TODAS las orientaciones lógicas y busca la calle también verticalmente. Pista: si encuentras CP+ciudad pero NO calle, casi seguro la calle está rotada al lado del barcode o debajo del nombre del destinatario. Busca patrones tipo "Avda", "Av.", "Calle", "C/", "Plaza", "Pza", "Camino", "Rúa", "Carrer", "Cuesta", "Travesía", "Paseo", "Polígono" seguidos de número.
-10. **Nunca dejes street vacío** si la imagen tiene texto rotado que podría ser una calle. Prefiere extraer "Avda La Independencia 55" con confidence 0.7 antes que dejar street vacío.
+
+4. **CRÍTICO — distinguir REMITENTE vs DESTINATARIO en etiquetas físicas**:
+   - El "RTE." o "Rte." o "Remitente" al inicio de la etiqueta = QUIÉN ENVÍA. **JAMÁS extraigas el remitente como destinatario**. Ej: si la etiqueta dice "RTE: TME GRAN PUBLICO" arriba, ignóralo. "TME" no es la dirección.
+   - El destinatario suele aparecer DESPUÉS del banner del servicio (ej. "ZLR DIA SIGUIENTE"), normalmente con el nombre de la persona en negrita y la dirección debajo.
+   - Si solo ves "MADRID" o el nombre del remitente al inicio = NO es la dirección de entrega.
+
+5. **CRÍTICO — patrón ZELERIS (logo verde con puntitos al final + banner verde-lima)**:
+   - El banner verde-lima dice "ZLR DIA SIGUIENTE / 011 CADIZ" o "011-001-CADIZ". Eso es el TIPO DE SERVICIO de Zeleris, NO el destino real.
+   - El destinatario real (persona + calle + CP + ciudad) aparece DEBAJO del banner verde, en bloque blanco, en este orden:
+       línea 1: Nombre persona (ej. "OLGA GARCIA ESTEVE")
+       línea 2: Calle + número (ej. "Avenida De Dolores Ibarruri")
+       línea 3: CP + ciudad (ej. "11140 Conil De La Frontera")
+   - La "ZONA DE REPARTO" (ej. "11140 / 11CONIL") confirma el CP y zona del destinatario.
+   - Carrier real = Zeleris (no TME, no el remitente del banner superior).
+
+6. **Inferencia contextual**: si una parada no muestra ciudad/provincia pero el resto de la lista sí, infiere usándolas. Marca esos campos en `context_inferred_fields` y baja su confidence a ≤0.7.
+
+7. **NUNCA inventes**. Si no puedes leer un campo y NO hay contexto suficiente, deja el campo vacío (string vacía).
+
+8. Para `floor_etc` extrae expresiones como "4ºB", "Esc 2", "Pta 3", "Portal C", "Pl Bajo", "1º derecha". Estas NUNCA van junto a la calle, van separadas para añadirlas a las notas del repartidor.
+
+9. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
+
+10. **Texto rotado 90°/180°/270°**: las etiquetas físicas frecuentemente se pegan rotadas sobre el paquete. Lee la imagen mentalmente desde TODAS las orientaciones lógicas. Si lees el texto principal del barcode "al revés" → la etiqueta está rotada 180° y debes rotar mentalmente para extraer todo. NUNCA descartes una etiqueta por estar rotada — siempre tienen contenido extraíble.
+
+11. **Nunca dejes street vacío** si la imagen tiene CP+ciudad legibles y SI hay alguna línea con patrón de dirección. Busca "Avda", "Av.", "Calle", "C/", "C.", "Plaza", "Pza", "Camino", "Carretera", "Ctra", "Rúa", "Carrer", "Cuesta", "Travesía", "Paseo", "Polígono", "Carril", "Cortijo", "Urbanización", "Urb.", "Barriada", "Bda.", "Diseminado", "Pago de" seguidos opcionalmente de número.
+
+12. Si una imagen no contiene una lista de paradas Y tampoco una etiqueta de envío (foto random sin texto reconocible), simplemente no añadas paradas de ahí.
 
 Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
 
