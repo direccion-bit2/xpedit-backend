@@ -1,0 +1,178 @@
+[
+  {
+    "filename": "zeleris_01.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 180,
+    "expected_stops": [
+      {
+        "name": "Elena María Salas Perdigones",
+        "street": "Avenida La Independencia",
+        "number": "55",
+        "floor_etc": "",
+        "postal_code": "11580",
+        "city": "San José del Valle",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83476399",
+        "notes": "PAGADOS · 11_PEDANI"
+      }
+    ],
+    "miguel_test_16may": "fallo_total",
+    "notes": "Etiqueta físicamente rotada 180°. Texto principal al revés. Banner verde-lima 'ZLR DIA SIGUIENTE / 011 001 - CADIZ' arriba (servicio Zeleris, NO destino). Dirección real: Avda La Independencia 55, 11580 San José del Valle. La 'Zona de reparto: 11580 / 11_PEDANI' confirma zona (pedanía de San José)."
+  },
+  {
+    "filename": "zeleris_02.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "María José Del Carmen Parodi Leal",
+        "street": "Calle Prieta",
+        "number": "1",
+        "floor_etc": "Pl Bajo, Pta No Aplica",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83486740",
+        "notes": "PAGADOS · 11CONIL · paquete WELEDA (Espressomaskin caja externa con texto árabe)"
+      }
+    ],
+    "miguel_test_16may": "fallo_total",
+    "notes": "Banner 'ZLR DIA SIGUIENTE / 011 CADIZ' (Zeleris). Destinatario debajo. 'Pl Bajo' va en floor_etc, NO en street. Tracking 301961024 a la derecha. Caja externa de WELEDA = remitente Madrid (RTE: TME GRAN PUBLICO)."
+  },
+  {
+    "filename": "zeleris_03.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "CADIZFORNIA",
+        "street": "Carril Guerrero",
+        "number": "4",
+        "floor_etc": "Casa de Postas",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "ES2026PRO0001196227",
+        "notes": "Nicolas S02874 Giacomuchi P008 · Exp 008-20504732 · PAGADOS · 11CONIL"
+      }
+    ],
+    "miguel_test_16may": "fallo_total",
+    "notes": "RTE 'PRINT THIS PRINT THAT SPAIN - BARCELONA'. Destinatario es CADIZFORNIA (nombre comercio, no persona física). 'Carril' es prefijo de calle típico del sur de España (rural Conil), nuevo en el vocabulario del prompt 16 may."
+  },
+  {
+    "filename": "zeleris_04.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 270,
+    "expected_stops": [
+      {
+        "name": "SRN Vertice Group SL (Jesús Silva)",
+        "street": "Calle Extramuros",
+        "number": "2",
+        "floor_etc": "Pl Bajo L Esc. U Nica",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "301879270",
+        "notes": "ESPECIAL · Entregar en el Hotel Arena House · 11CONIL · RTE TME Pequea Financiacion MF-Torrejón de Ardoz"
+      }
+    ],
+    "miguel_test_16may": "amarilla",
+    "notes": "Etiqueta rotada 270° (texto vertical leído desde el lado derecho). Gemini lo detectó parcialmente. 'NICA' al final es parte de 'L Esc. UNICA' (cortado por rotación). Nota 'Entregar en el Hotel Arena House' va en notes, NO en street."
+  },
+  {
+    "filename": "zeleris_05.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "",
+        "street": "Avenida Dolores Ibárruri",
+        "number": "0",
+        "floor_etc": "",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "",
+        "tracking_number": "",
+        "notes": ""
+      }
+    ],
+    "miguel_test_16may": "verde",
+    "notes": "Caso fácil — Gemini lo extrajo bien. Útil como referencia de qué SÍ funciona. Av. Dolores Ibárruri es una avenida principal de Conil costa."
+  },
+  {
+    "filename": "zeleris_06.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Luis Miguel Martín Sánchez",
+        "street": "Avenida Irlanda",
+        "number": "33",
+        "floor_etc": "",
+        "postal_code": "11149",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83478008",
+        "notes": "11CONI (cortado por la perspectiva de la foto)"
+      }
+    ],
+    "miguel_test_16may": "fallo_total",
+    "notes": "Etiqueta cortada lateralmente (driver sostiene paquete y solo se ve la mitad). Solo se lee el lado izquierdo: destinatario + calle + CP. CP 11149 es Conil costa (urb El Palmar / Roche). Vocabulario 'Avda Irlanda' = patrón común urbanizaciones."
+  },
+  {
+    "filename": "zeleris_07.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Olga García Esteve",
+        "street": "Avenida De Dolores Ibarruri",
+        "number": "",
+        "floor_etc": "FARMACIA 00",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83495152",
+        "notes": "Adjuntar al pedido PEDWEB2606565 · PAGADOS · 11CONIL · RTE WELEDA-MADRID · kilos 0.70"
+      }
+    ],
+    "miguel_test_16may": "pendiente_test_post_fix",
+    "notes": "Foto enviada 11:58. Sin número de calle visible — 'FARMACIA 00' parece indicador del local (no portal). Test con nuevo prompt Zeleris pendiente."
+  },
+  {
+    "filename": "zeleris_08.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 90,
+    "expected_stops": [
+      {
+        "name": "Jesús Silva (SRN Vertice Group SL)",
+        "street": "Calle Extramuros",
+        "number": "2",
+        "floor_etc": "Pl Bajo L Esc. U Nica",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "301879270",
+        "notes": "Mismo destino que zeleris_04 (Hotel Arena House). ESPECIAL. Foto enviada 11:58."
+      }
+    ],
+    "miguel_test_16may": "pendiente_test_post_fix",
+    "notes": "Etiqueta rotada 90° (texto vertical, lado izquierdo del paquete). Paquete sobre cajas de Zeleris (logo verde con puntos). DUP de zeleris_04 — útil para test de dedup."
+  }
+]
