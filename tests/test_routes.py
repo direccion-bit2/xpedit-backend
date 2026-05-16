@@ -191,11 +191,19 @@ class TestGeocodeEndpoint:
 
     @pytest.mark.asyncio
     async def test_geocode_success(self, client):
-        """Successful geocoding should return lat/lng."""
+        """Successful geocoding via Google → returns lat/lng + place_id + location_type."""
         mock_response = MagicMock()
-        mock_response.json.return_value = [
-            {"lat": "40.416775", "lon": "-3.703790", "display_name": "Madrid, Spain"}
-        ]
+        mock_response.json.return_value = {
+            "status": "OK",
+            "results": [{
+                "geometry": {
+                    "location": {"lat": 40.416775, "lng": -3.703790},
+                    "location_type": "ROOFTOP",
+                },
+                "formatted_address": "Puerta del Sol, 28013 Madrid, Spain",
+                "place_id": "ChIJSomePlaceId",
+            }],
+        }
         mock_response.status_code = 200
 
         mock_http_client = AsyncMock()
@@ -203,16 +211,51 @@ class TestGeocodeEndpoint:
         mock_http_client.__aenter__.return_value = mock_http_client
         mock_http_client.__aexit__.return_value = False
 
-        with patch("main.httpx.AsyncClient", return_value=mock_http_client):
+        with patch("main.httpx.AsyncClient", return_value=mock_http_client), \
+             patch("main.GOOGLE_API_KEY", "fake-key"):
             response = await client.post("/geocode", json={
-                "address": "Puerta del Sol, Madrid"
+                "address": "Puerta del Sol, Madrid",
+                "country": "ES",
             })
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert "lat" in data
-        assert "lng" in data
+        assert data["lat"] == 40.416775
+        assert data["lng"] == -3.703790
+        assert data["place_id"] == "ChIJSomePlaceId"
+        assert data["location_type"] == "ROOFTOP"
+        # Verify country biases the request
+        call_params = mock_http_client.get.call_args.kwargs["params"]
+        assert call_params["components"] == "country:ES"
+        assert call_params["region"] == "es"
+
+    @pytest.mark.asyncio
+    async def test_geocode_zero_results(self, client):
+        """When Google returns ZERO_RESULTS, surface a 200 with success=False."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "ZERO_RESULTS", "results": []}
+        mock_response.status_code = 200
+
+        mock_http_client = AsyncMock()
+        mock_http_client.get.return_value = mock_response
+        mock_http_client.__aenter__.return_value = mock_http_client
+        mock_http_client.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http_client), \
+             patch("main.GOOGLE_API_KEY", "fake-key"):
+            response = await client.post("/geocode", json={"address": "asdfghjkl qwerty"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is False
+        assert "no encontrada" in body["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_geocode_no_api_key_returns_503(self, client):
+        with patch("main.GOOGLE_API_KEY", ""):
+            response = await client.post("/geocode", json={"address": "Calle Mayor 1"})
+        assert response.status_code == 503
 
     @pytest.mark.asyncio
     async def test_geocode_address_too_short(self, client):

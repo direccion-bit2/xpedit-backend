@@ -97,8 +97,11 @@ else:
     logger.warning("SENTRY_DSN not configured — backend errors will NOT be reported")
 
 from emails import (
+    ACTIVE_FREE_PRO_INVITE_SUBJECT,
     TRIAL_EXPIRING_D1_SUBJECT,
     TRIAL_EXPIRING_D3_SUBJECT,
+    TRIAL_VALUE_RECAP_SUBJECT,
+    send_active_free_pro_invite_email,
     send_alert_email,
     send_broadcast_email,
     send_custom_email,
@@ -117,6 +120,7 @@ from emails import (
     send_trial_expiring_email,
     send_trial_feedback_email,
     send_trial_last_day_email,
+    send_trial_value_recap_email,
     send_upcoming_email,
     send_welcome_email,
 )
@@ -702,6 +706,137 @@ def check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60)
         raise HTTPException(status_code=429, detail="Demasiadas solicitudes. Inténtalo en unos minutos.")
     _rate_limits[key].append(now)
 
+
+# Daily OCR image quota per user/tier.
+# IMPORTANT: this counts IMAGES, not requests. Day 12 may 2026 the MSI client
+# was changed to chunk a 10-image import into 4 serial /ocr/screenshots-batch
+# requests (3+3+3+1) to avoid gateway timeouts. A per-request limit would
+# have shrunk the effective daily quota 4× without anyone noticing.
+# Same bucket is shared by /ocr/label (label scan, 1 img/req) and
+# /ocr/screenshots-batch (MSI, 1-3 img/req post-chunking) so an abuser can't
+# bypass the limit by mixing endpoints. Limit is per driver_id (not IP) so
+# device changes don't reset the quota either.
+_OCR_DAILY_IMG_QUOTA = {
+    # Limits set by Miguel 12 may 2026 14:29 CEST. Rationale: cost per
+    # image ~$0.01 (Gemini + Geocoding). We don't size for worst-case
+    # where every user maxes out every day; average use is much lower
+    # and the heavy outlier is acceptable to lose money on as long as
+    # the P50 stays profitable. If demand grows past sustainable, we
+    # revisit pricing (either raise plan price or move MSI to an
+    # add-on).  yearly users get the same daily quota as monthly —
+    # Miguel: "ten en cuenta que no todos van a usar esa función
+    # entonces no es realista calcular como si todos gastaran al
+    # tope".
+    "free": 0,         # Locked. Free users see the paywall.
+    "trial": 30,       # 7-day trial: enough to feel the value.
+    "pro": 20,         # /ocr/label only — MSI is Pro+ gated upstream.
+    "pro_yearly": 20,  # Same as monthly intentionally.
+    "pro_plus": 50,
+    # `_verify_msi_access` returns 'pro_yearly' for any sub_period='yearly',
+    # so a Pro+ yearly user also resolves to 'pro_yearly' here. That keeps
+    # yearly users at 20/day across the board, which protects the lower
+    # price-per-month of the yearly plan.
+}
+_OCR_QUOTA_WINDOW = 86400  # 24h rolling window.
+
+# Internal testing accounts get unlimited daily quota while we iterate on
+# MSI. Miguel staging + Miguel prod direccion@taespack. These are NOT
+# customer accounts, they're the ones we use to smoke-test every OTA.
+# Update this list when adding/removing dev devices, never expose it.
+# IMPORTANT: include BOTH `drivers.id` AND `auth.users.id` for each account.
+# When _resolve_user_tier fails for any reason, the code falls back to
+# auth_user_id as the quota_key — so if only one of the two is in the set,
+# bypass silently stops working in that failure path.
+_OCR_QUOTA_TESTING_BYPASS = frozenset({
+    # staging@xpedit.es (Miguel DEV staging)
+    "9922cc2e-d88d-4e58-a5f5-8b3d7ca52e40",  # drivers.id
+    "8f852b60-25a2-4180-a66f-8947a9325945",  # auth.users.id
+    # direccion@taespack.com (Miguel prod)
+    "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # drivers.id
+    "fe94de32-7f04-4f4f-83fc-b4264eedeaaa",  # auth.users.id
+})
+
+def get_ocr_quota_status(driver_id: str, tier: str) -> dict:
+    """Returns the current OCR daily-image quota state for a driver.
+    Used by GET /ocr/quota so the app can pre-check before sending a
+    batch (Miguel report 12 may 15:13: bad UX when the limit alert
+    fires AFTER the last image is processed). `used` and `remaining`
+    refer to the current rolling 24h window."""
+    if driver_id in _OCR_QUOTA_TESTING_BYPASS:
+        return {"tier": tier, "used": 0, "limit": 9999, "remaining": 9999, "testing_bypass": True}
+    now = time.time()
+    key = f"ocr_imgs:{driver_id}:daily"
+    used = len([t for t in _rate_limits.get(key, []) if t > now - _OCR_QUOTA_WINDOW])
+    limit = _OCR_DAILY_IMG_QUOTA.get(tier, _OCR_DAILY_IMG_QUOTA["free"])
+    return {
+        "tier": tier,
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "testing_bypass": False,
+    }
+
+
+def check_ocr_image_quota(driver_id: str, tier: str, n_images: int):
+    """Enforce a per-driver, per-day OCR image quota. Counts IMAGES, not requests.
+    Raises 429 if accepting the new images would push the user over their tier's
+    daily limit. Adds one timestamp per image so the rolling window math stays
+    cheap (linear in current usage). Testing accounts bypass the gate."""
+    if n_images <= 0:
+        return
+    if driver_id in _OCR_QUOTA_TESTING_BYPASS:
+        return
+    now = time.time()
+    key = f"ocr_imgs:{driver_id}:daily"
+    max_imgs = _OCR_DAILY_IMG_QUOTA.get(tier, _OCR_DAILY_IMG_QUOTA["free"])
+    _rate_limits[key] = [t for t in _rate_limits[key] if t > now - _OCR_QUOTA_WINDOW]
+    if len(_rate_limits[key]) + n_images > max_imgs:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "daily_image_quota_exceeded",
+                "message": f"Límite diario alcanzado ({max_imgs} imágenes/día). Vuelve a probar mañana.",
+                "tier": tier,
+                "used": len(_rate_limits[key]),
+                "limit": max_imgs,
+            },
+        )
+    for _ in range(n_images):
+        _rate_limits[key].append(now)
+
+
+def _resolve_user_tier(auth_user_id: str) -> tuple[str, Optional[str]]:
+    """Returns (tier, driver_id). Tier ∈ {'free','trial','pro','pro_yearly','pro_plus'}.
+    Used for OCR quota enforcement on endpoints that don't require Pro+ gating
+    (like /ocr/label, which free users can still hit a few times per day)."""
+    try:
+        d = supabase.table("drivers").select(
+            "id, promo_plan, promo_plan_expires_at, subscription_source, subscription_period"
+        ).eq("user_id", auth_user_id).single().execute()
+        row = d.data or {}
+    except Exception:
+        return "free", None
+    driver_id = row.get("id")
+    promo = row.get("promo_plan")
+    expires_raw = row.get("promo_plan_expires_at")
+    sub_src = row.get("subscription_source")
+    sub_period = row.get("subscription_period")
+    if promo == "pro_plus" and sub_src in ("stripe", "revenuecat"):
+        return "pro_plus", driver_id
+    if sub_period == "yearly":
+        return "pro_yearly", driver_id
+    if promo == "pro" and sub_src in ("stripe", "revenuecat"):
+        return "pro", driver_id
+    # Trial: promo='pro'|'pro_plus' AND no paid subscription AND expires_at in future
+    if promo in ("pro", "pro_plus") and sub_src is None and expires_raw:
+        try:
+            expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+            if expires_at > datetime.now(timezone.utc):
+                return "trial", driver_id
+        except (ValueError, AttributeError):
+            pass
+    return "free", driver_id
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     """Apply rate limiting to sensitive endpoints"""
@@ -721,7 +856,14 @@ async def rate_limit_middleware(request: Request, call_next):
         elif path.startswith("/email"):
             check_rate_limit(f"email:{client_ip}", max_requests=20, window_seconds=60)
         elif path.startswith("/ocr"):
-            check_rate_limit(f"ocr:{client_ip}", max_requests=5, window_seconds=60)
+            # 5/min was set when /ocr only had /ocr/label (1 photo per
+            # request). Now MSI fires up to 10 parallel /ocr/screenshots-batch
+            # calls (one per photo with concurrency=4) so 5/min trips after
+            # the first chunk wave. Per-user daily quota
+            # (check_ocr_image_quota) is the real spend gate; this
+            # middleware limit is just abuse-prevention. Bump it to a
+            # number that comfortably fits a normal 10-photo import.
+            check_rate_limit(f"ocr:{client_ip}", max_requests=60, window_seconds=60)
         elif path.startswith("/location"):
             check_rate_limit(f"location:{client_ip}", max_requests=60, window_seconds=60)
         elif path.startswith("/routes"):
@@ -807,6 +949,7 @@ class AssignDriversRequest(BaseModel):
 
 class GeocodeRequest(BaseModel):
     address: str = Field(..., min_length=3)
+    country: str | None = None  # ISO-2 (ES, MX, AR…) — biases search and adds components filter
 
 
 class StopCreate(BaseModel):
@@ -1245,27 +1388,56 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
 
 @app.post("/geocode", tags=["optimize"], summary="Geocodificar dirección")
 async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
-    """Convierte una dirección de texto en coordenadas (lat/lng) usando Nominatim."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
+    """Convierte una dirección de texto en coordenadas (lat/lng) usando Google Geocoding API.
+
+    Maneja business names (farmacias, hoteles), direcciones con sufijos raros
+    y CPs parciales mucho mejor que Nominatim. Acepta `country` ISO-2 opcional
+    para sesgar resultados al país del driver.
+    """
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Geocoding service not configured")
+
+    params = {
+        "address": request.address,
+        "language": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    if request.country:
+        cc = request.country.strip().upper()
+        if cc:
+            params["region"] = cc.lower()
+            params["components"] = f"country:{cc}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": request.address, "format": "json", "limit": 1},
-                headers={"User-Agent": "Xpedit/1.0"},
-                timeout=10.0
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params=params,
+                timeout=10.0,
             )
             data = response.json()
-            if not data:
-                return {"success": False, "error": "Dirección no encontrada"}
-            return {
-                "success": True,
-                "lat": float(data[0]["lat"]),
-                "lng": float(data[0]["lon"]),
-                "display_name": data[0]["display_name"]
-            }
-        except Exception as e:
-            logger.error(f"Geocode error: {e}")
-            raise HTTPException(status_code=500, detail="Error interno del servidor")
+    except Exception as e:
+        logger.error(f"Geocode error: {e}")
+        raise HTTPException(status_code=502, detail="Geocoding service error")
+
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return {"success": False, "error": "Dirección no encontrada"}
+    if status != "OK" or not data.get("results"):
+        logger.warning(f"Geocode returned status={status} for '{request.address[:80]}'")
+        return {"success": False, "error": "Dirección no encontrada"}
+
+    r = data["results"][0]
+    geom = r.get("geometry", {}) or {}
+    loc = geom.get("location", {}) or {}
+    return {
+        "success": True,
+        "lat": loc.get("lat"),
+        "lng": loc.get("lng"),
+        "display_name": r.get("formatted_address", ""),
+        "place_id": r.get("place_id", ""),
+        "location_type": geom.get("location_type", ""),
+    }
 
 
 # === ENDPOINTS AVANZADOS DE OPTIMIZACIÓN ===
@@ -4592,6 +4764,9 @@ async def get_company_subscription(company_id: str, user=Depends(get_current_use
 # `{success, content}` where `content` is a JSON string. The `data` field is
 # new (parsed dict, same content) so newer clients can skip the JSON.parse.
 
+# Modelo gemini-2.5-pro (no Flash) tras incidente 14 may PYTHON-FASTAPI-K
+# donde Flash truncaba JSON con response_schema enforced. Ver memoria
+# feedback_gemini_pro_for_ocr.md.
 _OCR_LABEL_MODEL = "gemini-2.5-pro"
 
 _OCR_LABEL_PROMPT = """Esta es una foto de una etiqueta de envío de paquetería (iMile, Shein, etc.).
@@ -4622,15 +4797,25 @@ _OCR_LABEL_SCHEMA = {
 class OCRLabelRequest(BaseModel):
     image_base64: str = Field(..., max_length=10_000_000)  # ~7.5MB max image
     media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/jpeg"
+    # When True the request authorizes the backend to keep the image + the
+    # model/user pair in `ocr_corrections` for OCR improvement (Day-2
+    # learning loop). Default False = no capture, no storage. The app shows
+    # the toggle in Settings and only forwards the True value when explicit
+    # consent has been recorded.
+    consent_to_training: bool = False
 
 
 def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
     """Synchronous Gemini call for label OCR. Wrap in asyncio.to_thread() from
     the async caller — google-genai SDK is blocking. Returns a dict that
-    matches `_OCR_LABEL_SCHEMA`. Raises HTTPException on Gemini errors."""
+    matches `_OCR_LABEL_SCHEMA`. Raises HTTPException on Gemini errors.
+
+    Uses Vertex AI (europe-west4) so the label image — which contains the
+    recipient's full name + address — never leaves the EU and falls under
+    the GCP DPA instead of AI Studio terms."""
     from google.genai import types
 
-    client = get_gemini_client()
+    client = get_gemini_vertex_client()
     if not client:
         raise HTTPException(status_code=503, detail="OCR service not configured")
 
@@ -4646,6 +4831,8 @@ def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
         response_mime_type="application/json",
         response_schema=_OCR_LABEL_SCHEMA,
         temperature=0.1,
+        # 1024 tokens (no 500) tras incidente 14 may donde Gemini Flash
+        # truncaba el JSON con direcciones largas. Mantenemos 1024 con Pro.
         max_output_tokens=1024,
     )
 
@@ -4662,34 +4849,1201 @@ def _ocr_label_with_gemini(image_base64: str, media_type: str) -> dict:
 
     text = (response.text or "").strip()
     if not text:
-        raise HTTPException(status_code=502, detail="Empty response from Gemini")
+        logger.warning("OCR Gemini returned empty text")
+        return {"name": "", "street": "", "city": "", "postalCode": "", "province": ""}
 
+    # Fast path: clean JSON straight from response_schema.
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"OCR Gemini returned invalid JSON: {e}; text[:200]={text[:200]}")
-        raise HTTPException(status_code=502, detail="Invalid JSON from Gemini")
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Tolerant fallback: Gemini occasionally wraps the JSON in ```json...```
+    # fences or prefixes a one-line apology. Strip those and try again.
+    cleaned = text
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```", 2)[1] if "```" in cleaned[3:] else cleaned[3:]
+        if cleaned.lstrip().lower().startswith("json"):
+            cleaned = cleaned.lstrip()[4:]
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Worst case: log to Sentry and return empty fields so the UI doesn't
+    # explode on a hard label. The app shows the user "couldn't read, try
+    # again" instead of a generic 502.
+    logger.error(f"OCR Gemini unparseable response, text[:300]={text[:300]}")
+    sentry_sdk.capture_message(
+        f"OCR Gemini unparseable response: {text[:200]}",
+        level="warning",
+    )
+    return {"name": "", "street": "", "city": "", "postalCode": "", "province": ""}
+
+
+@app.get("/ocr/quota", tags=["ocr"], summary="Current daily OCR image quota for this driver")
+async def ocr_quota(user=Depends(get_current_user)):
+    """Returns the caller's current OCR daily image quota state.
+    Used by the app to pre-check before sending a batch — without this
+    pre-check the limit alert fires AFTER the last image is processed
+    (which still costs Gemini money). Miguel report 12 may 15:13 CEST.
+    """
+    tier, driver_id = _resolve_user_tier(user["id"])
+    return get_ocr_quota_status(driver_id or user["id"], tier)
 
 
 @app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
 async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
     """Extrae datos de una etiqueta de envío (nombre, dirección, ciudad, CP,
-    provincia) con Gemini Vision. La API key se mantiene en el servidor."""
-    if not get_gemini_client():
+    provincia) con Gemini Vision. La API key se mantiene en el servidor.
+
+    If `consent_to_training` is true, the source image is uploaded to the
+    `ocr-training` bucket and an `ocr_corrections` row is created. The id
+    is returned as `correction_id` so the app can PATCH it later with the
+    user's accepted/edited answer.
+    """
+    if not get_gemini_vertex_client():
         raise HTTPException(status_code=503, detail="OCR service not configured")
 
+    # Per-user daily image quota, shared with /ocr/screenshots-batch. Free
+    # tier gets a handful of scans/day; trial and Pro+ get a much higher
+    # cap. Counts 1 image per call (this endpoint is single-image only).
+    tier, driver_id = _resolve_user_tier(user["id"])
+    quota_key = driver_id or user["id"]
+    check_ocr_image_quota(quota_key, tier, 1)
+
+    import time
+    t0 = time.perf_counter()
     try:
         data = await asyncio.to_thread(
             _ocr_label_with_gemini,
             request.image_base64,
             request.media_type,
         )
-        return {"success": True, "content": json.dumps(data, ensure_ascii=False), "data": data}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    correction_id: Optional[str] = None
+    if request.consent_to_training:
+        driver_id = _resolve_driver_id_from_user(user["id"])
+        if driver_id:
+            try:
+                image_bytes = base64.b64decode(request.image_base64)
+                storage_path = await asyncio.to_thread(
+                    _upload_ocr_image_sync, driver_id, image_bytes, request.media_type, "label_scan"
+                )
+            except Exception as e:
+                logger.warning(f"label_scan image decode/upload failed: {e}")
+                sentry_sdk.capture_exception(e)
+                storage_path = None
+            parts = data if isinstance(data, dict) else {}
+            # Compose a flat address string for fast diff/search later.
+            extracted_address = ", ".join(
+                p for p in [
+                    parts.get("street"), parts.get("city"),
+                    parts.get("postalCode"), parts.get("province"),
+                ] if p
+            ) or None
+            correction_id = await asyncio.to_thread(
+                _create_ocr_correction_row,
+                driver_id=driver_id,
+                source="label_scan",
+                image_storage_path=storage_path,
+                model_name=_OCR_LABEL_MODEL,
+                model_extracted_address=extracted_address,
+                model_extracted_parts=parts or None,
+                model_confidence=None,
+                carrier_hint=None,
+                country_iso=None,
+                model_latency_ms=latency_ms,
+                consent=True,
+            )
+
+    return {
+        "success": True,
+        "content": json.dumps(data, ensure_ascii=False),
+        "data": data,
+        "correction_id": correction_id,
+    }
+
+
+# === MULTI-SCREENSHOT IMPORTER (Pro+ killer feature) ===
+#
+# Driver sends 1-10 screenshots of their carrier app (CTT, MRW, Seur, GLS,
+# NACEX, Correos Express, …) or a generic stop list and we extract structured
+# stops with Gemini 2.5 Pro. Day 1 returns raw extraction; Day 2 will add
+# normalization + Google Geocoding with ES anchors.
+#
+# Gate: Pro+ paid OR Pro yearly OR active Pro trial. See _verify_msi_access.
+# Rate limit: 5 batches/day on trial, 50 batches/day on Pro+/yearly.
+
+_MSI_MAX_IMAGES = 10
+_MSI_MAX_IMAGE_B64 = 12_000_000  # ~9 MB per image post-base64
+_MSI_MODEL = "gemini-2.5-pro"
+
+
+class MSIScreenshotImage(BaseModel):
+    image_base64: str = Field(..., max_length=_MSI_MAX_IMAGE_B64)
+    media_type: Literal["image/jpeg", "image/png", "image/webp"] = "image/jpeg"
+
+
+class MSIRouteContext(BaseModel):
+    depot_lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    depot_lng: Optional[float] = Field(default=None, ge=-180, le=180)
+    country: Optional[str] = Field(default=None, max_length=2)  # ISO-2
+    language: Optional[str] = Field(default="es", max_length=5)
+
+
+class MSIBatchRequest(BaseModel):
+    images: List[MSIScreenshotImage] = Field(..., min_length=1, max_length=_MSI_MAX_IMAGES)
+    carrier_hint: Optional[Literal[
+        "ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"
+    ]] = None
+    route_context: Optional[MSIRouteContext] = None
+    # Opt-in flag for the OCR learning loop. When True the backend uploads
+    # the screenshots to the `ocr-training` bucket and creates one row per
+    # extracted stop in `ocr_corrections`, returning correction_ids that
+    # the app uses to PATCH the user's final answer after review.
+    consent_to_training: bool = False
+
+
+def _verify_msi_access(auth_user_id: str) -> dict:
+    """Gate for /ocr/screenshots-batch. Returns {tier, is_eligible, trial_eligible}.
+
+    Eligible:
+      - Pro+ paid: promo_plan='pro_plus' AND subscription_source IN ('stripe','revenuecat')
+      - Pro yearly: subscription_period='yearly' (treat as premium tier)
+      - Active trial: promo_plan='pro' AND promo_plan_expires_at > NOW()
+        AND subscription_source IS NULL  (i.e. not paid Pro monthly)
+
+    Pro paid monthly is NOT eligible — this is the Pro+ differentiator.
+
+    Raises HTTPException(403) if not eligible. The detail body always includes
+    `trial_eligible` so the app knows whether to show "Start trial" or
+    "Upgrade to Pro+" in the paywall.
+    """
+    try:
+        d = supabase.table("drivers").select(
+            "promo_plan, promo_plan_expires_at, subscription_source, subscription_period"
+        ).eq("user_id", auth_user_id).single().execute()
+        row = d.data or {}
+    except Exception as e:
+        logger.warning(f"MSI access check failed: {e}")
+        raise HTTPException(status_code=403, detail={"error": "verification_failed"})
+
+    promo = row.get("promo_plan")
+    expires_raw = row.get("promo_plan_expires_at")
+    sub_src = row.get("subscription_source")
+    sub_period = row.get("subscription_period")
+
+    is_pro_plus_paid = promo == "pro_plus" and sub_src in ("stripe", "revenuecat")
+    is_pro_yearly = sub_period == "yearly"
+
+    is_trial = False
+    if promo in ("pro", "pro_plus") and sub_src is None and expires_raw:
+        try:
+            expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+            is_trial = expires_at > datetime.now(timezone.utc)
+        except (ValueError, AttributeError):
+            is_trial = False
+
+    is_eligible = is_pro_plus_paid or is_pro_yearly or is_trial
+    tier = "pro_plus" if is_pro_plus_paid else ("pro_yearly" if is_pro_yearly else ("trial" if is_trial else "none"))
+
+    if not is_eligible:
+        # Trial-eligible if user has never used a trial or trial already expired
+        # (we offer extension via email/marketing flow). For now, true if no
+        # subscription at all and trial not currently active.
+        trial_eligible = sub_src is None and not is_trial
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "pro_plus_required",
+                "message": "El importador de pantallazos es exclusivo de Pro+. Activa la prueba o suscríbete.",
+                "trial_eligible": trial_eligible,
+            },
+        )
+
+    return {"tier": tier, "is_eligible": True, "trial_eligible": False}
+
+
+def _msi_gemini_response_schema() -> dict:
+    """JSON Schema (subset Google supports) for Gemini structured output."""
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "carrier_detected": {
+                "type": "STRING",
+                "description": "Detected carrier from app UI hints (logo, colors, layout). Use 'generic' if uncertain.",
+                "enum": ["ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"],
+            },
+            "language": {"type": "STRING", "description": "Detected language (ISO-639-1). Usually 'es'."},
+            "stops": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "raw_text": {"type": "STRING", "description": "Original text block from screenshot"},
+                        "name": {"type": "STRING", "description": "Recipient name if visible"},
+                        "street": {"type": "STRING", "description": "Street name only — NOT including floor/etc."},
+                        "number": {"type": "STRING", "description": "Street number (5, 5B, 5-7, s/n)"},
+                        "floor_etc": {"type": "STRING", "description": "Floor/portal/staircase: '4B', 'Esc 2', 'Pta 3'. Save for delivery instructions, NEVER send to geocoder."},
+                        "postal_code": {"type": "STRING", "description": "Spanish 5-digit postal code"},
+                        "city": {"type": "STRING", "description": "City / municipality"},
+                        "province": {"type": "STRING", "description": "Spanish province"},
+                        "phone": {"type": "STRING"},
+                        "tracking_number": {"type": "STRING", "description": "Carrier tracking ID if visible"},
+                        "notes": {"type": "STRING", "description": "Extra delivery instructions"},
+                        "confidence_per_field": {
+                            "type": "OBJECT",
+                            "description": "Per-field confidence 0..1. Lower if inferred from context.",
+                            "properties": {
+                                "street": {"type": "NUMBER"},
+                                "number": {"type": "NUMBER"},
+                                "city": {"type": "NUMBER"},
+                                "postal_code": {"type": "NUMBER"},
+                                "province": {"type": "NUMBER"},
+                            },
+                        },
+                        "source_image_idx": {"type": "INTEGER", "description": "0-based index of the source image in the batch"},
+                        "context_inferred_fields": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "Field names that were inferred from sibling stops, not explicitly visible.",
+                        },
+                    },
+                    "required": ["street", "source_image_idx", "confidence_per_field"],
+                },
+            },
+            "global_inference_notes": {
+                "type": "STRING",
+                "description": "Free-form notes about overall extraction (e.g. 'all stops appear to be in Sevilla based on visible header').",
+            },
+        },
+        "required": ["carrier_detected", "stops"],
+    }
+
+
+def _msi_build_prompt(carrier_hint: Optional[str], route_context: Optional[MSIRouteContext]) -> str:
+    """Builds the system prompt for screenshot extraction. V1 will inject
+    per-carrier few-shot examples (TODO #256). Day 1 ships generic prompt."""
+    carrier_line = ""
+    if carrier_hint and carrier_hint != "generic":
+        carrier_line = f"\nEl usuario indica que las pantallas son de la app del courier: {carrier_hint.upper()}. Usa ese contexto para localizar campos."
+    else:
+        carrier_line = "\nDetecta el courier (CTT, MRW, Seur, GLS, NACEX, Correos Express, TIPSA) por logo, colores o disposición. Si no estás seguro, devuelve 'generic'."
+
+    ctx_line = ""
+    if route_context:
+        bits = []
+        if route_context.depot_lat and route_context.depot_lng:
+            bits.append(f"el depósito del repartidor está en lat={route_context.depot_lat}, lng={route_context.depot_lng}")
+        if route_context.country:
+            bits.append(f"país={route_context.country}")
+        if bits:
+            ctx_line = "\nContexto del repartidor: " + "; ".join(bits) + "."
+
+    return f"""Eres un extractor experto de listas de paradas de reparto desde pantallazos de apps de paquetería españolas.{carrier_line}{ctx_line}
+
+Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distintas posiciones) o listas distintas. Tu tarea:
+
+1. Detecta cada parada/envío único. Si la misma parada aparece en 2 imágenes (porque el usuario hizo scroll), inclúyela UNA sola vez (con `source_image_idx` = la imagen donde se ve más completa).
+2. Extrae los campos: name (destinatario), street (solo nombre de calle), number (número), floor_etc (piso/escalera/portal/puerta — NUNCA juntar con street), postal_code (5 dígitos), city, province, phone, tracking_number, notes.
+3. Para cada campo extraído anota un `confidence_per_field` entre 0 y 1 (1 = totalmente legible y seguro).
+4. **Inferencia contextual**: si una parada no muestra ciudad/provincia pero el resto de la lista sí, infiere usándolas. Marca esos campos en `context_inferred_fields` y baja su confidence a ≤0.7. Si la mayoría de paradas son de Sevilla y una parada solo muestra calle, asume Sevilla con confidence 0.6 y anota.
+5. **NUNCA inventes**. Si no puedes leer un campo y NO hay contexto suficiente, deja el campo vacío (string vacía).
+6. Para `floor_etc` extrae expresiones como "4ºB", "Esc 2", "Pta 3", "Portal C", "1º derecha". Estas NUNCA van junto a la calle, van separadas para añadirlas a las notas del repartidor.
+7. Si una imagen no contiene una lista de paradas (foto random, captura no relacionada), simplemente no añadas paradas de ahí.
+8. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
+9. **Texto rotado**: las etiquetas físicas pueden estar rotadas 90° o 180° sobre el sobre. Lee la imagen mentalmente desde TODAS las orientaciones lógicas y busca la calle también verticalmente. Pista: si encuentras CP+ciudad pero NO calle, casi seguro la calle está rotada al lado del barcode o debajo del nombre del destinatario. Busca patrones tipo "Avda", "Av.", "Calle", "C/", "Plaza", "Pza", "Camino", "Rúa", "Carrer", "Cuesta", "Travesía", "Paseo", "Polígono" seguidos de número.
+10. **Nunca dejes street vacío** si la imagen tiene texto rotado que podría ser una calle. Prefiere extraer "Avda La Independencia 55" con confidence 0.7 antes que dejar street vacío.
+
+Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
+
+
+def _msi_extract_stops_with_gemini(
+    images: List[MSIScreenshotImage],
+    carrier_hint: Optional[str],
+    route_context: Optional[MSIRouteContext],
+) -> dict:
+    """Synchronous helper that calls Gemini 2.5 Pro with multimodal request +
+    structured response schema. Returns the parsed JSON dict. Wrap in
+    asyncio.to_thread() from async caller — google-genai SDK is blocking.
+
+    Uses Vertex AI (europe-west4) so the screenshots — which expose lists of
+    recipients with names and addresses — stay inside the EU and are
+    covered by the Google Cloud DPA, not the AI Studio terms."""
+    from google.genai import types
+
+    client = get_gemini_vertex_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="Gemini AI no configurado")
+
+    parts: list = [types.Part.from_text(text=_msi_build_prompt(carrier_hint, route_context))]
+    for idx, img in enumerate(images):
+        parts.append(types.Part.from_text(text=f"[Imagen #{idx}]"))
+        parts.append(
+            types.Part.from_bytes(
+                data=base64.b64decode(img.image_base64),
+                mime_type=img.media_type,
+            )
+        )
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=_msi_gemini_response_schema(),
+        temperature=0.1,
+        max_output_tokens=8192,
+    )
+
+    response = client.models.generate_content(
+        model=_MSI_MODEL,
+        contents=[types.Content(role="user", parts=parts)],
+        config=config,
+    )
+    text = (response.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="Empty response from Gemini")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"MSI Gemini returned invalid JSON: {e}; text[:200]={text[:200]}")
+        raise HTTPException(status_code=502, detail="Invalid JSON from Gemini")
+
+
+# --- Day 2: normalization, geocoding, confidence ---
+#
+# Gemini returns raw text fields. To make the stops actually usable we:
+#   1) Normalize each stop (clean fields, defensively re-split floor_etc from
+#      street if the model leaked it through).
+#   2) Geocode each stop with Google Geocoding using country:ES +
+#      postal_code anchor + (round 2) centroid bounds for stops that failed
+#      round 1.
+#   3) Compute a HIGH/MEDIUM/LOW confidence per stop combining extraction
+#      confidence, geocoder location_type, and presence of inferred fields.
+#   4) For LOW, fetch up to 3 autocomplete candidates so the user can pick.
+
+# Spanish 5-digit postal codes: first 2 digits → province. Static map (52
+# provinces inc. Ceuta/Melilla). Used as a defensive anchor when Gemini
+# extracts CP but no province (or wrong province).
+_MSI_CP_PROVINCE_MAP = {
+    "01": "Álava",         "02": "Albacete",      "03": "Alicante",
+    "04": "Almería",       "05": "Ávila",         "06": "Badajoz",
+    "07": "Baleares",      "08": "Barcelona",     "09": "Burgos",
+    "10": "Cáceres",       "11": "Cádiz",         "12": "Castellón",
+    "13": "Ciudad Real",   "14": "Córdoba",       "15": "A Coruña",
+    "16": "Cuenca",        "17": "Girona",        "18": "Granada",
+    "19": "Guadalajara",   "20": "Guipúzcoa",     "21": "Huelva",
+    "22": "Huesca",        "23": "Jaén",          "24": "León",
+    "25": "Lleida",        "26": "La Rioja",      "27": "Lugo",
+    "28": "Madrid",        "29": "Málaga",        "30": "Murcia",
+    "31": "Navarra",       "32": "Ourense",       "33": "Asturias",
+    "34": "Palencia",      "35": "Las Palmas",    "36": "Pontevedra",
+    "37": "Salamanca",     "38": "Santa Cruz de Tenerife",
+    "39": "Cantabria",     "40": "Segovia",       "41": "Sevilla",
+    "42": "Soria",         "43": "Tarragona",     "44": "Teruel",
+    "45": "Toledo",        "46": "Valencia",      "47": "Valladolid",
+    "48": "Vizcaya",       "49": "Zamora",        "50": "Zaragoza",
+    "51": "Ceuta",         "52": "Melilla",
+}
+
+# Regex patterns to detect floor/portal/staircase fragments that occasionally
+# leak into `street`. Word-bounded so they never match substrings inside a
+# longer word (e.g. "esc" must not match the "esc" inside "Desconocida").
+_MSI_FLOOR_RE = re.compile(
+    r"(?:,\s*|\s+)(?P<frag>"
+    r"(?:\bpiso\b|\bpta\b|\bpuerta\b|\besc\b|\bescalera\b|\bportal\b|\bbloque\b|\bblq\b|"
+    r"\d+\s*[ºªo]\s*[A-Za-zÀ-ÿ]?(?:\s+(?:izda|dcha|izquierda|derecha))?|"
+    r"\b\d+[A-Za-z]\b"
+    r")(?:[^,]*?))\s*$",
+    re.IGNORECASE,
+)
+
+# Detects whether a string contains a Spanish/LATAM street-type prefix.
+# Used to tell "Calle Real" (deliverable) from "San José del Valle"
+# (just a town the model misclassified into the street field). Covers
+# common ES forms + Catalan (Carrer) and Galician (Rúa). Word-boundary
+# escapes guard against false positives inside other words.
+_MSI_STREET_TYPE_RE = re.compile(
+    r"\b("
+    r"av(?:\.|enida)?|"
+    r"c\/|c\.|calle|"
+    r"plaza|pza|plza|"
+    r"camino|cami|"
+    r"carretera|ctra|crta|cra|"
+    r"traves(?:i|í)a|trav|"
+    r"paseo|p\.º|po|"
+    r"pol(?:\.|í|i)?gono|pol|pg|"
+    r"urbanizaci(?:o|ó)n|urb|"
+    r"r(?:ú|u)a|carrer|"
+    r"v(?:i|í)a|ronda|cuesta|"
+    r"callej(?:o|ó)n|"
+    r"gran\s+v(?:i|í)a|"
+    r"bulevar|bvar|blvd|"
+    r"glorieta|glta|"
+    r"rambla|"
+    r"cl|av\b"
+    r")\b\.?\s",
+    re.IGNORECASE,
+)
+
+
+def _msi_postal_code_to_province(cp: Optional[str]) -> Optional[str]:
+    """Map Spanish 5-digit postal code first 2 digits to province name."""
+    if not cp:
+        return None
+    digits = re.sub(r"\D", "", cp)
+    if len(digits) >= 2:
+        return _MSI_CP_PROVINCE_MAP.get(digits[:2])
+    return None
+
+
+def _msi_normalize_extracted_stop(stop: dict) -> dict:
+    """Defensive cleanup of one stop dict from Gemini. Returns mutated dict.
+
+    - Trim whitespace on string fields
+    - Reject garbage placeholders FIRST so they don't survive later steps
+    - Strip non-digits from postal_code, take first 5
+    - If `street` ends with a floor/portal fragment that Gemini missed,
+      move it to `floor_etc` so it never reaches the geocoder
+    - If province is missing but postal_code is valid Spanish CP, infer it
+    """
+    # Trim everything
+    for k in ("name", "street", "number", "floor_etc", "city",
+              "province", "phone", "tracking_number", "notes"):
+        if isinstance(stop.get(k), str):
+            stop[k] = stop[k].strip()
+
+    # Reject placeholder/garbage values BEFORE other transforms so they
+    # never reach the floor splitter or the geocoder.
+    GARBAGE = {
+        "DIRECCIÓN DESCONOCIDA", "DIRECCION DESCONOCIDA", "TBD", "S/I", "N/A",
+        "PENDIENTE", "—", "-", "?", "??", "DESCONOCIDA", "DESCONOCIDO",
+    }
+    for fld in ("street", "city", "province"):
+        v = (stop.get(fld) or "").upper().strip()
+        if v in GARBAGE:
+            stop[fld] = ""
+
+    # Postal code: keep only digits, take first 5
+    if stop.get("postal_code"):
+        digits = re.sub(r"\D", "", stop["postal_code"])
+        stop["postal_code"] = digits[:5] if len(digits) >= 5 else ""
+
+    # Defensive: re-split floor_etc from street if Gemini missed it
+    street = stop.get("street") or ""
+    if street and not stop.get("floor_etc"):
+        m = _MSI_FLOOR_RE.search(street)
+        if m:
+            frag = m.group("frag").strip(", ").strip()
+            # Only split when the fragment is plausibly a floor/portal — not
+            # the whole street (e.g. "4ºB" alone shouldn't replace "Mayor").
+            remaining = street[: m.start()].strip(" ,")
+            if remaining and len(remaining) >= 3:
+                stop["street"] = remaining
+                stop["floor_etc"] = frag
+
+    # Anchor province from CP if missing. Use direct dict access (not
+    # `setdefault(...) or []`) — when the existing list is empty it is
+    # falsy and `or` would shadow the real list with a fresh one,
+    # silently dropping the append.
+    if not stop.get("province"):
+        inferred = _msi_postal_code_to_province(stop.get("postal_code"))
+        if inferred:
+            stop["province"] = inferred
+            cif = stop.get("context_inferred_fields")
+            if not isinstance(cif, list):
+                cif = []
+                stop["context_inferred_fields"] = cif
+            if "province" not in cif:
+                cif.append("province")
+            cpf = stop.get("confidence_per_field")
+            if not isinstance(cpf, dict):
+                cpf = {}
+                stop["confidence_per_field"] = cpf
+            cpf["province"] = max(0.85, cpf.get("province", 0.0))
+
+    return stop
+
+
+def _msi_compute_centroid_bbox(coords: list) -> Optional[dict]:
+    """Given list of {lat, lng}, return a bounding box dict {ne_lat, ne_lng,
+    sw_lat, sw_lng} centered on the centroid with ~30 km padding. Returns
+    None if fewer than 2 valid coords (insufficient signal)."""
+    valid = [c for c in coords if c and c.get("lat") is not None and c.get("lng") is not None]
+    if len(valid) < 2:
+        return None
+    avg_lat = sum(c["lat"] for c in valid) / len(valid)
+    avg_lng = sum(c["lng"] for c in valid) / len(valid)
+    # ~30km bbox: 0.27° lat, 0.40° lng at lat=40
+    lat_pad = 0.27
+    lng_pad = 0.40 / max(math.cos(math.radians(avg_lat)), 1e-6)
+    return {
+        "sw_lat": avg_lat - lat_pad, "sw_lng": avg_lng - lng_pad,
+        "ne_lat": avg_lat + lat_pad, "ne_lng": avg_lng + lng_pad,
+    }
+
+
+async def _msi_geocode_one(
+    client: "httpx.AsyncClient",
+    stop: dict,
+    country: str = "ES",
+    bbox: Optional[dict] = None,
+) -> dict:
+    """Single async call to Google Geocoding for one stop.
+
+    Returns a dict augmenting the stop:
+      { lat, lng, formatted_address, location_type, place_id, status }
+    where status ∈ {"ok", "zero_results", "error"}.
+
+    NEVER includes floor_etc in the geocoded address — that's preserved
+    separately for the driver's delivery_instructions.
+    """
+    if not GOOGLE_API_KEY:
+        return {"status": "error", "error": "no_api_key"}
+
+    parts = []
+    if stop.get("street"):
+        parts.append(stop["street"])
+    if stop.get("number"):
+        parts.append(stop["number"])
+    if stop.get("city"):
+        parts.append(stop["city"])
+    if stop.get("province"):
+        parts.append(stop["province"])
+    address_query = ", ".join(p for p in parts if p)
+
+    if not address_query.strip():
+        return {"status": "zero_results"}
+
+    components_parts = [f"country:{country}"]
+    if stop.get("postal_code"):
+        components_parts.append(f"postal_code:{stop['postal_code']}")
+
+    params = {
+        "address": address_query,
+        "components": "|".join(components_parts),
+        "language": "es",
+        "region": "es",
+        "key": GOOGLE_API_KEY,
+    }
+    if bbox:
+        params["bounds"] = f"{bbox['sw_lat']},{bbox['sw_lng']}|{bbox['ne_lat']},{bbox['ne_lng']}"
+
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params=params,
+            timeout=10.0,
+        )
+        data = resp.json()
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:100]}
+
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return {"status": "zero_results"}
+    if status != "OK" or not data.get("results"):
+        return {"status": "error", "error": status or "unknown"}
+
+    r = data["results"][0]
+    geom = r.get("geometry", {})
+    return {
+        "status": "ok",
+        "lat": geom.get("location", {}).get("lat"),
+        "lng": geom.get("location", {}).get("lng"),
+        "formatted_address": r.get("formatted_address", ""),
+        "location_type": geom.get("location_type", ""),  # ROOFTOP|RANGE_INTERPOLATED|GEOMETRIC_CENTER|APPROXIMATE
+        "place_id": r.get("place_id", ""),
+    }
+
+
+def _msi_classify_confidence(stop: dict, geo: dict) -> str:
+    """Combine Gemini extraction confidence + Google location_type + inferred
+    fields → discrete bucket. Used to color the UI chip and decide whether to
+    auto-add or force user confirmation.
+
+    HIGH (≥0.85)  : ROOFTOP/RANGE_INTERPOLATED, no critical inferred fields,
+                    extraction confidence on street ≥ 0.85.
+    MEDIUM (0.60-0.85) : GEOMETRIC_CENTER with CP match, OR inferred city,
+                    OR slightly low extraction confidence.
+    LOW (<0.60)   : APPROXIMATE, geocoder failed, or low extraction confidence.
+    """
+    if geo.get("status") != "ok":
+        return "low"
+    location_type = geo.get("location_type", "")
+    cif = stop.get("context_inferred_fields") or []
+    cpf = stop.get("confidence_per_field") or {}
+    street_conf = cpf.get("street", 0.5)
+    city_conf = cpf.get("city", 0.5)
+
+    if location_type in ("ROOFTOP", "RANGE_INTERPOLATED"):
+        if street_conf >= 0.85 and "street" not in cif:
+            return "high"
+        return "medium"
+
+    if location_type == "GEOMETRIC_CENTER" and stop.get("postal_code"):
+        if street_conf >= 0.7 and city_conf >= 0.5:
+            return "medium"
+
+    return "low"
+
+
+async def _msi_get_candidates_for_stop(
+    client: "httpx.AsyncClient",
+    stop: dict,
+    bbox: Optional[dict] = None,
+    max_candidates: int = 3,
+) -> list:
+    """Last resort for LOW-confidence stops: hit Google Places Autocomplete
+    biased to the centroid bbox so the user can pick from real options.
+
+    Returns a list of {description, place_id} dicts (max `max_candidates`).
+    """
+    if not GOOGLE_API_KEY:
+        return []
+    query_bits = [stop.get("street") or "", stop.get("number") or "", stop.get("city") or ""]
+    query = " ".join(b for b in query_bits if b).strip()
+    if not query:
+        return []
+    params = {"input": query, "language": "es", "key": GOOGLE_API_KEY,
+              "components": "country:es"}
+    if bbox:
+        avg_lat = (bbox["sw_lat"] + bbox["ne_lat"]) / 2
+        avg_lng = (bbox["sw_lng"] + bbox["ne_lng"]) / 2
+        params["location"] = f"{avg_lat},{avg_lng}"
+        params["radius"] = "30000"
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+            params=params,
+            timeout=8.0,
+        )
+        data = resp.json()
+    except Exception:
+        return []
+    if data.get("status") != "OK":
+        return []
+    out = []
+    for p in (data.get("predictions") or [])[:max_candidates]:
+        out.append({"description": p.get("description", ""), "place_id": p.get("place_id", "")})
+    return out
+
+
+async def _msi_normalize_and_geocode(
+    stops_raw: list,
+    route_context: Optional[MSIRouteContext],
+) -> list:
+    """Full pipeline: normalize each stop, geocode in 2 rounds with anchors,
+    compute confidence, fetch candidates for LOW. Returns enriched stops list."""
+    country = (route_context.country if route_context and route_context.country else "ES").upper()
+
+    # Step 1: normalize all stops
+    stops = [_msi_normalize_extracted_stop(dict(s)) for s in stops_raw]
+
+    if not stops:
+        return []
+
+    client = google_maps_client()
+
+    # Step 2: round 1 — geocode all in parallel with country + CP anchors
+    round1_results = await asyncio.gather(
+        *[_msi_geocode_one(client, s, country=country) for s in stops],
+        return_exceptions=True,
+    )
+
+    coords_for_centroid = []
+    for s, geo in zip(stops, round1_results):
+        if isinstance(geo, dict) and geo.get("status") == "ok":
+            s["_geo"] = geo
+            coords_for_centroid.append({"lat": geo["lat"], "lng": geo["lng"]})
+        else:
+            s["_geo"] = {"status": (geo.get("status") if isinstance(geo, dict) else "error")}
+
+    bbox = _msi_compute_centroid_bbox(coords_for_centroid)
+
+    # Step 3: round 2 — re-geocode failures using centroid bbox bias
+    if bbox:
+        retry_indices = [i for i, s in enumerate(stops) if s["_geo"].get("status") != "ok"]
+        if retry_indices:
+            retry_results = await asyncio.gather(
+                *[_msi_geocode_one(client, stops[i], country=country, bbox=bbox)
+                  for i in retry_indices],
+                return_exceptions=True,
+            )
+            for i, geo in zip(retry_indices, retry_results):
+                if isinstance(geo, dict) and geo.get("status") == "ok":
+                    stops[i]["_geo"] = geo
+
+    # Step 4: classify confidence + fetch candidates for LOW in parallel
+    candidate_tasks = {}
+    for i, s in enumerate(stops):
+        s["confidence"] = _msi_classify_confidence(s, s["_geo"])
+        if s["confidence"] == "low":
+            candidate_tasks[i] = _msi_get_candidates_for_stop(client, s, bbox=bbox)
+    if candidate_tasks:
+        candidates_by_idx = await asyncio.gather(
+            *candidate_tasks.values(), return_exceptions=True
+        )
+        for idx, cands in zip(candidate_tasks.keys(), candidates_by_idx):
+            stops[idx]["candidates"] = cands if isinstance(cands, list) else []
+
+    # Step 5: shape output, drop internal _geo, expose flat fields the client expects
+    out = []
+    for s in stops:
+        geo = s.pop("_geo", {}) or {}
+
+        # A stop is "insufficient" if it doesn't carry a *deliverable*
+        # street. Two failure modes seen in the field:
+        #   1) street is literally empty → obviously empty.
+        #   2) street has text but it's a city/town name with no number
+        #      and no street-type prefix (e.g. Gemini puts "San José del
+        #      Valle" in street because the label only has CP+town). The
+        #      driver still can't deliver — there's no calle.
+        # We accept a street only if it has a digit (likely number) OR a
+        # recognised street-type word (Avda, C/, Plaza, Camino, …). Any
+        # other case is treated as empty and the row goes red.
+        street_text = (s.get("street") or "").strip()
+        has_digit = bool(re.search(r"\d", street_text))
+        has_street_type = bool(_MSI_STREET_TYPE_RE.search(street_text))
+        is_empty = not street_text or (not has_digit and not has_street_type)
+
+        if is_empty:
+            flat_address = ""
+        else:
+            flat_address_parts = [
+                s.get("street") or "",
+                (s.get("number") or "").strip(),
+            ]
+            flat_address = " ".join(p for p in flat_address_parts if p).strip()
+            if s.get("postal_code"):
+                flat_address = f"{flat_address}, {s['postal_code']}".strip(", ")
+            if s.get("city"):
+                flat_address = f"{flat_address} {s['city']}".strip()
+
+        s["coords"] = (
+            {"lat": geo["lat"], "lng": geo["lng"]} if geo.get("status") == "ok" else None
+        )
+        s["formatted_address"] = "" if is_empty else (geo.get("formatted_address") or flat_address)
+        s["place_id"] = geo.get("place_id", "")
+        s["delivery_instructions"] = (s.get("floor_etc") or "").strip()
+        s["geocoding_status"] = "empty_extraction" if is_empty else geo.get("status", "error")
+        s["is_empty_extraction"] = is_empty
+        if is_empty:
+            # Force confidence to low so the UI surfaces the row in red
+            # and keeps the driver from blindly clicking through.
+            s["confidence"] = "low"
+        s.setdefault("candidates", [])
+        out.append(s)
+
+    return out
+
+
+@app.post(
+    "/ocr/screenshots-batch",
+    tags=["ocr", "msi"],
+    summary="Importar paradas desde 1-10 pantallazos (Pro+ feature)",
+)
+async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_user)):
+    """Multi-Screenshot Importer: extract stops from a batch of carrier-app
+    screenshots using Gemini 2.5 Pro, then normalize and geocode them.
+
+    Pipeline:
+      1. Verify Pro+/yearly/trial eligibility
+      2. Per-tier daily quota (5 trial, 50 Pro+)
+      3. Gemini multi-image extraction with structured output
+      4. Normalize each stop (split floor_etc, infer province from CP, scrub)
+      5. Geocode round 1 with country:ES + CP anchors (parallel)
+      6. Compute centroid bbox; re-geocode failures (round 2) with bounds bias
+      7. Classify confidence HIGH/MEDIUM/LOW
+      8. For LOW, fetch up to 3 autocomplete candidates so user can pick
+
+    Gate: Pro+ paid OR Pro yearly OR active Pro trial. Pro paid monthly is NOT
+    eligible (this is the Pro+ differentiator).
+
+    Rate limit: 5 batches/day on trial, 50 batches/day on Pro+/yearly.
+    """
+    import time
+
+    auth_user_id = user["id"]
+    eligibility = _verify_msi_access(auth_user_id)  # raises 403 if not eligible
+    tier = eligibility["tier"]
+
+    # Daily IMAGE quota — counts photos, not requests, so the client-side
+    # chunking from 10 imgs into 4 requests doesn't accidentally shrink the
+    # effective limit. Bucket is shared with /ocr/label so a user can't
+    # bypass MSI quota by spamming single-image label scans.
+    _, driver_id = _resolve_user_tier(auth_user_id)
+    quota_key = driver_id or auth_user_id
+    check_ocr_image_quota(quota_key, tier, len(req.images))
+
+    t_start = time.perf_counter()
+    try:
+        gemini_result = await asyncio.to_thread(
+            _msi_extract_stops_with_gemini, req.images, req.carrier_hint, req.route_context
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MSI extraction failed: {type(e).__name__}: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=502, detail="Extraction failed")
+
+    extraction_ms = int((time.perf_counter() - t_start) * 1000)
+    raw_stops = gemini_result.get("stops") or []
+
+    # Guarantee one row per source image. If Gemini didn't return any stop
+    # for image `i`, inject an empty placeholder so the driver can still see
+    # that image in the review sheet and type the address by hand. Those
+    # corrections are the highest-value training signal — the model
+    # otherwise never sees its own worst cases.
+    seen_image_idxs: set[int] = set()
+    for s in raw_stops:
+        if not isinstance(s, dict):
+            continue
+        idx = s.get("source_image_idx")
+        if isinstance(idx, int):
+            seen_image_idxs.add(idx)
+    for idx in range(len(req.images)):
+        if idx in seen_image_idxs:
+            continue
+        raw_stops.append({
+            "source_image_idx": idx,
+            "street": "",
+            "number": "",
+            "floor_etc": "",
+            "postal_code": "",
+            "city": "",
+            "province": "",
+            "name": "",
+            "raw_text": "",
+            "confidence_per_field": {},
+            "context_inferred_fields": [],
+        })
+
+    # Day 2 pipeline: normalize + geocode + confidence + candidates
+    t_pipe = time.perf_counter()
+    enriched_stops = await _msi_normalize_and_geocode(raw_stops, req.route_context)
+    pipeline_ms = int((time.perf_counter() - t_pipe) * 1000)
+
+    # Stats for observability
+    by_conf = {"high": 0, "medium": 0, "low": 0}
+    for s in enriched_stops:
+        by_conf[s.get("confidence", "low")] = by_conf.get(s.get("confidence", "low"), 0) + 1
+
+    # OCR learning loop (Day 2). If the driver opted in, upload EVERY
+    # screenshot once and create one ocr_corrections row per stop in the
+    # response (including empty-extraction placeholders). Each row points
+    # to the storage path of its source image via `source_image_idx`, so
+    # when the driver later fills in a missing address that signal lands
+    # next to the exact image the model failed on.
+    correction_ids: List[Optional[str]] = [None] * len(enriched_stops)
+    if req.consent_to_training and enriched_stops:
+        driver_id = _resolve_driver_id_from_user(auth_user_id)
+        if driver_id:
+            # Upload every image once, in parallel. Path indexed by image idx.
+            async def _upload_idx(idx: int, img: MSIScreenshotImage) -> tuple[int, Optional[str]]:
+                try:
+                    raw = base64.b64decode(img.image_base64)
+                except Exception as e:
+                    logger.warning(f"msi image[{idx}] decode failed: {e}")
+                    sentry_sdk.capture_exception(e)
+                    return idx, None
+                path = await asyncio.to_thread(
+                    _upload_ocr_image_sync, driver_id, raw, img.media_type, "msi",
+                )
+                return idx, path
+
+            upload_results = await asyncio.gather(
+                *[_upload_idx(i, img) for i, img in enumerate(req.images)],
+                return_exceptions=True,
+            )
+            paths_by_idx: dict[int, Optional[str]] = {}
+            for r in upload_results:
+                if isinstance(r, tuple):
+                    paths_by_idx[r[0]] = r[1]
+
+            carrier_detected = gemini_result.get("carrier_detected")
+            country = (req.route_context.country if req.route_context else None) or "ES"
+            for i, stop in enumerate(enriched_stops):
+                src_idx = stop.get("source_image_idx")
+                storage_path = paths_by_idx.get(src_idx) if isinstance(src_idx, int) else None
+                cid = await asyncio.to_thread(
+                    _create_ocr_correction_row,
+                    driver_id=driver_id,
+                    source="msi",
+                    image_storage_path=storage_path,
+                    model_name=_MSI_MODEL,
+                    model_extracted_address=stop.get("address") or stop.get("street"),
+                    model_extracted_parts={k: stop.get(k) for k in (
+                        "name", "street", "city", "postalCode", "province", "floor_etc",
+                    ) if stop.get(k) is not None},
+                    model_confidence=float(stop.get("extraction_confidence")) if stop.get("extraction_confidence") is not None else None,
+                    carrier_hint=req.carrier_hint or carrier_detected,
+                    country_iso=country,
+                    model_latency_ms=extraction_ms if i == 0 else None,
+                    consent=True,
+                )
+                correction_ids[i] = cid
+                # Mirror the id on the response stop so the app can keep the
+                # association without zipping arrays.
+                if cid:
+                    stop["correction_id"] = cid
+
+    if SENTRY_DSN:
+        sentry_sdk.add_breadcrumb(
+            category="msi",
+            message="screenshots-batch processed",
+            level="info",
+            data={
+                "n_images": len(req.images),
+                "n_stops": len(enriched_stops),
+                "carrier_detected": gemini_result.get("carrier_detected"),
+                "carrier_hint": req.carrier_hint,
+                "tier": tier,
+                "extraction_ms": extraction_ms,
+                "pipeline_ms": pipeline_ms,
+                "n_high": by_conf["high"],
+                "n_medium": by_conf["medium"],
+                "n_low": by_conf["low"],
+            },
+        )
+
+    return {
+        "success": True,
+        "carrier_detected": gemini_result.get("carrier_detected", "generic"),
+        "language": gemini_result.get("language", "es"),
+        "stops_count": len(enriched_stops),
+        "stops": enriched_stops,
+        "correction_ids": correction_ids,
+        "global_inference_notes": gemini_result.get("global_inference_notes", ""),
+        "confidence_summary": by_conf,
+        "extraction_ms": extraction_ms,
+        "pipeline_ms": pipeline_ms,
+        "processing_ms": extraction_ms + pipeline_ms,
+        "model": _MSI_MODEL,
+        "tier": tier,
+    }
+
+
+# === OCR LEARNING LOOP (Day 2) ===
+#
+# When the driver opts in to "ayúdame a mejorar Xpedit", each call to
+# /ocr/label or /ocr/screenshots-batch uploads the source image to the
+# `ocr-training` bucket and inserts one row per extracted stop in
+# `ocr_corrections`. The app then PATCHes each row with the driver's
+# accepted/edited address. Admin reviews diffs in /admin/ocr-corrections
+# and promotes the best pairs to is_golden_example=TRUE.
+#
+# No consent  → no upload, no row, no learning. Strict opt-in.
+# Vertex AI processes the image either way (extraction needs it), but
+# the data is not retained past the request unless consent is given.
+
+_OCR_BUCKET = "ocr-training"
+_OCR_EXT_BY_MIME = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def _resolve_driver_id_from_user(auth_user_id: str) -> Optional[str]:
+    """Map an auth.users.id to the corresponding drivers.id. Returns None
+    if the user has no driver row. Used by OCR endpoints that need to write
+    `ocr_corrections.driver_id` (FK to drivers, not auth users)."""
+    try:
+        res = (
+            supabase.table("drivers")
+            .select("id")
+            .eq("user_id", auth_user_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["id"]
+    except Exception as e:
+        logger.error(f"driver lookup failed for user {auth_user_id}: {e}")
+        sentry_sdk.capture_exception(e)
+    return None
+
+
+def _upload_ocr_image_sync(
+    driver_id: str, image_bytes: bytes, media_type: str, source: str
+) -> Optional[str]:
+    """Upload an OCR source image to the `ocr-training` bucket. Returns the
+    storage path on success, None on failure. Synchronous because the
+    supabase Storage SDK is blocking — call via asyncio.to_thread().
+
+    Path layout: {driver_id}/{source}/{uuid4}.{ext}
+      - driver_id at top so RLS policies can scope reads cheaply
+      - source tags the originating endpoint (msi / label_scan)
+      - uuid4 avoids collisions across concurrent requests
+    """
+    ext = _OCR_EXT_BY_MIME.get(media_type, "bin")
+    path = f"{driver_id}/{source}/{uuid_mod.uuid4().hex}.{ext}"
+    try:
+        supabase.storage.from_(_OCR_BUCKET).upload(
+            path,
+            image_bytes,
+            {"content-type": media_type, "upsert": "false"},
+        )
+        return path
+    except Exception as e:
+        logger.warning(f"OCR image upload failed (path={path}): {e}")
+        sentry_sdk.capture_exception(e)
+        return None
+
+
+def _create_ocr_correction_row(
+    *,
+    driver_id: str,
+    source: str,
+    image_storage_path: Optional[str],
+    model_name: str,
+    model_extracted_address: Optional[str],
+    model_extracted_parts: Optional[dict],
+    model_confidence: Optional[float],
+    carrier_hint: Optional[str],
+    country_iso: Optional[str],
+    model_latency_ms: Optional[int],
+    consent: bool,
+    app_version: Optional[str] = None,
+) -> Optional[str]:
+    """Insert a row in `ocr_corrections` describing the model's output for
+    a single extracted stop. Returns the row id, or None if the insert
+    failed. Best-effort: a failure here MUST NOT break the OCR response —
+    the user still gets their addresses, we just lose one training sample.
+    """
+    row = {
+        "driver_id": driver_id,
+        "source": source,
+        "image_storage_path": image_storage_path,
+        "model_name": model_name,
+        "prompt_version": "v1",
+        "model_extracted_address": model_extracted_address,
+        "model_extracted_parts": model_extracted_parts,
+        "model_confidence": model_confidence,
+        "model_latency_ms": model_latency_ms,
+        "carrier_hint": carrier_hint,
+        "country_iso": country_iso,
+        "user_action": "pending",
+        "user_consented_training": consent,
+        "consent_version": "v1" if consent else None,
+        "redaction_status": "pending" if image_storage_path else "not_required",
+        "app_version": app_version,
+    }
+    try:
+        res = supabase.table("ocr_corrections").insert(row).execute()
+        if res.data:
+            return res.data[0]["id"]
+    except Exception as e:
+        logger.warning(f"OCR correction row insert failed: {e}")
+        sentry_sdk.capture_exception(e)
+    return None
+
+
+class OCRCorrectionUpdate(BaseModel):
+    """Body for PATCH /ocr/corrections/{id}. The driver tells us what the
+    final, accepted answer was so we can compare it against what the model
+    produced and grow the training set."""
+    user_final_address: str = Field(..., max_length=500)
+    user_final_lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    user_final_lng: Optional[float] = Field(default=None, ge=-180, le=180)
+    user_action: Literal["accepted", "edited", "rejected"]
+    correction_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
+    corrected_fields: Optional[List[str]] = Field(default=None, max_length=20)
+
+
+@app.patch(
+    "/ocr/corrections/{correction_id}",
+    tags=["ocr"],
+    summary="Driver confirma/edita una extracción OCR (learning loop)",
+)
+async def update_ocr_correction(
+    correction_id: str,
+    body: OCRCorrectionUpdate,
+    user=Depends(get_current_user),
+):
+    """Driver-side endpoint to close the OCR learning loop. The app calls
+    this when the driver taps "Aceptar" or finishes editing an extracted
+    address. We compute `was_corrected` server-side by comparing the user
+    answer with the model output, regardless of what the client sent.
+
+    Auth: any logged-in driver. RLS already constrains drivers to their
+    own corrections, but we double-check here so a leaked id can't be
+    written by a different driver via service_role bypass.
+    """
+    check_rate_limit(f"ocr-corr-patch:{user['id']}", max_requests=120, window_seconds=60)
+
+    driver_id = _resolve_driver_id_from_user(user["id"])
+    if not driver_id:
+        raise HTTPException(status_code=403, detail="Driver profile not found")
+
+    try:
+        existing_res = (
+            supabase.table("ocr_corrections")
+            .select("id,driver_id,model_extracted_address,user_consented_training")
+            .eq("id", correction_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"OCR correction lookup failed: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Lookup failed")
+
+    if not existing_res.data:
+        raise HTTPException(status_code=404, detail="Correction not found")
+    existing = existing_res.data[0]
+    if existing["driver_id"] != driver_id:
+        # Ownership mismatch — never reveal whether the id exists.
+        raise HTTPException(status_code=404, detail="Correction not found")
+    if not existing.get("user_consented_training"):
+        # Row was created before consent flag flipped on, or row belongs to
+        # a non-consented batch. Refuse the update so we never silently
+        # retain a corrected pair without a recorded consent.
+        raise HTTPException(status_code=403, detail="Training consent not recorded for this correction")
+
+    model_addr = (existing.get("model_extracted_address") or "").strip()
+    user_addr = body.user_final_address.strip()
+    was_corrected = body.user_action == "edited" or (
+        body.user_action == "accepted" and model_addr.lower() != user_addr.lower()
+    )
+
+    update = {
+        "user_final_address": user_addr,
+        "user_final_lat": body.user_final_lat,
+        "user_final_lng": body.user_final_lng,
+        "user_action": body.user_action,
+        "user_action_at": datetime.now(timezone.utc).isoformat(),
+        "correction_seconds": body.correction_seconds,
+        "corrected_fields": body.corrected_fields or [],
+        "was_corrected": was_corrected,
+    }
+    try:
+        supabase.table("ocr_corrections").update(update).eq("id", correction_id).execute()
+    except Exception as e:
+        logger.error(f"OCR correction update failed: {e}")
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Update failed")
+
+    return {
+        "success": True,
+        "correction_id": correction_id,
+        "was_corrected": was_corrected,
+    }
 
 
 # === STRIPE CHECKOUT ===
@@ -6383,6 +7737,52 @@ def get_gemini_client():
         gemini_client = genai.Client(api_key=GOOGLE_AI_API_KEY)
     return gemini_client
 
+
+# === GEMINI VERTEX AI FOR OCR/MSI (personal data → EU region + DPA) ===
+# Used by /ocr/label and /ocr/screenshots-batch (MSI). The text social path
+# stays on AI Studio (no personal data, only marketing prompts).
+#
+# Auth: Application Default Credentials. In Railway set
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON  → JSON blob of service account key
+# (loaded into a tempfile at startup) or
+#   GOOGLE_APPLICATION_CREDENTIALS       → path to mounted key file.
+# Service account needs role "Vertex AI User" on project
+# trim-odyssey-465314-r2.
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "trim-odyssey-465314-r2")
+GCP_VERTEX_LOCATION = os.getenv("GCP_VERTEX_LOCATION", "europe-west4")
+gemini_vertex_client = None
+
+def get_gemini_vertex_client():
+    """Return a google-genai Client wired to Vertex AI (region
+    europe-west4). All processing of label/screenshot images for OCR/MSI
+    must go through this client so that personal data stays inside the EU
+    and is covered by the Google Cloud DPA, not the AI Studio terms."""
+    global gemini_vertex_client
+    if gemini_vertex_client is None:
+        from google import genai
+        # If JSON creds shipped via env, write them to /tmp once so the SDK
+        # can pick them up via Application Default Credentials.
+        creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        if creds_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            creds_path = "/tmp/gcp_vertex_sa.json"
+            try:
+                with open(creds_path, "w") as f:
+                    f.write(creds_json)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+            except Exception as e:
+                logger.error(f"Failed to materialize GCP creds: {e}")
+        try:
+            gemini_vertex_client = genai.Client(
+                vertexai=True,
+                project=GCP_PROJECT_ID,
+                location=GCP_VERTEX_LOCATION,
+            )
+        except Exception as e:
+            logger.error(f"Vertex AI client init failed: {e}")
+            sentry_sdk.capture_exception(e)
+            return None
+    return gemini_vertex_client
+
 XPEDIT_CONTEXT = """Eres el community manager experto de Xpedit, la app española de optimización de rutas para repartidores.
 
 === SOBRE XPEDIT ===
@@ -6964,13 +8364,64 @@ async def send_weekly_reengagement_push():
             sentry_sdk.capture_exception(e)
 
 
-async def check_expiring_trials():
-    """Daily conversion touchpoints: D-3 reminder + D-1 final urgency.
+def _compute_trial_kpis(driver_id: str, signup_at: datetime) -> dict:
+    """Sum routes optimized + stops completed + km traveled for a driver since
+    `signup_at`. Used by the D-2 value-recap email so the user sees concrete
+    numbers instead of an abstract upgrade ask.
 
-    Runs once a day. Picks ONLY users whose trial expires in [3, 4) days (D-3 cohort)
-    or in [1, 2) days (D-1 cohort) and sends the corresponding template. email_log
-    dedup ensures each user receives each touch at most once even if the cron retries
-    or the window slightly shifts day-to-day.
+    Bounded to the trial window (signup_at..now) — we don't want to leak
+    pre-signup activity (which shouldn't exist anyway, but defensive).
+    """
+    routes_optimized, stops_completed, total_km = 0, 0, 0.0
+    try:
+        # Routes with optimized_hash IS NOT NULL = the user actually pressed
+        # "Optimizar". A created-but-never-optimized route doesn't count.
+        r = (
+            supabase.table("routes")
+            .select("id, total_distance_km, optimized_hash")
+            .eq("driver_id", driver_id)
+            .is_("deleted_at", "null")
+            .gte("created_at", signup_at.isoformat())
+            .execute()
+        )
+        if r.data:
+            for row in r.data:
+                if row.get("optimized_hash"):
+                    routes_optimized += 1
+                if row.get("total_distance_km"):
+                    try:
+                        total_km += float(row["total_distance_km"])
+                    except (TypeError, ValueError):
+                        pass
+
+        s = (
+            supabase.table("stops")
+            .select("id", count="exact")
+            .eq("driver_id", driver_id)
+            .eq("status", "completed")
+            .is_("deleted_at", "null")
+            .gte("created_at", signup_at.isoformat())
+            .execute()
+        )
+        stops_completed = s.count or 0
+    except Exception as e:
+        logger.warning(f"Trial KPI compute failed for {driver_id}: {e}")
+    return {
+        "routes_optimized": routes_optimized,
+        "stops_completed": stops_completed,
+        "total_km": round(total_km, 1),
+    }
+
+
+async def check_expiring_trials():
+    """Daily conversion touchpoints: D-3 reminder + D-2 value recap + D-1 urgency + D-1 push.
+
+    Runs once a day. Picks users whose trial expires in [3,4) days (D-3 cohort),
+    [2,3) days (D-2 cohort) or [1,2) days (D-1 cohort) and sends the corresponding
+    template. email_log dedup ensures each touch is sent at most once.
+
+    D-1 also fires a push notification (best-effort, fire-and-forget) so users who
+    don't open email still see the final urgency.
     """
     EXCLUDED_IDS = [
         "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
@@ -6983,14 +8434,14 @@ async def check_expiring_trials():
     try:
         now = datetime.now(timezone.utc)
 
-        # Single query covering both windows. We split into D-3 / D-1 in Python
-        # so we only hit Supabase once.
+        # Single query covering all three windows (24h..96h). We split into
+        # D-3 / D-2 / D-1 in Python so we only hit Supabase once.
         window_start = (now + timedelta(days=1)).isoformat()
         window_end = (now + timedelta(days=4)).isoformat()
 
         result = (
             supabase.table("drivers")
-            .select("id, email, name, promo_plan, promo_plan_expires_at, subscription_source")
+            .select("id, email, name, promo_plan, promo_plan_expires_at, subscription_source, push_token, created_at")
             .in_("promo_plan", ["pro", "pro_plus"])
             .eq("is_ambassador", False)
             .is_("subscription_source", "null")  # already-paying users skip
@@ -7002,12 +8453,12 @@ async def check_expiring_trials():
         )
 
         if not result.data:
-            logger.info("Trial expiry check: no trials in D-3 or D-1 windows")
+            logger.info("Trial expiry check: no trials in D-3, D-2 or D-1 windows")
             if SENTRY_DSN:
                 sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
             return
 
-        sent_d3, sent_d1, skipped, failed = 0, 0, 0, 0
+        sent_d3, sent_d2, sent_d1, pushed_d1, skipped, failed = 0, 0, 0, 0, 0, 0
         for driver in result.data:
             if driver["id"] in EXCLUDED_IDS or not driver.get("email"):
                 skipped += 1
@@ -7015,15 +8466,18 @@ async def check_expiring_trials():
             expires_at = datetime.fromisoformat(driver["promo_plan_expires_at"].replace("Z", "+00:00"))
             hours_left = (expires_at - now).total_seconds() / 3600
 
-            # Bucket selection: D-1 takes precedence if both could match (shouldn't happen).
+            # Bucket selection: most-urgent wins if windows overlap (shouldn't happen).
             if 24 <= hours_left < 48:
                 template_subject = TRIAL_EXPIRING_D1_SUBJECT
                 template_kind = "d1"
+            elif 48 <= hours_left < 72:
+                template_subject = TRIAL_VALUE_RECAP_SUBJECT
+                template_kind = "d2"
             elif 72 <= hours_left < 96:
                 template_subject = TRIAL_EXPIRING_D3_SUBJECT
                 template_kind = "d3"
             else:
-                # Outside our two cohorts (e.g. 50h or 25h gap day) — skip silently.
+                # Outside our three cohorts (e.g. exactly 24h or 48h boundary) — skip silently.
                 skipped += 1
                 continue
 
@@ -7045,12 +8499,29 @@ async def check_expiring_trials():
                 email_result = send_trial_expiring_email(
                     driver["email"], driver.get("name", ""), driver["promo_plan"], days_left
                 )
+            elif template_kind == "d2":
+                # D-2 needs concrete KPIs — query routes + stops since signup.
+                signup_str = driver.get("created_at") or driver["promo_plan_expires_at"]
+                try:
+                    signup_at = datetime.fromisoformat(signup_str.replace("Z", "+00:00"))
+                except Exception:
+                    signup_at = now - timedelta(days=7)
+                kpis = _compute_trial_kpis(driver["id"], signup_at)
+                email_result = send_trial_value_recap_email(
+                    driver["email"],
+                    driver.get("name", ""),
+                    kpis["routes_optimized"],
+                    kpis["stops_completed"],
+                    kpis["total_km"],
+                )
             else:  # d1
                 email_result = send_trial_last_day_email(driver["email"], driver.get("name", ""))
 
             if email_result.get("success"):
                 if template_kind == "d3":
                     sent_d3 += 1
+                elif template_kind == "d2":
+                    sent_d2 += 1
                 else:
                     sent_d1 += 1
                 try:
@@ -7065,17 +8536,190 @@ async def check_expiring_trials():
                     # Log failure isn't fatal — the email already went out. Worst case the user
                     # gets one duplicate next run; that's acceptable.
                     pass
+
+                # D-1: also fire a push so users who skip email still see urgency.
+                # Best-effort, no email_log dedup since email_log already gates the email.
+                if template_kind == "d1" and driver.get("push_token"):
+                    try:
+                        push_ok = await send_push_to_token(
+                            driver["push_token"],
+                            "Mañana acaba tu prueba Pro",
+                            "Mantén Pro por 4,99€/mes y sigue sin límites de paradas.",
+                            data={"type": "trial_d1", "deeplink": "xpedit://upgrade"},
+                        )
+                        if push_ok:
+                            pushed_d1 += 1
+                    except Exception as push_err:
+                        logger.warning(f"Trial D-1 push failed for {driver['id']}: {push_err}")
             else:
                 failed += 1
                 logger.warning(f"Trial expiry email failed for {driver['id']}: {email_result.get('error')}")
 
-        logger.info(f"Trial expiry: D-3={sent_d3} D-1={sent_d1} skipped={skipped} failed={failed} of {len(result.data)} candidates")
+        logger.info(
+            f"Trial expiry: D-3={sent_d3} D-2={sent_d2} D-1={sent_d1} push_D-1={pushed_d1} "
+            f"skipped={skipped} failed={failed} of {len(result.data)} candidates"
+        )
         if SENTRY_DSN:
             sentry_check_in(monitor_slug="check-expiring-trials", status="ok")
     except Exception as e:
         logger.error(f"Trial expiry check failed: {e}")
         if SENTRY_DSN:
             sentry_check_in(monitor_slug="check-expiring-trials", status="error")
+            sentry_sdk.capture_exception(e)
+
+
+async def invite_active_free_to_trial():
+    """Weekly job: surface 7-day Pro trial to free users who're already engaged.
+
+    Audience criteria (ALL must hold):
+      - promo_plan IS NULL (not in trial, not paying via promo)
+      - subscription_source IS NULL (not paying via stripe/revenuecat)
+      - email IS NOT NULL
+      - is_ambassador = false
+      - signed up >= 14 days ago (skips users still in their natural trial window)
+      - >= 5 routes with optimized_hash IS NOT NULL in the last 30 days
+      - never received this email before (email_log dedup by subject prefix)
+
+    Sends email + push (best-effort). The CTA deep-links to xpedit://trial which
+    the app routes to claimTrial() — device_id + IP abuse guards already in place
+    inside that endpoint, so re-attempts by users who already burned their trial
+    fall through gracefully.
+
+    Runs Mondays 11:00 UTC (= 12:00 CET / 13:00 CEST). Weekly cadence keeps the
+    audience fresh without burning attention.
+    """
+    EXCLUDED_IDS = [
+        "8c0aa30a-6de1-43e8-8a6c-71c1c8a6670b",  # admin
+        "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # test
+        "d773b1aa-b077-4b44-a66b-1cb79cf1059b",  # Demo Xpedit
+        "b903e5ad-6f82-4cdc-beb4-1a36cec113f4",  # Apple Reviewer
+    ]
+    if SENTRY_DSN:
+        sentry_check_in(monitor_slug="invite-active-free-to-trial", status="in_progress")
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff_signup = (now - timedelta(days=14)).isoformat()
+        cutoff_routes = (now - timedelta(days=30)).isoformat()
+
+        # Step 1: pull free + email-able + not-too-fresh drivers via paginated
+        # helper (Supabase Cloud caps server-side at 1000 rows).
+        free_drivers = []
+        page_size = 1000
+        offset = 0
+        while True:
+            page = (
+                supabase.table("drivers")
+                .select("id, email, name, push_token")
+                .is_("promo_plan", "null")
+                .is_("subscription_source", "null")
+                .eq("is_ambassador", False)
+                .not_.is_("email", "null")
+                .lt("created_at", cutoff_signup)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            if not page.data:
+                break
+            free_drivers.extend(page.data)
+            if len(page.data) < page_size:
+                break
+            offset += page_size
+
+        if not free_drivers:
+            logger.info("Active-free invite: no eligible drivers")
+            if SENTRY_DSN:
+                sentry_check_in(monitor_slug="invite-active-free-to-trial", status="ok")
+            return
+
+        sent, pushed, skipped, failed = 0, 0, 0, 0
+        for driver in free_drivers:
+            if driver["id"] in EXCLUDED_IDS:
+                skipped += 1
+                continue
+
+            # Step 2: count optimized routes in last 30d for this driver. Cheap
+            # per-driver count vs single huge query — keeps RAM bounded for
+            # 800+ drivers and lets us shortcut at >=5.
+            try:
+                rcount = (
+                    supabase.table("routes")
+                    .select("id", count="exact")
+                    .eq("driver_id", driver["id"])
+                    .not_.is_("optimized_hash", "null")
+                    .is_("deleted_at", "null")
+                    .gte("created_at", cutoff_routes)
+                    .limit(1)
+                    .execute()
+                )
+                routes_30d = rcount.count or 0
+            except Exception as q_err:
+                logger.warning(f"Active-free invite: route count failed for {driver['id']}: {q_err}")
+                skipped += 1
+                continue
+
+            if routes_30d < 5:
+                skipped += 1
+                continue
+
+            # Step 3: dedup against prior sends. We use a LIKE on the formatted
+            # subject so any past invite (regardless of route count number)
+            # blocks future invites for this user.
+            existing = (
+                supabase.table("email_log")
+                .select("id")
+                .eq("recipient_email", driver["email"])
+                .like("subject", "Has optimizado%rutas. Prueba Pro%")
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                skipped += 1
+                continue
+
+            email_result = send_active_free_pro_invite_email(
+                driver["email"], driver.get("name", ""), routes_30d
+            )
+            if not email_result.get("success"):
+                failed += 1
+                logger.warning(f"Active-free invite email failed for {driver['id']}: {email_result.get('error')}")
+                continue
+
+            sent += 1
+            try:
+                supabase.table("email_log").insert({
+                    "recipient_email": driver["email"],
+                    "recipient_name": driver.get("name"),
+                    "subject": ACTIVE_FREE_PRO_INVITE_SUBJECT.format(n=routes_30d),
+                    "body": f"active-free invite (auto, {routes_30d} routes/30d)",
+                    "message_id": email_result.get("id"),
+                }).execute()
+            except Exception:
+                pass  # Log failure isn't fatal; email already sent.
+
+            # Best-effort push alongside the email — silent if no token.
+            if driver.get("push_token"):
+                try:
+                    push_ok = await send_push_to_token(
+                        driver["push_token"],
+                        f"Has optimizado {routes_30d} rutas con Xpedit",
+                        "Prueba Pro 7 días gratis. Sin tarjeta.",
+                        data={"type": "active_free_invite", "deeplink": "xpedit://trial"},
+                    )
+                    if push_ok:
+                        pushed += 1
+                except Exception as push_err:
+                    logger.warning(f"Active-free invite push failed for {driver['id']}: {push_err}")
+
+        logger.info(
+            f"Active-free invite: sent={sent} pushed={pushed} skipped={skipped} failed={failed} "
+            f"of {len(free_drivers)} eligible candidates"
+        )
+        if SENTRY_DSN:
+            sentry_check_in(monitor_slug="invite-active-free-to-trial", status="ok")
+    except Exception as e:
+        logger.error(f"Active-free invite failed: {e}")
+        if SENTRY_DSN:
+            sentry_check_in(monitor_slug="invite-active-free-to-trial", status="error")
             sentry_sdk.capture_exception(e)
 
 
@@ -7993,7 +9637,17 @@ async def start_monitoring_jobs():
         id="reactivation_push_followup",
         replace_existing=True,
     )
-    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET), reactivation followup (hourly :15)")
+    # Weekly invite for active free users (Mondays 11:00 UTC = 12:00 CET / 13:00 CEST)
+    social_scheduler.add_job(
+        invite_active_free_to_trial,
+        "cron",
+        day_of_week="mon",
+        hour=11,
+        minute=0,
+        id="invite_active_free_to_trial",
+        replace_existing=True,
+    )
+    logger.info("Monitoring jobs scheduled: health (5min), website (15min), daily backup (3:00 UTC), weekly retention (Sun 4:00 UTC), re-engagement push (Mon 10:00 UTC), trial expiry (9:00 UTC), trial degrade (9:05 UTC), trial feedback (10:30 UTC), daily health digest (08:00 CET), reactivation followup (hourly :15), active-free invite (Mon 11:00 UTC)")
 
 
 async def periodic_health_check():

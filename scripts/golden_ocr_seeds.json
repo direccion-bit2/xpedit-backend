@@ -1,0 +1,758 @@
+{
+  "version": 1,
+  "namespace_uuid": "0a83f6c6-6d04-4f8b-90ce-c8c2e1a86e8c",
+  "note_marker_prefix": "GOLDEN_SEED:",
+  "description": "Curated golden examples for the OCR/MSI few-shot retrieval set. Each entry represents a (model_extracted, user_corrected) pair that teaches the model a recurrent failure mode. Re-run idempotent: UUID derived deterministically from seed_key via uuid5(namespace_uuid, seed_key).",
+  "examples": [
+    {
+      "seed_key": "es_ctt_madrid_floor_in_street",
+      "carrier_hint": "CTT",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Calle de Alcalá 220 4ºB, Madrid 28028",
+      "model_extracted_parts": {
+        "name": "María García López",
+        "street": "Calle de Alcalá 220 4ºB",
+        "city": "Madrid",
+        "postalCode": "28028",
+        "province": "Madrid",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.82,
+      "user_final_address": "Calle de Alcalá 220, Madrid 28028 (4ºB)",
+      "user_final_parts": {
+        "name": "María García López",
+        "street": "Calle de Alcalá 220",
+        "city": "Madrid",
+        "postalCode": "28028",
+        "province": "Madrid",
+        "floor_etc": "4ºB"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "floor_etc"],
+      "lesson": "Floor designators (4ºB, Esc 2, Pta 3, Portal C) must be extracted into floor_etc, never concatenated into street."
+    },
+    {
+      "seed_key": "es_ctt_seville_avda_abbrev",
+      "carrier_hint": "CTT",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Aoda. de la Constitución 32, Sevilla 41001",
+      "model_extracted_parts": {
+        "name": "Juan Pérez Ruiz",
+        "street": "Aoda. de la Constitución 32",
+        "city": "Sevilla",
+        "postalCode": "41001",
+        "province": "Sevilla",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.74,
+      "user_final_address": "Avda. de la Constitución 32, Sevilla 41001",
+      "user_final_parts": {
+        "name": "Juan Pérez Ruiz",
+        "street": "Avda. de la Constitución 32",
+        "city": "Sevilla",
+        "postalCode": "41001",
+        "province": "Sevilla",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street"],
+      "lesson": "OCR sometimes misreads 'Avda.' as 'Aoda.' or 'Avoa.'. Normalize known abbreviations: Avda./Av./Avenida, C/, Pza./Plza./Plaza, Trav./Travesía, Crta./Carretera."
+    },
+    {
+      "seed_key": "es_ctt_sanlucar_local_street",
+      "carrier_hint": "CTT",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ Patrón Carrerilla 149, Sanlúcar de Barrameda 11540",
+      "model_extracted_parts": {
+        "name": "TAES PACK S.L.",
+        "street": "C/ Patrón Carrerilla 149",
+        "city": "Sanlúcar de Barrameda",
+        "postalCode": "11540",
+        "province": "Cádiz",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.94,
+      "user_final_address": "C/ Patrón Carrerilla 149, Sanlúcar de Barrameda 11540",
+      "user_final_parts": {
+        "name": "TAES PACK S.L.",
+        "street": "C/ Patrón Carrerilla 149",
+        "city": "Sanlúcar de Barrameda",
+        "postalCode": "11540",
+        "province": "Cádiz",
+        "floor_etc": ""
+      },
+      "user_action": "accepted",
+      "was_corrected": false,
+      "corrected_fields": [],
+      "lesson": "Cádiz province inferred correctly from CP prefix '11'. Compound city names ('Sanlúcar de Barrameda', 'Alcalá de Guadaíra') kept intact, never truncated."
+    },
+    {
+      "seed_key": "es_mrw_barcelona_planta_porta",
+      "carrier_hint": "MRW",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Carrer de Mallorca 401 3-2, Barcelona 08013",
+      "model_extracted_parts": {
+        "name": "Laia Vidal Puig",
+        "street": "Carrer de Mallorca 401 3-2",
+        "city": "Barcelona",
+        "postalCode": "08013",
+        "province": "Barcelona",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.79,
+      "user_final_address": "Carrer de Mallorca 401, Barcelona 08013 (3º 2ª)",
+      "user_final_parts": {
+        "name": "Laia Vidal Puig",
+        "street": "Carrer de Mallorca 401",
+        "city": "Barcelona",
+        "postalCode": "08013",
+        "province": "Barcelona",
+        "floor_etc": "3º 2ª"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "floor_etc"],
+      "lesson": "Catalan addresses use 'planta-puerta' notation (3-2 = 3º planta, 2ª puerta). Split into floor_etc as '3º 2ª'."
+    },
+    {
+      "seed_key": "es_mrw_valencia_urbanizacion",
+      "carrier_hint": "MRW",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Urb. Los Naranjos C/ Limón 12, Valencia 46021",
+      "model_extracted_parts": {
+        "name": "Carlos Martínez Soler",
+        "street": "Urb. Los Naranjos C/ Limón 12",
+        "city": "Valencia",
+        "postalCode": "46021",
+        "province": "Valencia",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.71,
+      "user_final_address": "C/ Limón 12, Urb. Los Naranjos, Valencia 46021",
+      "user_final_parts": {
+        "name": "Carlos Martínez Soler",
+        "street": "C/ Limón 12, Urb. Los Naranjos",
+        "city": "Valencia",
+        "postalCode": "46021",
+        "province": "Valencia",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street"],
+      "lesson": "Urbanization names ('Urb. X') belong after the street, not before — Google Geocoding pairs better with 'C/ Limón 12, Urb. Los Naranjos' than 'Urb. ... C/ ...'."
+    },
+    {
+      "seed_key": "es_mrw_bilbao_basque_street",
+      "carrier_hint": "MRW",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Gran Vía Don Diego López Haroko 45, Bilbao 48011",
+      "model_extracted_parts": {
+        "name": "Aitor Etxebarria",
+        "street": "Gran Vía Don Diego López Haroko 45",
+        "city": "Bilbao",
+        "postalCode": "48011",
+        "province": "Bizkaia",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.66,
+      "user_final_address": "Gran Vía Don Diego López de Haro 45, Bilbao 48011",
+      "user_final_parts": {
+        "name": "Aitor Etxebarria",
+        "street": "Gran Vía Don Diego López de Haro 45",
+        "city": "Bilbao",
+        "postalCode": "48011",
+        "province": "Bizkaia",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street"],
+      "lesson": "Basque suffixes ('-ko') from Euskara labels get mistakenly appended to Spanish street names. Strip them on Spanish-form addresses."
+    },
+    {
+      "seed_key": "es_seur_malaga_escalera",
+      "carrier_hint": "SEUR",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Calle Larios 5 Esc 2 1ºA, Málaga 29005",
+      "model_extracted_parts": {
+        "name": "Pilar Romero Aguilar",
+        "street": "Calle Larios 5 Esc 2 1ºA",
+        "city": "Málaga",
+        "postalCode": "29005",
+        "province": "Málaga",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.77,
+      "user_final_address": "Calle Larios 5, Málaga 29005 (Esc 2, 1ºA)",
+      "user_final_parts": {
+        "name": "Pilar Romero Aguilar",
+        "street": "Calle Larios 5",
+        "city": "Málaga",
+        "postalCode": "29005",
+        "province": "Málaga",
+        "floor_etc": "Esc 2, 1ºA"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "floor_etc"],
+      "lesson": "Multiple floor designators ('Esc 2 1ºA' = escalera 2, planta 1, puerta A) must all go to floor_etc, joined with commas."
+    },
+    {
+      "seed_key": "es_seur_zaragoza_bloque",
+      "carrier_hint": "SEUR",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Paseo Independencia 24 Bloque B 5ºD, Zaragoza 50001",
+      "model_extracted_parts": {
+        "name": "David Sánchez Lafuente",
+        "street": "Paseo Independencia 24 Bloque B 5ºD",
+        "city": "Zaragoza",
+        "postalCode": "50001",
+        "province": "Zaragoza",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.81,
+      "user_final_address": "Paseo Independencia 24, Zaragoza 50001 (Bloque B, 5ºD)",
+      "user_final_parts": {
+        "name": "David Sánchez Lafuente",
+        "street": "Paseo Independencia 24",
+        "city": "Zaragoza",
+        "postalCode": "50001",
+        "province": "Zaragoza",
+        "floor_etc": "Bloque B, 5ºD"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "floor_etc"],
+      "lesson": "'Bloque X' is part of floor_etc, not street. Always split."
+    },
+    {
+      "seed_key": "es_seur_acoruna_travesia",
+      "carrier_hint": "SEUR",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Trav. Praceres 7, A Coruña 15011",
+      "model_extracted_parts": {
+        "name": "Manuela Vázquez Rodríguez",
+        "street": "Trav. Praceres 7",
+        "city": "A Coruña",
+        "postalCode": "15011",
+        "province": "Coruña",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.83,
+      "user_final_address": "Travesía de los Praceres 7, A Coruña 15011",
+      "user_final_parts": {
+        "name": "Manuela Vázquez Rodríguez",
+        "street": "Travesía de los Praceres 7",
+        "city": "A Coruña",
+        "postalCode": "15011",
+        "province": "A Coruña",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "province"],
+      "lesson": "Galician/Spanish 'A Coruña' province: never 'Coruña' alone. Article 'A' is part of the province name."
+    },
+    {
+      "seed_key": "es_gls_murcia_pedania",
+      "carrier_hint": "GLS",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ Mayor 14, El Palmar, Murcia 30120",
+      "model_extracted_parts": {
+        "name": "Antonio López Hernández",
+        "street": "C/ Mayor 14, El Palmar",
+        "city": "Murcia",
+        "postalCode": "30120",
+        "province": "Murcia",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.78,
+      "user_final_address": "C/ Mayor 14, El Palmar, Murcia 30120",
+      "user_final_parts": {
+        "name": "Antonio López Hernández",
+        "street": "C/ Mayor 14",
+        "city": "El Palmar",
+        "postalCode": "30120",
+        "province": "Murcia",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "city"],
+      "lesson": "Spanish 'pedanías' (El Palmar near Murcia) are the actual city; the bigger municipality stays in province context only. Otherwise Geocoding lands miles away on the metropolitan centroid."
+    },
+    {
+      "seed_key": "es_gls_granada_realejo_historic",
+      "carrier_hint": "GLS",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Cuesta Escoriaza 12, Granada 18009",
+      "model_extracted_parts": {
+        "name": "Inés Molina Fernández",
+        "street": "Cuesta Escoriaza 12",
+        "city": "Granada",
+        "postalCode": "18009",
+        "province": "Granada",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.91,
+      "user_final_address": "Cuesta Escoriaza 12, Granada 18009",
+      "user_final_parts": {
+        "name": "Inés Molina Fernández",
+        "street": "Cuesta Escoriaza 12",
+        "city": "Granada",
+        "postalCode": "18009",
+        "province": "Granada",
+        "floor_etc": ""
+      },
+      "user_action": "accepted",
+      "was_corrected": false,
+      "corrected_fields": [],
+      "lesson": "Granada Realejo old-town: 'Cuesta' is a valid Spanish street type (alongside Calle, Avenida, Travesía, Carretera, Camino, Paseo, Plaza, Ronda). Don't normalize 'Cuesta' to 'Calle'."
+    },
+    {
+      "seed_key": "es_gls_toledo_callejon_historic",
+      "carrier_hint": "GLS",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Callejón de San Pedro 3, Toledo",
+      "model_extracted_parts": {
+        "name": "Sofía Ruiz Castro",
+        "street": "Callejón de San Pedro 3",
+        "city": "Toledo",
+        "postalCode": "",
+        "province": "",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.62,
+      "user_final_address": "Callejón de San Pedro 3, Toledo 45002",
+      "user_final_parts": {
+        "name": "Sofía Ruiz Castro",
+        "street": "Callejón de San Pedro 3",
+        "city": "Toledo",
+        "postalCode": "45002",
+        "province": "Toledo",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["postalCode", "province"],
+      "lesson": "When CP is missing but city is unambiguous, set province = city (capital case) and let Geocoding bbox round 2 fill in CP. Never invent a 5-digit CP."
+    },
+    {
+      "seed_key": "es_nacex_alicante_urbanizacion_turistica",
+      "carrier_hint": "NACEX",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Urb. La Marina Av. del Cabo 88, Elche 03177",
+      "model_extracted_parts": {
+        "name": "Brian Hughes",
+        "street": "Urb. La Marina Av. del Cabo 88",
+        "city": "Elche",
+        "postalCode": "03177",
+        "province": "Alicante",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.69,
+      "user_final_address": "Av. del Cabo 88, Urb. La Marina, Elche 03177",
+      "user_final_parts": {
+        "name": "Brian Hughes",
+        "street": "Av. del Cabo 88, Urb. La Marina",
+        "city": "Elche",
+        "postalCode": "03177",
+        "province": "Alicante",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street"],
+      "lesson": "Coastal urbanizations: same rule as inland — street first, then 'Urb. X' suffix."
+    },
+    {
+      "seed_key": "es_nacex_laspalmas_GC_island",
+      "carrier_hint": "NACEX",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ Triana 91, Las Palmas 35002",
+      "model_extracted_parts": {
+        "name": "Yeray Hernández Sosa",
+        "street": "C/ Triana 91",
+        "city": "Las Palmas",
+        "postalCode": "35002",
+        "province": "Las Palmas",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.88,
+      "user_final_address": "C/ Triana 91, Las Palmas de Gran Canaria 35002",
+      "user_final_parts": {
+        "name": "Yeray Hernández Sosa",
+        "street": "C/ Triana 91",
+        "city": "Las Palmas de Gran Canaria",
+        "postalCode": "35002",
+        "province": "Las Palmas",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["city"],
+      "lesson": "Canarian capital: 'Las Palmas' is the province; the municipality is 'Las Palmas de Gran Canaria'. Always expand for the city field."
+    },
+    {
+      "seed_key": "es_nacex_palma_poligono",
+      "carrier_hint": "NACEX",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Pol. Ind. Son Castelló C/ Gremi Sucrers 22, Palma 07009",
+      "model_extracted_parts": {
+        "name": "Comercial Balear S.A.",
+        "street": "Pol. Ind. Son Castelló C/ Gremi Sucrers 22",
+        "city": "Palma",
+        "postalCode": "07009",
+        "province": "Balears",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.72,
+      "user_final_address": "C/ Gremi Sucrers 22, Polígono Son Castelló, Palma 07009",
+      "user_final_parts": {
+        "name": "Comercial Balear S.A.",
+        "street": "C/ Gremi Sucrers 22, Polígono Son Castelló",
+        "city": "Palma",
+        "postalCode": "07009",
+        "province": "Illes Balears",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "province"],
+      "lesson": "Industrial estates ('Pol. Ind. X') belong AFTER the actual street, never before. Province for Balears is 'Illes Balears' (official Catalan form)."
+    },
+    {
+      "seed_key": "es_correos_express_vigo_oporrino",
+      "carrier_hint": "Correos Express",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Rúa Manuel Rodríguez 17, O Porriño 36400",
+      "model_extracted_parts": {
+        "name": "Xosé Lago Couto",
+        "street": "Rúa Manuel Rodríguez 17",
+        "city": "O Porriño",
+        "postalCode": "36400",
+        "province": "Pontevedra",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.93,
+      "user_final_address": "Rúa Manuel Rodríguez 17, O Porriño 36400",
+      "user_final_parts": {
+        "name": "Xosé Lago Couto",
+        "street": "Rúa Manuel Rodríguez 17",
+        "city": "O Porriño",
+        "postalCode": "36400",
+        "province": "Pontevedra",
+        "floor_etc": ""
+      },
+      "user_action": "accepted",
+      "was_corrected": false,
+      "corrected_fields": [],
+      "lesson": "Galician 'Rúa' (street) and town article 'O' must be preserved verbatim — don't translate to 'Calle' or drop the 'O'."
+    },
+    {
+      "seed_key": "es_correos_express_pamplona_iruna_neighborhood",
+      "carrier_hint": "Correos Express",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ San Nicolás 28, Barrio Casco Viejo, Pamplona 31001",
+      "model_extracted_parts": {
+        "name": "Maite Iribarren Goñi",
+        "street": "C/ San Nicolás 28, Barrio Casco Viejo",
+        "city": "Pamplona",
+        "postalCode": "31001",
+        "province": "Navarra",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.86,
+      "user_final_address": "C/ San Nicolás 28, Pamplona 31001",
+      "user_final_parts": {
+        "name": "Maite Iribarren Goñi",
+        "street": "C/ San Nicolás 28",
+        "city": "Pamplona",
+        "postalCode": "31001",
+        "province": "Navarra",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street"],
+      "lesson": "Neighborhood name ('Barrio Casco Viejo') is decorative on labels but hurts Geocoding precision. Drop it from street; CP already encodes the neighborhood."
+    },
+    {
+      "seed_key": "es_correos_express_salamanca_student_piso",
+      "carrier_hint": "Correos Express",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ Bordadores 4 piso 2 dcha, Salamanca 37002",
+      "model_extracted_parts": {
+        "name": "Lucía Méndez Vázquez",
+        "street": "C/ Bordadores 4 piso 2 dcha",
+        "city": "Salamanca",
+        "postalCode": "37002",
+        "province": "Salamanca",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.80,
+      "user_final_address": "C/ Bordadores 4, Salamanca 37002 (2º dcha)",
+      "user_final_parts": {
+        "name": "Lucía Méndez Vázquez",
+        "street": "C/ Bordadores 4",
+        "city": "Salamanca",
+        "postalCode": "37002",
+        "province": "Salamanca",
+        "floor_etc": "2º dcha"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "floor_etc"],
+      "lesson": "Lowercase 'piso X dcha/izda' form: same rule — extract to floor_etc, normalize as '2º dcha'."
+    },
+    {
+      "seed_key": "es_edge_case_cp_four_digit_dropped_leading_zero",
+      "carrier_hint": "GLS",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Avda. Diagonal 405, Barcelona 8008",
+      "model_extracted_parts": {
+        "name": "Roger Solà i Vidal",
+        "street": "Avda. Diagonal 405",
+        "city": "Barcelona",
+        "postalCode": "8008",
+        "province": "Barcelona",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.71,
+      "user_final_address": "Avda. Diagonal 405, Barcelona 08008",
+      "user_final_parts": {
+        "name": "Roger Solà i Vidal",
+        "street": "Avda. Diagonal 405",
+        "city": "Barcelona",
+        "postalCode": "08008",
+        "province": "Barcelona",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["postalCode"],
+      "lesson": "Spanish CP is always 5 digits. If 4 digits seen, pad with leading zero (provinces 01-09 — Álava, Albacete, Alicante, Almería, Ávila, Badajoz, Baleares, Barcelona, Burgos)."
+    },
+    {
+      "seed_key": "es_edge_case_city_inferred_from_other_stops",
+      "carrier_hint": "MRW",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ Marqués de Larios 8",
+      "model_extracted_parts": {
+        "name": "Pepe Salas",
+        "street": "C/ Marqués de Larios 8",
+        "city": "",
+        "postalCode": "",
+        "province": "",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.55,
+      "user_final_address": "C/ Marqués de Larios 8, Málaga 29005",
+      "user_final_parts": {
+        "name": "Pepe Salas",
+        "street": "C/ Marqués de Larios 8",
+        "city": "Málaga",
+        "postalCode": "29005",
+        "province": "Málaga",
+        "floor_etc": ""
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["city", "postalCode", "province"],
+      "lesson": "When a stop in a batch only shows street, infer city/province from majority of sibling stops (contextual inference). Mark inferred fields with confidence ≤0.7 so the UI flags them yellow."
+    },
+    {
+      "seed_key": "es_edge_case_floor_already_in_floor_etc_correct",
+      "carrier_hint": "SEUR",
+      "country_iso": "ES",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "C/ Goya 88, Madrid 28009",
+      "model_extracted_parts": {
+        "name": "Cristina Romero Pardo",
+        "street": "C/ Goya 88",
+        "city": "Madrid",
+        "postalCode": "28009",
+        "province": "Madrid",
+        "floor_etc": "3º C"
+      },
+      "model_confidence": 0.96,
+      "user_final_address": "C/ Goya 88, Madrid 28009 (3º C)",
+      "user_final_parts": {
+        "name": "Cristina Romero Pardo",
+        "street": "C/ Goya 88",
+        "city": "Madrid",
+        "postalCode": "28009",
+        "province": "Madrid",
+        "floor_etc": "3º C"
+      },
+      "user_action": "accepted",
+      "was_corrected": false,
+      "corrected_fields": [],
+      "lesson": "GOLD STANDARD: street clean, floor_etc separated, CP+city+province all present. This is the target output shape for every successful extraction."
+    },
+    {
+      "seed_key": "latam_mx_cdmx_colonia",
+      "carrier_hint": null,
+      "country_iso": "MX",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Av. Insurgentes Sur 1602, Crédito Constructor, Ciudad de México 03940",
+      "model_extracted_parts": {
+        "name": "Alejandra Domínguez Vargas",
+        "street": "Av. Insurgentes Sur 1602, Crédito Constructor",
+        "city": "Ciudad de México",
+        "postalCode": "03940",
+        "province": "CDMX",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.84,
+      "user_final_address": "Av. Insurgentes Sur 1602, Col. Crédito Constructor, Benito Juárez, CDMX 03940",
+      "user_final_parts": {
+        "name": "Alejandra Domínguez Vargas",
+        "street": "Av. Insurgentes Sur 1602",
+        "city": "Benito Juárez",
+        "postalCode": "03940",
+        "province": "CDMX",
+        "floor_etc": "Col. Crédito Constructor"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "city", "floor_etc"],
+      "lesson": "MX addresses: 'Colonia' (Col.) is a neighborhood-level locator critical for couriers — keep it in floor_etc, NOT in street. The 'city' field should be the alcaldía (Benito Juárez, Cuauhtémoc, …), not 'Ciudad de México'."
+    },
+    {
+      "seed_key": "latam_ar_buenosaires_barrio",
+      "carrier_hint": null,
+      "country_iso": "AR",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Av. Santa Fe 1234 4ºA, Palermo, Buenos Aires C1059",
+      "model_extracted_parts": {
+        "name": "Federico Álvarez Pérez",
+        "street": "Av. Santa Fe 1234 4ºA",
+        "city": "Buenos Aires",
+        "postalCode": "C1059",
+        "province": "CABA",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.76,
+      "user_final_address": "Av. Santa Fe 1234, Palermo, CABA C1059ABC (4ºA)",
+      "user_final_parts": {
+        "name": "Federico Álvarez Pérez",
+        "street": "Av. Santa Fe 1234",
+        "city": "Palermo",
+        "postalCode": "C1059ABC",
+        "province": "CABA",
+        "floor_etc": "4ºA"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "city", "postalCode", "floor_etc"],
+      "lesson": "AR addresses: CABA uses CPA (alphanumeric, e.g. 'C1059ABC'), not just 'C1059'. The 'barrio' (Palermo, Recoleta, Belgrano) is the operational city for couriers. Buenos Aires province ≠ CABA."
+    },
+    {
+      "seed_key": "latam_co_bogota_localidad",
+      "carrier_hint": null,
+      "country_iso": "CO",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Carrera 11 #93-46 apto 502, Chapinero, Bogotá 110221",
+      "model_extracted_parts": {
+        "name": "Daniela Restrepo Ortiz",
+        "street": "Carrera 11 #93-46 apto 502",
+        "city": "Bogotá",
+        "postalCode": "110221",
+        "province": "Cundinamarca",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.73,
+      "user_final_address": "Carrera 11 #93-46, Chapinero, Bogotá D.C. 110221 (Apto 502)",
+      "user_final_parts": {
+        "name": "Daniela Restrepo Ortiz",
+        "street": "Carrera 11 #93-46",
+        "city": "Bogotá D.C.",
+        "postalCode": "110221",
+        "province": "Bogotá D.C.",
+        "floor_etc": "Apto 502, Chapinero"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "city", "province", "floor_etc"],
+      "lesson": "CO addresses: Carrera/Calle nomenclature with # separator must stay intact. Bogotá D.C. is its own special district (not Cundinamarca). Apto + localidad go to floor_etc."
+    },
+    {
+      "seed_key": "latam_cl_santiago_comuna",
+      "carrier_hint": null,
+      "country_iso": "CL",
+      "model_name": "gemini-2.5-pro",
+      "prompt_version": "v1",
+      "model_extracted_address": "Av. Providencia 1234 dpto 802, Santiago 7510000",
+      "model_extracted_parts": {
+        "name": "Camila Rojas Müller",
+        "street": "Av. Providencia 1234 dpto 802",
+        "city": "Santiago",
+        "postalCode": "7510000",
+        "province": "Región Metropolitana",
+        "floor_etc": ""
+      },
+      "model_confidence": 0.78,
+      "user_final_address": "Av. Providencia 1234, Providencia, Santiago 7510000 (Depto 802)",
+      "user_final_parts": {
+        "name": "Camila Rojas Müller",
+        "street": "Av. Providencia 1234",
+        "city": "Providencia",
+        "postalCode": "7510000",
+        "province": "Región Metropolitana",
+        "floor_etc": "Depto 802"
+      },
+      "user_action": "edited",
+      "was_corrected": true,
+      "corrected_fields": ["street", "city", "floor_etc"],
+      "lesson": "CL addresses: 'comuna' (Providencia, Las Condes, Ñuñoa) is the operational city, not the metropolitan area ('Santiago'). 'dpto' normalizes to 'Depto' (full word, capitalized)."
+    }
+  ]
+}

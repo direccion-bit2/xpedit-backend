@@ -1,0 +1,52 @@
+-- =============================================================================
+-- Enable RLS on tables that were exposed via anon key
+-- =============================================================================
+-- Detected by Supabase advisor 10 may 2026 from the Windows marketing center.
+-- These 3 tables had RLS disabled with no policies, meaning ANY caller with the
+-- public anon key (which is shipped in the website JS bundle) could:
+--
+--   - daily_metrics_snapshot — read 99+ days of historical KPIs (signups, MAU,
+--     paying users, MRR, CAC, ads cost, etc.). Pure competitive intelligence
+--     leak.
+--   - cohort_retention_snapshot — empty today (0 rows), but same exposure.
+--   - seo_cache — singleton row with computed SEO scores + GA4/GSC metadata.
+--     Less critical but still internal data.
+--
+-- Code audit (10 may 2026) confirmed every code path that touches these tables
+-- uses the SUPABASE_SERVICE_ROLE_KEY:
+--
+--   * backend/main.py:7922-7949 — daily_health_digest cron reads
+--     daily_metrics_snapshot via the global `supabase` client which is
+--     instantiated with service_role.
+--   * website/app/api/admin/historical/route.ts:140-194 — admin API route uses
+--     `createClient(supabaseUrl, serviceRoleKey)` exclusively.
+--   * website/app/api/admin/seo/route.ts:557, 631 — same pattern with seo_cache
+--     read + upsert.
+--   * cohort_retention_snapshot — zero references in the code base.
+--
+-- Because service_role bypasses RLS by default, simply enabling RLS *without*
+-- adding any policies blocks anon completely while leaving server-side access
+-- untouched. No policies are required.
+--
+-- Verified end-to-end on staging (10 may 16:50 CEST) before applying to prod
+-- (10 may 17:15 CEST):
+--   * service_role SELECT continues to return rows.
+--   * anon REST call (`Authorization: Bearer <anon_jwt>`) returns
+--     [{"count": 0}] — RLS silently filters everything.
+--
+-- DO NOT add `FORCE ROW LEVEL SECURITY` here — that would block service_role
+-- too and break the cron + admin dashboard.
+-- =============================================================================
+
+ALTER TABLE public.seo_cache                  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.daily_metrics_snapshot     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cohort_retention_snapshot  ENABLE ROW LEVEL SECURITY;
+
+-- Verification query (run after the ALTERs):
+--
+-- SELECT c.relname, c.relrowsecurity, (SELECT COUNT(*) FROM pg_policy WHERE polrelid = c.oid) AS policies
+-- FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+-- WHERE n.nspname = 'public'
+--   AND c.relname IN ('seo_cache', 'daily_metrics_snapshot', 'cohort_retention_snapshot');
+--
+-- Expected: relrowsecurity = true, policies = 0 for each.
