@@ -1,122 +1,13 @@
 [
   {
-    "filename": "zeleris_01.jpg",
-    "carrier_hint": "generic",
-    "carrier_real": "zeleris",
-    "label_rotated_deg": 180,
-    "expected_stops": [
-      {
-        "name": "Elena María Salas Perdigones",
-        "street": "Avenida La Independencia",
-        "number": "55",
-        "floor_etc": "",
-        "postal_code": "11580",
-        "city": "San José del Valle",
-        "province": "Cádiz",
-        "phone": "917077864",
-        "tracking_number": "83476399",
-        "notes": "PAGADOS · 11_PEDANI"
-      }
-    ],
-    "miguel_test_16may": "fallo_total",
-    "notes": "Etiqueta físicamente rotada 180°. Texto principal al revés. Banner verde-lima 'ZLR DIA SIGUIENTE / 011 001 - CADIZ' arriba (servicio Zeleris, NO destino). Dirección real: Avda La Independencia 55, 11580 San José del Valle. La 'Zona de reparto: 11580 / 11_PEDANI' confirma zona (pedanía de San José)."
-  },
-  {
-    "filename": "zeleris_02.jpg",
+    "filename": "raw/04a01a14-ae63-428a-95cd-56d70f6e3466.JPG",
     "carrier_hint": "generic",
     "carrier_real": "zeleris",
     "label_rotated_deg": 0,
+    "label_partially_visible": true,
     "expected_stops": [
       {
-        "name": "María José Del Carmen Parodi Leal",
-        "street": "Calle Prieta",
-        "number": "1",
-        "floor_etc": "Pl Bajo, Pta No Aplica",
-        "postal_code": "11140",
-        "city": "Conil de la Frontera",
-        "province": "Cádiz",
-        "phone": "917077864",
-        "tracking_number": "83486740",
-        "notes": "PAGADOS · 11CONIL · paquete WELEDA (Espressomaskin caja externa con texto árabe)"
-      }
-    ],
-    "miguel_test_16may": "fallo_total",
-    "notes": "Banner 'ZLR DIA SIGUIENTE / 011 CADIZ' (Zeleris). Destinatario debajo. 'Pl Bajo' va en floor_etc, NO en street. Tracking 301961024 a la derecha. Caja externa de WELEDA = remitente Madrid (RTE: TME GRAN PUBLICO)."
-  },
-  {
-    "filename": "zeleris_03.jpg",
-    "carrier_hint": "generic",
-    "carrier_real": "zeleris",
-    "label_rotated_deg": 0,
-    "expected_stops": [
-      {
-        "name": "CADIZFORNIA",
-        "street": "Carril Guerrero",
-        "number": "4",
-        "floor_etc": "Casa de Postas",
-        "postal_code": "11140",
-        "city": "Conil de la Frontera",
-        "province": "Cádiz",
-        "phone": "917077864",
-        "tracking_number": "ES2026PRO0001196227",
-        "notes": "Nicolas S02874 Giacomuchi P008 · Exp 008-20504732 · PAGADOS · 11CONIL"
-      }
-    ],
-    "miguel_test_16may": "fallo_total",
-    "notes": "RTE 'PRINT THIS PRINT THAT SPAIN - BARCELONA'. Destinatario es CADIZFORNIA (nombre comercio, no persona física). 'Carril' es prefijo de calle típico del sur de España (rural Conil), nuevo en el vocabulario del prompt 16 may."
-  },
-  {
-    "filename": "zeleris_04.jpg",
-    "carrier_hint": "generic",
-    "carrier_real": "zeleris",
-    "label_rotated_deg": 270,
-    "expected_stops": [
-      {
-        "name": "SRN Vertice Group SL (Jesús Silva)",
-        "street": "Calle Extramuros",
-        "number": "2",
-        "floor_etc": "Pl Bajo L Esc. U Nica",
-        "postal_code": "11140",
-        "city": "Conil de la Frontera",
-        "province": "Cádiz",
-        "phone": "917077864",
-        "tracking_number": "301879270",
-        "notes": "ESPECIAL · Entregar en el Hotel Arena House · 11CONIL · RTE TME Pequea Financiacion MF-Torrejón de Ardoz"
-      }
-    ],
-    "miguel_test_16may": "amarilla",
-    "notes": "Etiqueta rotada 270° (texto vertical leído desde el lado derecho). Gemini lo detectó parcialmente. 'NICA' al final es parte de 'L Esc. UNICA' (cortado por rotación). Nota 'Entregar en el Hotel Arena House' va en notes, NO en street."
-  },
-  {
-    "filename": "zeleris_05.jpg",
-    "carrier_hint": "generic",
-    "carrier_real": "zeleris",
-    "label_rotated_deg": 0,
-    "expected_stops": [
-      {
-        "name": "",
-        "street": "Avenida Dolores Ibárruri",
-        "number": "0",
-        "floor_etc": "",
-        "postal_code": "11140",
-        "city": "Conil de la Frontera",
-        "province": "Cádiz",
-        "phone": "",
-        "tracking_number": "",
-        "notes": ""
-      }
-    ],
-    "miguel_test_16may": "verde",
-    "notes": "Caso fácil — Gemini lo extrajo bien. Útil como referencia de qué SÍ funciona. Av. Dolores Ibárruri es una avenida principal de Conil costa."
-  },
-  {
-    "filename": "zeleris_06.jpg",
-    "carrier_hint": "generic",
-    "carrier_real": "zeleris",
-    "label_rotated_deg": 0,
-    "expected_stops": [
-      {
-        "name": "Luis Miguel Martín Sánchez",
+        "name": "Luis Miguel Martin Sanchez",
         "street": "Avenida Irlanda",
         "number": "33",
         "floor_etc": "",
@@ -125,20 +16,104 @@
         "province": "Cádiz",
         "phone": "917077864",
         "tracking_number": "83478008",
-        "notes": "11CONI (cortado por la perspectiva de la foto)"
+        "notes": "Zona reparto 11149 11CONIL · etiqueta lateral pegada al costado del paquete · cortada parcialmente (no se ve banner ZLR completo)"
       }
     ],
-    "miguel_test_16may": "fallo_total",
-    "notes": "Etiqueta cortada lateralmente (driver sostiene paquete y solo se ve la mitad). Solo se lee el lado izquierdo: destinatario + calle + CP. CP 11149 es Conil costa (urb El Palmar / Roche). Vocabulario 'Avda Irlanda' = patrón común urbanizaciones."
+    "rte_sender": "(no visible)"
   },
   {
-    "filename": "zeleris_07.jpg",
+    "filename": "raw/06e0b405-52bf-48da-b80a-731d465d08ce.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 90,
+    "expected_stops": [
+      {
+        "name": "AVANT EXPERT SERVICES S.L.",
+        "street": "Calle Carretera",
+        "number": "43",
+        "floor_etc": "",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "405-2687725-300027",
+        "notes": "Exp 008-20503329 · Bultos 01/001 · Kilos 10.00 · PAGADOS · 11CONIL · marcador manual 25"
+      }
+    ],
+    "rte_sender": "DMYTRO KURAKULOV - SANT CELONI"
+  },
+  {
+    "filename": "raw/0dc2de88-9fed-4db0-aa69-424695058452.JPG",
     "carrier_hint": "generic",
     "carrier_real": "zeleris",
     "label_rotated_deg": 0,
     "expected_stops": [
       {
-        "name": "Olga García Esteve",
+        "name": "Jose Manuel Buitrago Cordero",
+        "street": "Calle Canarias",
+        "number": "5",
+        "floor_etc": "Pl 2, Pta A",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83491697",
+        "notes": "Referencia cliente 301966498 · Bultos 1/1 · Kg 0.30 · ZLR DIA SIGUIENTE 011 CADIZ · ZONA REPARTO 11140/11CONIL · marcador manual 17"
+      }
+    ],
+    "rte_sender": "TME FUSION SAP / Torrejón de Ardoz / 28850"
+  },
+  {
+    "filename": "raw/1a783c0c-4d6a-4bf9-b3a4-d6150dcf7b76.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 90,
+    "expected_stops": [
+      {
+        "name": "SRN VERTICE GROUP SL",
+        "contact": "Jesús Silva",
+        "street": "Calle Extramuros",
+        "number": "00002",
+        "floor_etc": "P BAJO L ESC. UNICA",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "301879270",
+        "notes": "ESPECIAL · Entregar en el Hotel Arena House · Exp 028-83395706 · Kilos 1.00 · Fecha envío 16/04/2026 · ZONA 11CONIL · marcador manual 15"
+      }
+    ],
+    "rte_sender": "TME Pequea Financiacion MF - Torrejón de Ardoz"
+  },
+  {
+    "filename": "raw/31eb61c9-54da-4290-9f6c-dec791a87272.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 180,
+    "expected_stops": [
+      {
+        "name": "ILDEFONSO ARAGON E HIJOS S.L.",
+        "street": "Carretera del Pradillo",
+        "number": "S/N",
+        "floor_etc": "P BAJO L ESC. UNICA",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83445324",
+        "notes": "ZELERIS 14 / 011 CADIZ · ZONA REPARTO 11140/11CONIL · Kilos 0.10 · Fecha envío 24/04/2026 · PAGADOS · marcador manual 26 con scribble"
+      }
+    ],
+    "rte_sender": "TME GRANDES CUENTAS/MEDIANA/MADRID"
+  },
+  {
+    "filename": "raw/9749fd8f-a299-4693-a699-b6fb870fea1d.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "OLGA GARCIA ESTEVE",
         "street": "Avenida De Dolores Ibarruri",
         "number": "",
         "floor_etc": "FARMACIA 00",
@@ -147,32 +122,137 @@
         "province": "Cádiz",
         "phone": "917077864",
         "tracking_number": "83495152",
-        "notes": "Adjuntar al pedido PEDWEB2606565 · PAGADOS · 11CONIL · RTE WELEDA-MADRID · kilos 0.70"
+        "notes": "ZLR DIA SIGUIENTE 011 CADIZ · ZONA REPARTO 11140/11CONIL · PAGADOS · Adjuntar al pedido PEDWEB2606565 · Kilos 0.70 · Fecha envío 04/05/2026 · destinatario es comercio (farmacia) sin nº calle · marcador 18"
       }
     ],
-    "miguel_test_16may": "pendiente_test_post_fix",
-    "notes": "Foto enviada 11:58. Sin número de calle visible — 'FARMACIA 00' parece indicador del local (no portal). Test con nuevo prompt Zeleris pendiente."
+    "rte_sender": "WELEDA - MADRID"
   },
   {
-    "filename": "zeleris_08.jpg",
+    "filename": "raw/a1aa3616-b984-4c4a-86f2-d530453c8432.JPG",
     "carrier_hint": "generic",
     "carrier_real": "zeleris",
-    "label_rotated_deg": 90,
+    "label_rotated_deg": 0,
     "expected_stops": [
       {
-        "name": "Jesús Silva (SRN Vertice Group SL)",
-        "street": "Calle Extramuros",
-        "number": "2",
-        "floor_etc": "Pl Bajo L Esc. U Nica",
+        "name": "Maria Jose Del Carmen Parodi Leal",
+        "street": "Calle Prieta",
+        "number": "1",
+        "floor_etc": "Pl Bajo, Pta No Aplica",
         "postal_code": "11140",
         "city": "Conil de la Frontera",
         "province": "Cádiz",
         "phone": "917077864",
-        "tracking_number": "301879270",
-        "notes": "Mismo destino que zeleris_04 (Hotel Arena House). ESPECIAL. Foto enviada 11:58."
+        "tracking_number": "83486740",
+        "notes": "ZLR DIA SIGUIENTE 011 CADIZ · ZONA REPARTO 11140/11CONIL · PAGADOS · Bultos 1/1 · Kilos 5.80 · Fecha envío 03/05/2026 · ref cliente 301961024 · paquete WELEDA con texto árabe Espressomaskin (caja externa) · marcador 21"
       }
     ],
-    "miguel_test_16may": "pendiente_test_post_fix",
-    "notes": "Etiqueta rotada 90° (texto vertical, lado izquierdo del paquete). Paquete sobre cajas de Zeleris (logo verde con puntos). DUP de zeleris_04 — útil para test de dedup."
+    "rte_sender": "TME GRAN PUBLICO - MADRID"
+  },
+  {
+    "filename": "raw/a2f16f3d-cb7f-4843-bba2-6434e1be9d66.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "MIGUEL LOPEZ RAMIREZ",
+        "company": "KONILCITY SL",
+        "street": "Carril Los Limas",
+        "number": "",
+        "floor_etc": "",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "132502A7154542362K",
+        "notes": "ZLR DIA SIGUIENTE 011-001-CADIZ · ZONA REPARTO 11CONIL · Bultos 03/005 · Exp 015-28493042 · Referencia 26884 · PAGADOS · Carril Los Limas es vía rural (típico Conil interior) · sin número · marcador manual 24"
+      }
+    ],
+    "rte_sender": "26884 - ZONAFERRETERIA - A CORUÑA"
+  },
+  {
+    "filename": "raw/d409d18a-f6ce-42f5-b903-1608de0592ce.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Inmaculada Munoz Garcia",
+        "street": "Calle Malaga",
+        "number": "61",
+        "floor_etc": "",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83481221",
+        "notes": "ZLR DIA SIGUIENTE 011 CADIZ · ZONA REPARTO 11140/11CONIL · PAGADOS · Bultos 1/1 · Kilos 10.50 · Albarán 301955878 · Sector TE Telco · Canal CO260470GZUV4-3357 · marcador 15"
+      }
+    ],
+    "rte_sender": "TME GRAN PUBLICO - MADRID"
+  },
+  {
+    "filename": "raw/ed174059-6f83-42dd-a3c3-8599082e57ea.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "LYDIA GASKELL",
+        "street": "Carretera Fuente del Gallo",
+        "number": "728",
+        "floor_etc": "Casa Alondra",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "1C15D4451545534344W",
+        "notes": "ZLR DIA SIGUIENTE 011-001-CADIZ · ZONA REPARTO 11CONIL · PAGADOS · Bultos 01/001 · Exp 045-28497692 · Referencia ENV20260429113041 · Kilos 1.00 · Fecha envío 29/04/2026 · 'Casa Alondra' es el nombre de la vivienda (típico zonas residenciales rurales Conil) · marcador 20"
+      }
+    ],
+    "rte_sender": "PODENCO ACTIVE - TOLEDO"
+  },
+  {
+    "filename": "raw/f338ce31-734b-4877-b04a-57012aa1d419.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "CADIZFORNIA",
+        "contact": "Nicolas - S02874 Giacomuchi - P008",
+        "street": "Carril Guerrero",
+        "number": "4",
+        "floor_etc": "Casa de Postas",
+        "postal_code": "11140",
+        "city": "Conil de la Frontera",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "lrk",
+        "notes": "ZLR DIA SIGUIENTE 011-001-CADIZ · ZONA REPARTO 11CONIL · PAGADOS · Bultos 01/001 · Exp 008-20504732 · Referencia ES2026PRO0001196227 · Kilos 10.00 · Fecha envío 30/04/2026 · destinatario es comercio (CADIZFORNIA) · 'Casa de Postas' es etiqueta del local · marcador 19"
+      }
+    ],
+    "rte_sender": "PRINT THIS PRINT THAT SPAIN - BARCELONA"
+  },
+  {
+    "filename": "raw/IMG_0276.JPG",
+    "carrier_hint": "generic",
+    "carrier_real": "zeleris",
+    "label_rotated_deg": 180,
+    "expected_stops": [
+      {
+        "name": "Elena Maria Salas Perdigones",
+        "street": "Avenida La Independencia",
+        "number": "55",
+        "floor_etc": "",
+        "postal_code": "11580",
+        "city": "San Jose del Valle",
+        "province": "Cádiz",
+        "phone": "917077864",
+        "tracking_number": "83476399",
+        "notes": "ZLR DIA SIGUIENTE 011 001 - CADIZ · ZONA REPARTO 11580/11_PEDANI · PAGADOS · Bultos 1/1 · etiqueta físicamente rotada 180° respecto al sobre · destino es PEDANIA NO CONIL (11580 San José del Valle) — caso 'CP CADIZ no implica Conil' · marcador X4 15"
+      }
+    ],
+    "rte_sender": "TME GRAN PUBLICO - MADRID"
   }
 ]
