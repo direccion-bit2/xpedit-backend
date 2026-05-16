@@ -5191,6 +5191,32 @@ Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distinta
 
 12. Si una imagen no contiene una lista de paradas Y tampoco una etiqueta de envío (foto random sin texto reconocible), simplemente no añadas paradas de ahí.
 
+13. **EJEMPLOS RESUELTOS** (etiquetas físicas Zeleris reales de Conil/Cádiz — aprende estos patrones):
+
+EJEMPLO A — Etiqueta rotada 180° + CP 11580 ≠ Conil:
+- Vista superficial: parece rotada, banner "ZLR DIA SIGUIENTE 011 001 - CADIZ", RTE arriba "TME GRAN PUBLICO - MADRID".
+- Extracción correcta:
+  name: "Elena Maria Salas Perdigones"
+  street: "Avenida La Independencia"  number: "55"
+  postal_code: "11580"  city: "San Jose del Valle"  province: "Cádiz"
+- LECCIÓN: CP=11580 es San José del Valle (pedanía), NO Conil. NUNCA asumir Conil solo por ver "CADIZ" en el banner. El CP manda. El RTE "TME GRAN PUBLICO" se IGNORA.
+
+EJEMPLO B — Destinatario es COMERCIO + prefijo rural "Carril":
+- Vista superficial: nombre del destinatario en mayúsculas tipo razón social, calle empieza por "Carril".
+- Extracción correcta:
+  name: "CADIZFORNIA"  (es un comercio, mantener mayúsculas)
+  street: "Carril Guerrero"  number: "4"  floor_etc: "Casa de Postas"
+  postal_code: "11140"  city: "Conil de la Frontera"  province: "Cádiz"
+- LECCIÓN: el destinatario puede ser una empresa/comercio (mantén el nombre como aparece). "Carril" es prefijo VÁLIDO de vía rural en Conil — NO descartar como ruido. "Casa de Postas" es el nombre del local → va en floor_etc, no en street.
+
+EJEMPLO C — Vivienda con nombre + confusión RTE/destino:
+- Vista superficial: arriba "PODENCO ACTIVE - TOLEDO" (RTE), banner ZLR, abajo destinatario.
+- Extracción correcta:
+  name: "LYDIA GASKELL"
+  street: "Carretera Fuente del Gallo"  number: "728"  floor_etc: "Casa Alondra"
+  postal_code: "11140"  city: "Conil de la Frontera"  province: "Cádiz"
+- LECCIÓN: "PODENCO ACTIVE" es el RTE (toledano), NUNCA lo extraigas como destino. "Casa Alondra" es el nombre de la vivienda (típico zonas rurales Conil) → floor_etc. Carretera es prefijo VÁLIDO.
+
 Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
 
 
