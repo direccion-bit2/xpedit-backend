@@ -5217,6 +5217,43 @@ EJEMPLO C — Vivienda con nombre + confusión RTE/destino:
   postal_code: "11140"  city: "Conil de la Frontera"  province: "Cádiz"
 - LECCIÓN: "PODENCO ACTIVE" es el RTE (toledano), NUNCA lo extraigas como destino. "Casa Alondra" es el nombre de la vivienda (típico zonas rurales Conil) → floor_etc. Carretera es prefijo VÁLIDO.
 
+14. **Patrón PAACK (logo "paack" + flecha verde/morada arriba — variantes CFA, NT4, ECI, co-branded)**:
+    - PAACK NO imprime su propia info de origen; reusa la del cliente final (Anbo/Shein desde "Prologis (Anbo) Logistics Center, Datang Town, 528143 FO SHAN, CN" / Nike Europe desde "Carrer Camí de la Font Freda 1, 08110 Montcada i Reixac" / Amazon.es desde "Avenida de la Astronomía 24, 28830 San Fernando de Henares" / Tiendanimal vía DHL desde Ontigola). **JAMÁS extraigas ninguna de esas direcciones como destino** — son el ORIGEN.
+    - El destinatario real (persona + calle + CP + ciudad ES) aparece en el bloque CENTRAL de la etiqueta, normalmente DEBAJO del bloque del sender.
+    - El número grande arriba a la derecha (ej. 24391, 24350) suele ser el **wave/oleada de PAACK**, NO el postal_code. El CP real está en el bloque del destinatario y suele coincidir pero NO siempre.
+    - Badges `CFA`, `NT4`, `ECI` en esquinas son tipo de servicio PAACK, NO ciudad ni CP.
+    - Variante `ECI` (El Corte Inglés): layout en formato "Datos de Envío" con campos Operación venta + Pedido + Bulto + Oleada. Texto literal "PAACK" en medio inferior.
+    - Variante `co-branded Tiendanimal`: layout completo de Tiendanimal con badge paack arriba derecha + texto "Next-day delivery / Timeslot available - X hours".
+    - Variante `Amazon-Paack`: layout Amazon estándar con badge paack arriba derecha + códigos sortation (MAD4, A266, etc.).
+    - Etiquetas rotadas 90/180/270° muy frecuentes en CFA (sobre bolsas Anbo).
+    - Normalización: ciudad impresa como "Len" debe normalizarse a "León" (typo recurrente en generador NT4).
+    - `n12` significa "número 12" — extraer solo el dígito (`12`) en number.
+    - Pedanías de León típicas: Carbajal de la Legua, Aldea de la Valdoncina, San Miguel del Camino, Villarejo de Orbigo, Espinosa de la Ribera, Sariegos.
+
+EJEMPLO D — Paack CFA con sender Anbo China rotada:
+- Vista superficial: bolsa con etiqueta rotada 270°, logo paack arriba, badge CFA, sender "Prologis (Anbo) Logistics Center, 528143 FO SHAN, CN" arriba.
+- Extracción correcta:
+  name: "Camino Fernandez Gutierrez"
+  street: "Camino Quintana"  number: "15"  floor_etc: ""
+  postal_code: "24391"  city: "San Miguel del Camino"  province: "León"
+- LECCIÓN: ignorar el sender chino. El destinatario está en el bloque central debajo. Rotación 270° → rotar mentalmente para leer.
+
+EJEMPLO E — Paack NT4 con typo "Len" y dirección con piso:
+- Vista superficial: etiqueta rotada 90°, logo paack + badge NT4, sender Nike Europe Montcada, ciudad impresa como "Len".
+- Extracción correcta:
+  name: "Álvarez Villa M. Cristina"
+  street: "Calle el Fuero"  number: "15"  floor_etc: "4C"
+  postal_code: "24001"  city: "León"  province: "León"
+- LECCIÓN: "Len" → "León" (typo conocido NT4). "15 4C" se separa: number="15", floor_etc="4C". Sender Nike es ORIGEN, no destino.
+
+EJEMPLO F — Paack con dirección manuscrita sobre impresa tachada:
+- Vista superficial: dirección impresa "Avenida de Portugal 7" con un trazo a bolígrafo que la tacha + escrito a mano al lado "Rep Argentina 31 Pdo".
+- Extracción correcta (la manuscrita gana):
+  name: "Adriana Escalona"
+  street: "Calle República Argentina"  number: "31"  floor_etc: "Puerta"
+  postal_code: "24009"  city: "León"  province: "León"
+- LECCIÓN: cuando hay manuscrita superpuesta sobre dirección impresa tachada, la MANUSCRITA es la dirección REAL (re-direccionado). "Pdo" en este contexto = "Puerta" (abreviatura manuscrita común en León/Castilla). Expandir abreviaturas conocidas: "Pdo" → Puerta, "Pl" → Planta, "Esc" → Escalera, "Pta" → Puerta.
+
 Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
 
 

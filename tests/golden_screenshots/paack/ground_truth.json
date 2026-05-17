@@ -1,0 +1,256 @@
+[
+  {
+    "filename": "raw/670a75bf-4dd5-42f9-bade-fedc5e6eeda9.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "CFA",
+    "label_rotated_deg": 270,
+    "expected_stops": [
+      {
+        "name": "Camino Fernandez Gutierrez",
+        "street": "Camino Quintana",
+        "number": "15",
+        "floor_etc": "",
+        "postal_code": "24391",
+        "city": "San Miguel del Camino",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "C26042902372890",
+        "notes": "Etiqueta Paack pegada sobre bolsa Anbo · banner verde con icono Paack arriba derecha · CFA badge · Origen Prologis Anbo Datang Town 528143 FO SHAN CN (sender, ignorar) · Wave 24391 · ventana 10:00-22:00 2026-06-29 · 50.0x0.0x42.0 1.4Kg"
+      }
+    ],
+    "rte_sender": "Prologis (Anbo) Logistics Center, Datang Town, 528143 FO SHAN CN",
+    "notas_ml": "Imagen rotada 270° respecto a la orientación legible. Gemini debe leer mentalmente como vertical."
+  },
+  {
+    "filename": "raw/6b47aa78-0758-4b5d-8448-7230633a4adb.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "NT4",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Marina Fidalgo",
+        "street": "Calle Presidente Isidoro Nicolas",
+        "number": "10",
+        "floor_etc": "",
+        "postal_code": "24391",
+        "city": "Aldea de la Valdoncina",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "17777186919500012489385",
+        "notes": "Etiqueta Paack NT4 (Nike Logistics) sobre caja Nike roja · 1/1 · 40.0x23.0x30.0 1.6 Kg · ventana 10:00-00:00 2026-05-02 · Origen Nike Logistics Europe Carrer Camí de la Font Freda 1 08110 Montcada i Reixac (sender, ignorar)"
+      }
+    ],
+    "rte_sender": "Nike Logistics Europe — Montcada i Reixac",
+    "notas_ml": "Layout NT4: número wave (24391) arriba a la derecha + badge NT4 negro. Destinatario en bloque central. Tracking 22 dígitos."
+  },
+  {
+    "filename": "raw/331e56e8-8f83-4ae6-9f28-813c1c67112c.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "CFA",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Nisrine Slihimi",
+        "street": "Avenida de Orbigo",
+        "number": "35A",
+        "floor_etc": "2º C",
+        "postal_code": "24350",
+        "city": "Villarejo de Orbigo",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "C26042001649446",
+        "notes": "Etiqueta Paack CFA pegada sobre bolsa Anbo · logo Paack arriba derecha · barcode lateral con wave 24350 · 60.0x0.0x50.0 4.1 Kg · ventana 10:00-22:00 2026-06-20"
+      }
+    ],
+    "rte_sender": "Prologis (Anbo) Logistics Center, Datang Town, 528143 FO SHAN CN",
+    "notas_ml": "Floor_etc '2º C' debe extraerse separado de street. NO meter '35A 2º C' junto."
+  },
+  {
+    "filename": "raw/3799edb6-a8b6-4cd2-9cd7-f1c5701a5d13.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "CFA",
+    "label_rotated_deg": 0,
+    "label_has_manuscript_override": true,
+    "expected_stops": [
+      {
+        "name": "Adriana Escalona",
+        "street": "Calle República Argentina",
+        "number": "31",
+        "floor_etc": "Puerta?",
+        "postal_code": "24009",
+        "city": "León",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "C26031402152740",
+        "notes": "REDIRECCIÓN MANUSCRITA: dirección impresa 'Avenida de Portugal 7' está tachada a bolígrafo · escrito a mano 'Rep Argentina 31 Pdo' (Puerta/Bajo). La manuscrita tiene prioridad. · Anbo CN sender ignorar"
+      }
+    ],
+    "rte_sender": "Prologis (Anbo) Logistics Center, Datang Town, 528143 FO SHAN CN",
+    "notas_ml": "CRÍTICO: cuando hay manuscrita sobre dirección impresa tachada, la manuscrita es la dirección REAL. Gemini debe priorizar texto manuscrito sobre impreso tachado."
+  },
+  {
+    "filename": "raw/646eb296-02a7-44f1-9d27-272b32ea73d6.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "ECI",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Alfonso González Gutiérrez",
+        "street": "Avenida Suero de Quiñones",
+        "number": "4",
+        "floor_etc": "Planta Baja Mapfre",
+        "postal_code": "24002",
+        "city": "León",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "9470892002396287",
+        "notes": "Etiqueta El Corte Inglés (formato 'Datos de Envío') · número wave 325 327 + 24002 arriba · Operación venta 0010090956027772026022421192 · Pedido 2692055034972 · Bulto 001 · Oleada 20260225 0002 · 'PAACK' impreso bajo Datos Envío · Reembolso NO · Domicilio incluye 'Mapfre' como referencia local"
+      }
+    ],
+    "rte_sender": "El Corte Inglés",
+    "notas_ml": "VARIANTE ECI: layout completamente distinto al CFA/NT4 estándar. Sin barcodes principales en lateral. Datos en formato form-style. 'Mapfre' es punto de referencia (oficina), debe ir en floor_etc o notes."
+  },
+  {
+    "filename": "raw/39339593-70fd-49fa-8e02-205912ec487f.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "NT4",
+    "label_rotated_deg": 90,
+    "expected_stops": [
+      {
+        "name": "Álvarez Villa M. Cristina",
+        "street": "Calle el Fuero",
+        "number": "15",
+        "floor_etc": "4C",
+        "postal_code": "24001",
+        "city": "León",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "364458929",
+        "notes": "Paack NT4 (Nike Logistics) · wave 24001 + NT4 badge · ciudad impresa como 'Len' (typo truncado de 'León' — normalizar) · 0.1x0.2x0.4 1.38kg · 4/2/2026 · 01/01"
+      }
+    ],
+    "rte_sender": "Nike Logistics Europe — Montcada i Reixac",
+    "notas_ml": "EDGE CASE: ciudad impresa como 'Len' debido a truncamiento del label generator. Debe normalizarse a 'León' (province=León confirma). NT4 layout rotado 90°."
+  },
+  {
+    "filename": "raw/18014b6f-f5ad-41e8-a499-b1c31c012495.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "NT4",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Diez Estévez Marian",
+        "street": "Calle Burgo Nuevo",
+        "number": "2",
+        "floor_etc": "",
+        "postal_code": "24001",
+        "city": "León",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "364457560",
+        "notes": "Paack NT4 (Nike Logistics) · wave 24001 + NT4 badge · 0.1x0.2x0.3 0.79kg · 4/2/2026 · 02/02"
+      }
+    ],
+    "rte_sender": "Nike Logistics Europe — Montcada i Reixac",
+    "notas_ml": "NT4 estándar. Apellido + Nombre (orden invertido vs habitual). 02/02 indica 2 bultos del envío."
+  },
+  {
+    "filename": "raw/15a660ac-ab4a-4d39-8b8d-60b88cfa88ef.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "co-branded-Tiendanimal",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Sandra García Cañón",
+        "street": "Calle Burgo Nuevo",
+        "number": "8",
+        "floor_etc": "",
+        "postal_code": "24001",
+        "city": "León",
+        "province": "León",
+        "phone": "650536998",
+        "tracking_number": "070896403",
+        "notes": "Etiqueta co-branded Tiendanimal/Paack · Caja 13 · Packages 1/3 · Weight 20.01 P.PAGADOS · Next-day delivery Timeslot 4 hours · 03-02-26 · From ONTIGOLA to León · Referencia 070896403 · Origen Tiendanimal c/o DHL Supply Chain Dehesa de la plata II 3P Nave A 45340 Ontigola Spain (sender, ignorar)"
+      }
+    ],
+    "rte_sender": "Tiendanimal c/o DHL Supply Chain — Ontigola",
+    "notas_ml": "VARIANTE co-branded: layout Tiendanimal con badge Paack arriba derecha. Includes phone explicit. 'CAJA 13' es referencia interna, no parte de dirección."
+  },
+  {
+    "filename": "raw/bad75f40-7811-4c80-8cdc-0113c5ebef49.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "NT4",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Maria Muniz",
+        "street": "Calle Valdepegos",
+        "number": "12",
+        "floor_etc": "",
+        "postal_code": "24121",
+        "city": "Sariegos",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "1769811217947011330527",
+        "notes": "Paack NT4 · wave 24121 + NT4 badge · 10.0x20.0x20.0 1.9 Kg · ventana 09:00-23:00 2026-01-30 · 1/2 (1 de 2 bultos) · número escrito como 'n12' (n=número)"
+      }
+    ],
+    "rte_sender": "(no visible)",
+    "notas_ml": "Número escrito 'n12' donde 'n' = abreviatura 'número'. Debe extraerse number=12 (sin la n)."
+  },
+  {
+    "filename": "raw/929723ee-05dd-4a25-8ada-071dd6703074.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "CFA",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Veronica Aller Acebes",
+        "street": "Santa Colomba",
+        "number": "4",
+        "floor_etc": "",
+        "postal_code": "24274",
+        "city": "Espinosa de la Ribera",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "C260119026844299",
+        "notes": "Paack CFA · wave 24274 + CFA badge · 40.0x0.0x32.0 0.4 Kg · ventana 09:00-21:00 2026-03-21 · Origen Prologis Anbo Datang Town 528143 FO SHAN CN (sender, ignorar) · sobre bolsa con osito impreso"
+      }
+    ],
+    "rte_sender": "Prologis (Anbo) Logistics Center, Datang Town, 528143 FO SHAN CN",
+    "notas_ml": "CFA estándar. Ciudad rural pequeña (Espinosa de la Ribera, pedanía León)."
+  },
+  {
+    "filename": "raw/2967c1b2-5cd8-460c-9d21-3adc7d8be13d.jpg",
+    "carrier_hint": "generic",
+    "carrier_real": "paack",
+    "label_variant": "Amazon-Paack",
+    "label_rotated_deg": 0,
+    "expected_stops": [
+      {
+        "name": "Elena González Morán",
+        "street": "Urbanización Monteleón",
+        "number": "",
+        "floor_etc": "Chalet 58",
+        "postal_code": "24196",
+        "city": "Carbajal de la Legua",
+        "province": "León",
+        "phone": "",
+        "tracking_number": "534000021252813169",
+        "notes": "Etiqueta Amazon.es con badge Paack arriba derecha · Pkg 1 OF 1 · 0.44 Kgs · MAD4 A266 · Datamatrix grid · Origen Amazon.es Avenida de la Astronomía 24 San Fernando de Henares 28830 (sender, ignorar) · zona urbanización chalets (no número de calle, identificador es chalet)"
+      }
+    ],
+    "rte_sender": "Amazon.es — San Fernando de Henares",
+    "notas_ml": "EDGE CASE: dirección sin número de calle convencional, identificador = 'Chalet 58' dentro de urbanización. number queda vacío, identificador completo en floor_etc. Carbajal de la Legua es pedanía de Sariegos, CP 24196."
+  }
+]
