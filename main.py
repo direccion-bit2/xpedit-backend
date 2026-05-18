@@ -1151,6 +1151,15 @@ OSRM_MAX_RETRIES = 8  # Persist: better to wait than fall back to haversine
 OSRM_RETRY_DELAYS = [1.5, 2.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0]  # ~26s total wait max
 OSRM_CHUNK_SIZE = 100  # Max sources per chunked request
 
+# OpenRouteService — fallback regional para LATAM/US donde OSRM público no cubre.
+# Free tier: 500 matrix req/día, max 50 ubicaciones por request.
+# Se activa solo si ORS_API_KEY está set en env. Sin key → fallback Haversine.
+# 18 may 2026: Daniel (MX, 100 stops Monterrey) reproduce OSRM 400 — los drivers
+# LATAM llevan meses optimizando con Haversine sin calidad routing real.
+ORS_API_KEY = os.getenv("ORS_API_KEY", "")
+ORS_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
+ORS_MAX_LOCATIONS = 50  # Free tier limit
+
 
 async def _osrm_table_request(
     coords_str: str,
@@ -1212,12 +1221,70 @@ async def _osrm_table_request(
     return None
 
 
+async def _ors_matrix_request(locations: list) -> dict | None:
+    """
+    OpenRouteService Matrix API — fallback regional para zonas no cubiertas
+    por OSRM público (LATAM, US, etc).
+
+    Free tier: 500 matrix req/día, max 50 ubicaciones por request.
+    Sin API key configurada → retorna None (caller cae a Haversine).
+
+    18 may 2026: añadido tras incidente OSRM 400 con Daniel (MX, 100 stops
+    Monterrey). LATAM llevaba meses con Haversine sin saberlo.
+    """
+    if not ORS_API_KEY:
+        return None
+    n = len(locations)
+    if n > ORS_MAX_LOCATIONS:
+        logger.info(f"ORS skipped: {n} locations > {ORS_MAX_LOCATIONS} free tier limit")
+        return None
+
+    body = {
+        "locations": [[float(loc["lng"]), float(loc["lat"])] for loc in locations],
+        "metrics": ["distance", "duration"],
+        "units": "m",
+    }
+    headers = {
+        "Authorization": ORS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(ORS_URL, json=body, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "distances" in data and "durations" in data:
+                    logger.info(f"ORS matrix OK: {n} locations")
+                    return {
+                        "distances": [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]],
+                        "durations": [[int(d) if d is not None else 999999 for d in row] for row in data["durations"]],
+                    }
+                logger.warning(f"ORS returned 200 but missing fields: {list(data.keys())}")
+                return None
+            if resp.status_code == 403:
+                logger.warning("ORS 403 — quota exceeded or bad API key")
+            elif resp.status_code == 429:
+                logger.warning("ORS 429 rate limit")
+            else:
+                logger.warning(f"ORS {resp.status_code}: {resp.text[:200]}")
+            return None
+    except Exception as e:
+        logger.warning(f"ORS request failed: {type(e).__name__}: {e}")
+        return None
+
+
 async def get_road_distance_matrix(locations: list) -> dict | None:
     """
-    Obtiene matrices de distancias y duraciones reales por carretera usando OSRM.
-    Reintenta agresivamente. Para >100 paradas, chunkea con sources/destinations.
+    Obtiene matrices de distancias y duraciones reales por carretera.
+
+    Flujo (18 may 2026):
+    1. OSRM público — para España y Europa (cobertura full).
+    2. ORS API (si OSRM falla y hay API key) — para LATAM/US y resto del mundo.
+    3. None → caller (optimizer) cae a Haversine.
+
     La matriz de duraciones es ASIMÉTRICA (A→B ≠ B→A) por calles de un sentido.
-    Retorna {"distances": [...], "durations": [...]} o None si OSRM es inalcanzable.
+    Retorna {"distances": [...], "durations": [...]} o None.
     """
     import asyncio
 
@@ -1231,7 +1298,11 @@ async def get_road_distance_matrix(locations: list) -> dict | None:
     if n <= OSRM_CHUNK_SIZE:
         data = await _osrm_table_request(coords, n_label=n)
         if not data:
-            logger.error(f"OSRM FAILED for {n} locations after all retries")
+            logger.warning(f"OSRM FAILED for {n} locations after all retries — trying ORS fallback")
+            ors_data = await _ors_matrix_request(locations)
+            if ors_data:
+                return ors_data
+            logger.error(f"Both OSRM and ORS failed for {n} locations — caller will fall back to Haversine")
             return None
         logger.info(f"OSRM road matrix OK: {n} locations")
         distances = [[int(d) if d is not None else 999999 for d in row] for row in data["distances"]]
@@ -1254,7 +1325,9 @@ async def get_road_distance_matrix(locations: list) -> dict | None:
 
         data = await _osrm_table_request(coords, sources_param=sources_param, n_label=n)
         if not data:
-            logger.error(f"OSRM chunk {chunk_start}-{chunk_end} FAILED for {n} locations")
+            logger.warning(f"OSRM chunk {chunk_start}-{chunk_end} FAILED for {n} locations")
+            # ORS no soporta chunking en free tier (max 50 locations total) —
+            # para rutas grandes en LATAM, caemos a Haversine. Caller maneja.
             return None
 
         # data["distances"] has (chunk_end - chunk_start) rows x n columns
