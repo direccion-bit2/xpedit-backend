@@ -2007,7 +2007,14 @@ async def soft_delete_stop(body: StopDeleteRequest, user=Depends(get_current_use
     resolved_id = body.stop_id
     if not resolved_id:
         if not body.route_id or not body.client_id:
-            raise HTTPException(status_code=400, detail="stop_id o (route_id+client_id) requerido")
+            # Filosofía best-effort: si llega una op legacy sin identificadores
+            # suficientes, NO devolvemos 400 (el cliente lo trataría como
+            # PERMANENT_PG_CODE y dropearía la op sin guardarla en ningún sitio).
+            # En su lugar devolvemos 200 + skipped:true para que el drain marque
+            # la op como done y aprendamos del breadcrumb en Sentry. La op se
+            # perdería igual con 400, pero al menos no llenamos Sentry de
+            # excepciones para algo irrecuperable.
+            return {"success": True, "skipped": True, "reason": "missing_identifiers"}
         # Resolver por (route_id, client_id) — UNIQUE en stops
         lookup = await asyncio.to_thread(
             lambda: supabase.table("stops").select("id")
@@ -2069,11 +2076,43 @@ async def update_push_token(driver_id: str, body: PushTokenUpdate, user=Depends(
 
 @app.post("/location", tags=["tracking"], summary="Registrar ubicación")
 async def update_location(location: LocationUpdate, user=Depends(get_current_user)):
-    """Registra la ubicación GPS actual del conductor. Fuerza el driver_id del usuario autenticado."""
+    """Registra la ubicación GPS actual del conductor. Fuerza el driver_id del usuario autenticado.
+
+    Best-effort: si el user autenticado no tiene fila en drivers todavía (race
+    condition tras signup RC webhook, edge case auth), creamos la fila aquí
+    con datos mínimos en lugar de devolver 400. Sin esto, drivers iOS recién
+    sign-up que mandan GPS desde el primer minuto perderían tracking entero
+    (cada ping → 400 → 0 location_history → admin no los ve nunca).
+    """
     # Force driver_id to be the authenticated user's driver
     user_driver_id = await get_user_driver_id(user)
     if not user_driver_id:
-        raise HTTPException(status_code=400, detail="No se encontró perfil de conductor")
+        try:
+            new_driver = await asyncio.to_thread(
+                lambda: supabase.table("drivers").insert({
+                    "user_id": user["id"],
+                    "email": user.get("email"),
+                    "name": (user.get("email") or "Driver").split("@")[0],
+                }).execute()
+            )
+            row = safe_first(new_driver)
+            if row:
+                user_driver_id = row["id"]
+                logger.warning(
+                    "auto-created driver row for user_id=%s in POST /location (best-effort)",
+                    user["id"],
+                )
+            else:
+                raise HTTPException(status_code=500, detail="No se pudo crear perfil de conductor")
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Race condition: otro POST /location del mismo user lo creó entre
+            # nuestro SELECT y nuestro INSERT. Re-leer.
+            user_driver_id = await get_user_driver_id(user)
+            if not user_driver_id:
+                logger.error("Failed auto-create driver for user_id=%s: %s", user["id"], e)
+                raise HTTPException(status_code=500, detail="Error al asegurar perfil de conductor") from e
     if user["role"] != "admin" and location.driver_id != user_driver_id:
         raise HTTPException(status_code=403, detail="No puedes registrar ubicación de otro conductor")
     data = {
