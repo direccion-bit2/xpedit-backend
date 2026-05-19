@@ -1933,6 +1933,77 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
     return {"success": True, "route": route}
 
 
+class ReconcileOptimizationBody(BaseModel):
+    """Cliente envía los datos de optimización que tiene en local cuando
+    detecta que BD los perdió (optimized_hash NULL en una ruta in_progress).
+    Patrón rescate, similar a reconcileLocalVsRemoteStops."""
+    optimized_hash: str
+    polyline_points: Optional[list] = None
+    return_leg_polyline: Optional[list] = None
+    snapped_waypoints: Optional[list] = None
+    stops_order: Optional[list[dict]] = None  # [{stop_id, position}, ...]
+
+
+@app.patch("/routes/{route_id}/reconcile-optimization", tags=["routes"], summary="Rescatar datos optimización desde cliente")
+async def reconcile_route_optimization(
+    route_id: str,
+    body: ReconcileOptimizationBody,
+    user=Depends(get_current_user),
+):
+    """Rescata datos de optimización que el cliente sí tiene en AsyncStorage
+    pero la BD perdió (el UPDATE original entre `/optimize` cliente y el
+    persist falló por crash, red, etc.). Idempotente — solo escribe si BD
+    actualmente NO tiene optimized_hash. Si BD ya tiene un hash distinto,
+    abortar (puede haber re-optimización más reciente).
+
+    Limita el alcance a rutas in_progress o pending del propio driver
+    para que el reconcile NO pueda alterar rutas completed/cancelled."""
+    await verify_route_access(route_id, user)
+    # Defensive: leer estado actual de la ruta
+    existing = await asyncio.to_thread(
+        lambda: supabase.table("routes")
+        .select("id, status, optimized_hash")
+        .eq("id", route_id)
+        .limit(1)
+        .single()
+        .execute()
+    )
+    row = existing.data
+    if not row:
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+    if row.get("status") not in ("pending", "in_progress"):
+        raise HTTPException(status_code=409, detail=f"Ruta en estado {row.get('status')}, no reconciliable")
+    current_hash = row.get("optimized_hash")
+    if current_hash and current_hash != body.optimized_hash:
+        return {"success": False, "reason": "hash_mismatch", "current_hash": current_hash}
+    update_fields: dict = {"optimized_hash": body.optimized_hash}
+    if body.polyline_points is not None:
+        update_fields["polyline_points"] = body.polyline_points
+    if body.return_leg_polyline is not None:
+        update_fields["return_leg_polyline"] = body.return_leg_polyline
+    if body.snapped_waypoints is not None:
+        update_fields["snapped_waypoints"] = body.snapped_waypoints
+    await asyncio.to_thread(
+        lambda: supabase.table("routes").update(update_fields).eq("id", route_id).execute()
+    )
+    # Aplicar nuevo orden de stops si viene
+    stops_updated = 0
+    if body.stops_order:
+        for item in body.stops_order:
+            sid = item.get("stop_id")
+            pos = item.get("position")
+            if sid is None or pos is None:
+                continue
+            try:
+                await asyncio.to_thread(
+                    lambda s=sid, p=pos: supabase.table("stops").update({"position": p}).eq("id", s).eq("route_id", route_id).execute()
+                )
+                stops_updated += 1
+            except Exception:
+                continue
+    return {"success": True, "stops_reordered": stops_updated, "polyline_persisted": body.polyline_points is not None}
+
+
 @app.patch("/routes/{route_id}/complete", tags=["routes"], summary="Completar ruta")
 async def complete_route(route_id: str, user=Depends(get_current_user)):
     """Marca una ruta como 'completed' y registra la hora de finalización.
