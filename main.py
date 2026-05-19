@@ -1936,12 +1936,17 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 class ReconcileOptimizationBody(BaseModel):
     """Cliente envía los datos de optimización que tiene en local cuando
     detecta que BD los perdió (optimized_hash NULL en una ruta in_progress).
-    Patrón rescate, similar a reconcileLocalVsRemoteStops."""
+    Patrón rescate, similar a reconcileLocalVsRemoteStops.
+
+    `force=True`: el cliente ACABA de optimizar y es la fuente de verdad
+    fresca → saltar el guard hash_mismatch (autorizar sobrescritura).
+    Solo lo manda el path post-optimize, nunca el rescate cold-start."""
     optimized_hash: str
     polyline_points: Optional[list] = None
     return_leg_polyline: Optional[list] = None
     snapped_waypoints: Optional[list] = None
     stops_order: Optional[list[dict]] = None  # [{stop_id, position}, ...]
+    force: bool = False
 
 
 @app.patch("/routes/{route_id}/reconcile-optimization", tags=["routes"], summary="Rescatar datos optimización desde cliente")
@@ -1974,7 +1979,7 @@ async def reconcile_route_optimization(
     if row.get("status") not in ("pending", "in_progress"):
         raise HTTPException(status_code=409, detail=f"Ruta en estado {row.get('status')}, no reconciliable")
     current_hash = row.get("optimized_hash")
-    if current_hash and current_hash != body.optimized_hash:
+    if current_hash and current_hash != body.optimized_hash and not body.force:
         return {"success": False, "reason": "hash_mismatch", "current_hash": current_hash}
     update_fields: dict = {"optimized_hash": body.optimized_hash}
     if body.polyline_points is not None:

@@ -698,3 +698,98 @@ class TestRouteActions:
 
         assert response.status_code == 200
         assert response.json()["success"] is True
+
+
+class TestReconcileOptimization:
+    """Tests for PATCH /routes/{route_id}/reconcile-optimization."""
+
+    def _mock_dispatch(self, existing_route: dict):
+        """Build a Supabase table mock that yields existing_route on the
+        first select+single chain (route lookup), and absorbs the UPDATE chain
+        used to persist hash + polyline."""
+        driver_lookup = MagicMock()
+        driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+
+        route_access = MagicMock()
+        route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
+
+        route_select = MagicMock()
+        route_select.data = existing_route
+
+        call_count = {"routes": 0}
+
+        def table_dispatch(name):
+            chain = MagicMock()
+            if name == "routes":
+                call_count["routes"] += 1
+                if call_count["routes"] == 1:
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                elif call_count["routes"] == 2:
+                    chain.select.return_value.eq.return_value.limit.return_value.single.return_value.execute.return_value = route_select
+                else:
+                    chain.update.return_value.eq.return_value.execute.return_value = MagicMock()
+            elif name == "drivers":
+                chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+            elif name == "stops":
+                chain.update.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock()
+            return chain
+
+        return table_dispatch
+
+    @pytest.mark.asyncio
+    async def test_persists_when_bd_has_no_hash(self, client):
+        """BD vacío + cliente envía hash → escribe, success=true."""
+        with patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(
+                side_effect=self._mock_dispatch({"id": "route-1", "status": "in_progress", "optimized_hash": None})
+            )
+            response = await client.patch(
+                "/routes/route-1/reconcile-optimization",
+                json={"optimized_hash": "abc123", "polyline_points": [[1.0, 2.0]]},
+            )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_hash_mismatch_without_force(self, client):
+        """BD ya tiene hash distinto + force ausente → success=false hash_mismatch."""
+        with patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(
+                side_effect=self._mock_dispatch({"id": "route-1", "status": "in_progress", "optimized_hash": "old"})
+            )
+            response = await client.patch(
+                "/routes/route-1/reconcile-optimization",
+                json={"optimized_hash": "new"},
+            )
+        body = response.json()
+        assert response.status_code == 200
+        assert body["success"] is False
+        assert body["reason"] == "hash_mismatch"
+        assert body["current_hash"] == "old"
+
+    @pytest.mark.asyncio
+    async def test_force_overwrites_existing_hash(self, client):
+        """BD tiene hash distinto + force=true (post-optimize) → sobrescribe."""
+        with patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(
+                side_effect=self._mock_dispatch({"id": "route-1", "status": "in_progress", "optimized_hash": "old"})
+            )
+            response = await client.patch(
+                "/routes/route-1/reconcile-optimization",
+                json={"optimized_hash": "new", "polyline_points": [[1.0, 2.0]], "force": True},
+            )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_refuses_completed_route(self, client):
+        """Ruta completed no es reconciliable (evita reabrir histórico)."""
+        with patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(
+                side_effect=self._mock_dispatch({"id": "route-1", "status": "completed", "optimized_hash": None})
+            )
+            response = await client.patch(
+                "/routes/route-1/reconcile-optimization",
+                json={"optimized_hash": "abc"},
+            )
+        assert response.status_code == 409
