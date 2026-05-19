@@ -6809,6 +6809,7 @@ async def places_autocomplete(
     input: str,
     lat: Optional[float] = None,
     lng: Optional[float] = None,
+    country: Optional[str] = None,
     sessiontoken: Optional[str] = None,
     user=Depends(get_current_user),
 ):
@@ -6816,7 +6817,12 @@ async def places_autocomplete(
 
     `sessiontoken` (opcional) agrupa keystrokes + Place Details en una única
     sesión facturable. Con session token, Google factura SOLO el Details final
-    y los autocompletes son gratis."""
+    y los autocompletes son gratis.
+
+    `country` (ISO-3166-1 alpha-2, p.ej. 'AR'): restringe resultados al país.
+    Sin esta restricción Google asume España por defecto y un driver argentino
+    buscando "Calle Ancha" recibe direcciones de Madrid antes que las suyas.
+    """
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
     import asyncio
 
@@ -6840,6 +6846,10 @@ async def places_autocomplete(
     if lat and lng:
         params["location"] = f"{lat},{lng}"
         params["radius"] = "30000"
+    cc = (country or "").strip().lower()
+    if len(cc) == 2 and cc.isalpha():
+        params["components"] = f"country:{cc}"
+        params["region"] = cc
     if sessiontoken:
         params["sessiontoken"] = sessiontoken
 

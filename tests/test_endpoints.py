@@ -671,6 +671,43 @@ class TestPlacesEndpoints:
         assert called_params.get("sessiontoken") == "abc-123-uuid"
 
     @pytest.mark.asyncio
+    async def test_places_autocomplete_country_bias_forwards_components(self, client):
+        """country=AR must reach Google as components=country:ar + region=ar.
+        Without this, Google defaults to ES and an Argentine driver searching
+        'Calle Ancha' gets Madrid before San Juan (#112)."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "OK", "predictions": []}
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/autocomplete?input=Calle+Ancha&country=ar")
+        assert response.status_code == 200
+        called_params = mock_http.get.call_args.kwargs.get("params", {})
+        assert called_params.get("components") == "country:ar"
+        assert called_params.get("region") == "ar"
+
+    @pytest.mark.asyncio
+    async def test_places_autocomplete_country_ignored_when_invalid(self, client):
+        """Garbage country (3+ chars, digits, empty) must NOT reach Google so
+        we don't accidentally restrict to nothing."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "OK", "predictions": []}
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/autocomplete?input=foo&country=spain")
+        assert response.status_code == 200
+        called_params = mock_http.get.call_args.kwargs.get("params", {})
+        assert "components" not in called_params
+        assert "region" not in called_params
+
+    @pytest.mark.asyncio
     async def test_places_autocomplete_no_sessiontoken_backcompat(self, client):
         """Without sessiontoken the endpoint still works (back-compat for old app
         builds). Google receives no sessiontoken param and falls back to per-request
