@@ -6952,6 +6952,55 @@ def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tup
     return norm, bias
 
 
+def _country_iso_from_coords(lat: Optional[float], lng: Optional[float]) -> Optional[str]:
+    """Devuelve ISO-2 del país probable según lat/lng. None si está en zona ambigua
+    (frontera, mar, fuera de mercados conocidos).
+
+    Bounding boxes intencionalmente CONSERVADORAS — solo clasifica el "core" del
+    país, dejando frontera ambigua (especialmente CL/AR alrededor de la cordillera
+    de los Andes lng ≈ -68 a -70) como None para evitar falsos positivos.
+    Caso de uso: detectar mismatch entre GPS y `country` flag del driver — si el
+    helper devuelve None lo dejamos en "no sé" (mantén filter por seguridad).
+    """
+    if lat is None or lng is None:
+        return None
+    # ES peninsular + Baleares
+    if 36.0 <= lat <= 43.8 and -9.5 <= lng <= 4.5:
+        return "ES"
+    # ES Canarias
+    if 27.5 <= lat <= 29.5 and -18.2 <= lng <= -13.4:
+        return "ES"
+    # MX
+    if 14.5 <= lat <= 32.7 and -117.0 <= lng <= -86.7:
+        return "MX"
+    # CO (excluye costa pacífica que se solapa con EC)
+    if 1.5 <= lat <= 12.5 and -79.0 <= lng <= -67.0:
+        return "CO"
+    # EC
+    if -4.8 <= lat <= 1.4 and -81.0 <= lng <= -75.2:
+        return "EC"
+    # PE (excluye norte Amazónico que toca CO/BR)
+    if -18.3 <= lat <= -0.5 and -81.0 <= lng <= -68.8:
+        return "PE"
+    # CL puro (lng < -70, lejos de la cordillera). Frontera -70/-68 = None
+    if -55.5 <= lat <= -17.5 and -76.0 <= lng <= -70.0:
+        return "CL"
+    # UY — check ANTES que AR porque Río de la Plata cae dentro del bbox AR.
+    # lng >= -58.0 excluye Buenos Aires (-58.38) que está al oeste del río.
+    if -34.97 <= lat <= -30.08 and -58.0 <= lng <= -53.07:
+        return "UY"
+    # AR puro (lng > -65, lejos de la cordillera).
+    if -55.0 <= lat <= -21.7 and -65.0 <= lng <= -53.5:
+        return "AR"
+    # BO
+    if -22.9 <= lat <= -9.7 and -69.6 <= lng <= -57.5:
+        return "BO"
+    # PY
+    if -27.6 <= lat <= -19.3 and -62.6 <= lng <= -54.3:
+        return "PY"
+    return None
+
+
 @app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
 async def places_autocomplete(
     input: str,
@@ -6996,8 +7045,24 @@ async def places_autocomplete(
         params["radius"] = "30000"
     cc = (country or "").strip().lower()
     if len(cc) == 2 and cc.isalpha():
-        params["components"] = f"country:{cc}"
-        params["region"] = cc
+        # Safety net: si GPS del driver claramente NO está en `country`
+        # (Christian 20 may: BD country=AR pero GPS en La Serena CL → 0 results
+        # cada búsqueda, app inservible), saltamos el hard filter. Google sigue
+        # priorizando por proximidad gracias a location+radius. Mantiene el
+        # filter cuando GPS está en zona ambigua/frontera o no hay GPS — solo lo
+        # quita cuando es OBVIO que el flag está mal.
+        gps_iso = _country_iso_from_coords(lat, lng)
+        if gps_iso and gps_iso.lower() != cc:
+            logger.warning(
+                f"places/autocomplete: country flag '{cc}' != GPS country '{gps_iso}' "
+                f"(driver_id={user.get('id')}). Dropping country filter — keeping GPS bias."
+            )
+            # Sin components ni region — solo location bias. El flag estaba mal,
+            # arreglamos la búsqueda ahora y la auditoría country mismatch lo
+            # corrige offline.
+        else:
+            params["components"] = f"country:{cc}"
+            params["region"] = cc
     if sessiontoken:
         params["sessiontoken"] = sessiontoken
 
