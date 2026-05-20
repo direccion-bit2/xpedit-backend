@@ -5430,6 +5430,12 @@ Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distinta
 
 11. **Nunca dejes street vacío** si la imagen tiene CP+ciudad legibles y SI hay alguna línea con patrón de dirección. Busca "Avda", "Av.", "Calle", "C/", "C.", "Plaza", "Pza", "Camino", "Carretera", "Ctra", "Rúa", "Carrer", "Cuesta", "Travesía", "Paseo", "Polígono", "Carril", "Cortijo", "Urbanización", "Urb.", "Barriada", "Bda.", "Diseminado", "Pago de" seguidos opcionalmente de número.
 
+11.b **CRÍTICO — NUNCA dejes `number` ni `postal_code` vacíos si están visibles en la imagen**. Patrón observado 20 may: en un lote de 10 etiquetas de Móstoles, el modelo extrajo correctamente la calle ("CALLE URANO", "BERLIN", "REYES CATOLICOS", etc.) pero devolvió `number=""` y `postal_code=""` en TODAS aunque las etiquetas físicas los llevaban impresos. ANTES de devolver un campo vacío:
+   - Vuelve a inspeccionar la imagen buscando explícitamente: dígitos sueltos cerca del nombre de la calle (ej. "C/NIZA 12", "BERLIN, 4"), dígitos al final de la línea de dirección, números separados por coma/guion, números pegados a "nº", "núm", "#".
+   - Para `postal_code`: busca 5 dígitos juntos junto a la ciudad ("28937 Móstoles", "28938 MOSTOLES"), o solos en otra línea.
+   - Si tras releer SIGUEN sin estar visibles, devuelve "" y baja `confidence_per_field` de ese campo a 0.2. Pero **el comportamiento por defecto debe ser EXTRAER, no omitir**.
+   - Para CEIPs/colegios/empresas/comercios: la etiqueta de mensajería SIEMPRE lleva número de portal (el repartidor no entregaría sin él). Si no lo ves, está rotado, en pequeño, o tapado — sigue buscando antes de rendirte.
+
 12. Si una imagen no contiene una lista de paradas Y tampoco una etiqueta de envío (foto random sin texto reconocible), simplemente no añadas paradas de ahí.
 
 13. **EJEMPLOS RESUELTOS** (etiquetas físicas Zeleris reales de Conil/Cádiz — aprende estos patrones):
