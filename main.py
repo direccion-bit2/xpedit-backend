@@ -5161,11 +5161,16 @@ async def ocr_training_contribute(
     if not driver_id:
         raise HTTPException(status_code=403, detail={"error": "driver_not_found"})
 
-    # Rate limit + dedupe: 1 batch / driver / día.
+    # Decisión Miguel 20 may 17:28: eliminado el rate limit "1 batch/día".
+    # Si el driver quiere subir 5 batches el mismo día (60 fotos), bienvenido
+    # — cada batch trae más seed real para entrenar el OCR. El bonus +10 imgs
+    # MSI mañana se sigue dando con cualquier `last_contribution_at` reciente
+    # (no se multiplica con N batches porque _get_msi_bonus_today devuelve 10
+    # fijo si fue ayer). Mantenemos el SELECT solo para leer country.
     try:
         d = (
             supabase.table("drivers")
-            .select("last_contribution_at, country")
+            .select("country")
             .eq("id", driver_id)
             .single()
             .execute()
@@ -5174,21 +5179,6 @@ async def ocr_training_contribute(
     except Exception as e:
         logger.warning(f"training-contribute drivers lookup failed: {e}")
         raise HTTPException(status_code=500, detail={"error": "lookup_failed"}) from e
-
-    last = row.get("last_contribution_at")
-    if last:
-        try:
-            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            if last_dt.astimezone(timezone.utc).date() == datetime.now(timezone.utc).date():
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "error": "already_contributed_today",
-                        "message": "¡Gracias! Ya has aportado hoy. Vuelve mañana para subir más etiquetas.",
-                    },
-                )
-        except (ValueError, AttributeError):
-            pass
 
     country_iso = row.get("country")
 
