@@ -64,7 +64,7 @@ if SENTRY_DSN:
 
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=1.0,  # 100% temporarily until we trust ingestion; drop to 0.1 once stable
+        traces_sample_rate=0.1,  # 10% — ingestion estable desde may 2026, evita saturar cuota
         profiles_sample_rate=0.1,
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
         release=_release,
