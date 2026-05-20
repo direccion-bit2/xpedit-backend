@@ -781,9 +781,15 @@ def get_ocr_quota_status(driver_id: str, tier: str) -> dict:
 
 def _get_msi_bonus_today(driver_id: str) -> int:
     """Devuelve +10 si el driver contribuyó etiquetas vía /ocr/training-contribute
-    HOY. Reward para incentivar el flywheel de seed crowdsourcing (decisión
-    Miguel 20 may 15:45). El flag persiste en drivers.last_contribution_at;
-    si su fecha == hoy UTC → bonus activo.
+    AYER. Cambio Miguel 20 may 16:13: el bonus se entrega al DÍA SIGUIENTE
+    (no el mismo día). Razón: si das bonus el mismo día, el driver puede
+    haber gastado ya la quota y el regalo no se nota. Dándolo al día siguiente
+    es un incentivo claro a volver a usar el importador mañana.
+
+    Lógica:
+    - Día N: driver contribuye → drivers.last_contribution_at = N
+    - Día N+1: bonus activo (last_contribution_at = ayer UTC)
+    - Día N+2 o posterior: bonus expirado, return 0
     """
     try:
         res = (
@@ -797,7 +803,10 @@ def _get_msi_bonus_today(driver_id: str) -> int:
         if not last:
             return 0
         last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-        if last_dt.astimezone(timezone.utc).date() == datetime.now(timezone.utc).date():
+        last_date = last_dt.astimezone(timezone.utc).date()
+        today = datetime.now(timezone.utc).date()
+        # Bonus activo SOLO el día siguiente a la contribución.
+        if (today - last_date).days == 1:
             return 10
         return 0
     except Exception:
@@ -5230,8 +5239,8 @@ async def ocr_training_contribute(
         "ok": True,
         "uploaded": inserted,
         "failed": failed,
-        "bonus_quota_msi_today": 10,
-        "message": f"¡Gracias! Subiste {inserted} etiquetas. Tienes +10 imágenes extra hoy para el importador de pantallazos.",
+        "bonus_quota_msi_tomorrow": 10,
+        "message": f"¡Gracias! Subiste {inserted} etiquetas. Mañana tendrás +10 imágenes extra para el importador de pantallazos.",
     }
 
 
