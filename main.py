@@ -5199,7 +5199,12 @@ class MSIRouteContext(BaseModel):
 class MSIBatchRequest(BaseModel):
     images: List[MSIScreenshotImage] = Field(..., min_length=1, max_length=_MSI_MAX_IMAGES)
     carrier_hint: Optional[Literal[
-        "ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"
+        "ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa",
+        # Añadidos 20 may 2026 — Gemini ahora reconoce estos carriers tras
+        # 50+ ejemplos seed/golden. Antes caían silenciosamente a 'generic'
+        # y el few-shot dinámico nunca encontraba ejemplos del carrier real.
+        "sending", "paack", "ups", "zeleris",
+        "generic"
     ]] = None
     route_context: Optional[MSIRouteContext] = None
     # Opt-in flag for the OCR learning loop. When True the backend uploads
@@ -5291,7 +5296,11 @@ def _msi_gemini_response_schema() -> dict:
             "carrier_detected": {
                 "type": "STRING",
                 "description": "Detected carrier from app UI hints (logo, colors, layout). Use 'generic' if uncertain.",
-                "enum": ["ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa", "generic"],
+                "enum": [
+                    "ctt", "mrw", "seur", "gls", "nacex", "correos_express", "tipsa",
+                    "sending", "paack", "ups", "zeleris",
+                    "generic",
+                ],
             },
             "language": {"type": "STRING", "description": "Detected language (ISO-639-1). Usually 'es'."},
             "stops": {
@@ -5349,17 +5358,25 @@ def _msi_load_dynamic_examples(carrier_hint: Optional[str], limit: int = 3) -> s
     aprendizaje sin redeploy.
 
     Prefiere admin_corrected_at descendente (los más recientes de Miguel
-    son ground truth más fiable). Si carrier es generic/None, devuelve "".
+    son ground truth más fiable).
+
+    20 may v2 — bug Miguel "SENDING no reconoce":
+    - Si carrier='generic' o None, ANTES retornábamos "" y la etiqueta jamás
+      veía ejemplos. Ahora cargamos hasta `limit` golden examples mezclados
+      de TODOS los carriers para que el modelo tenga alguna pista (mejor algo
+      que nada — patrón de extracción cualquier carrier > prompt seco).
+    - `eq("carrier_hint", upper())` fallaba con seeds en mixed case
+      ('Sending', 'PAACK', 'Zeleris'). Cambiado a ilike para tolerar mayúsculas.
     """
-    if not carrier_hint or carrier_hint == "generic":
-        return ""
     try:
-        carrier_norm = carrier_hint.upper()
-        res = supabase.table("ocr_corrections").select(
-            "model_extracted_address, user_final_address, admin_corrected_parts, model_extracted_parts"
-        ).eq("is_golden_example", True).eq("carrier_hint", carrier_norm).order(
-            "admin_corrected_at", desc=True
-        ).limit(limit).execute()
+        q = supabase.table("ocr_corrections").select(
+            "model_extracted_address, user_final_address, admin_corrected_parts, model_extracted_parts, carrier_hint"
+        ).eq("is_golden_example", True)
+        if carrier_hint and carrier_hint != "generic":
+            # ilike case-insensitive con el valor exacto (sin wildcards) —
+            # tolera 'sending' vs 'Sending' vs 'SENDING' en BD.
+            q = q.ilike("carrier_hint", carrier_hint)
+        res = q.order("admin_corrected_at", desc=True).limit(limit).execute()
         rows = res.data or []
     except Exception as e:
         # Sentry capture pero NO romper el OCR si BD está mala
@@ -5372,8 +5389,12 @@ def _msi_load_dynamic_examples(carrier_hint: Optional[str], limit: int = 3) -> s
     if not rows:
         return ""
 
+    if carrier_hint and carrier_hint != "generic":
+        header_label = f"de {carrier_hint.upper()}"
+    else:
+        header_label = "(de varios carriers — usa el patrón general)"
     lines = [
-        f"\n\n15. **EJEMPLOS REALES de {carrier_norm} corregidos por drivers/admin** (aprende estos patrones específicos del carrier):\n"
+        f"\n\n15. **EJEMPLOS REALES {header_label} corregidos por drivers/admin** (aprende estos patrones específicos):\n"
     ]
     for i, r in enumerate(rows, 1):
         model_addr = (r.get("model_extracted_address") or "").strip()
