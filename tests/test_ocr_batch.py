@@ -300,8 +300,17 @@ class TestMSIExtraction:
 
 class TestMSIRateLimit:
     @pytest.mark.asyncio
-    async def test_trial_quota_5_per_day(self, client):
-        """Active trial allows 5 batches/day, 6th call fails with 429."""
+    async def test_trial_quota_blocks_at_limit(self, client, monkeypatch):
+        """Active trial allows N batches/day, (N+1)th fails with 429.
+
+        Patch the trial limit down to 5 for this test (prod value is 30 —
+        ver main._OCR_QUOTA_LIMITS) so we don't have to fire 30+ real
+        HTTP calls in CI. We're not testing the value, we're testing that
+        the counter+429 path works when the limit is crossed.
+        """
+        import main as _main
+        monkeypatch.setitem(_main._OCR_DAILY_IMG_QUOTA, "trial", 5)
+
         future = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat().replace("+00:00", "Z")
         row = _drivers_row(promo_plan="pro", expires_at=future, sub_src=None)
         with patch("main.supabase") as mock_sb, patch(
