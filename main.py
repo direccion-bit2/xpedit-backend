@@ -729,9 +729,11 @@ _OCR_DAILY_IMG_QUOTA = {
     # tope".
     "free": 0,         # Locked. Free users see the paywall.
     "trial": 30,       # 7-day trial: enough to feel the value.
-    "pro": 20,         # /ocr/label only — MSI is Pro+ gated upstream.
-    "pro_yearly": 20,  # Same as monthly intentionally.
-    "pro_plus": 50,
+    "pro": 30,         # Same as trial — Miguel decision 20 may: MSI for Pro
+                       # accelerates the OCR learning flywheel. Pricing rises
+                       # with QUALITY of MSI, not by gating who can use it.
+    "pro_yearly": 30,  # Aligned with Pro monthly (was 20).
+    "pro_plus": 50,    # Premium tier kept higher for future power-users.
     # `_verify_msi_access` returns 'pro_yearly' for any sub_period='yearly',
     # so a Pro+ yearly user also resolves to 'pro_yearly' here. That keeps
     # yearly users at 20/day across the board, which protects the lower
@@ -5172,8 +5174,10 @@ async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
 # stops with Gemini 2.5 Pro. Day 1 returns raw extraction; Day 2 will add
 # normalization + Google Geocoding with ES anchors.
 #
-# Gate: Pro+ paid OR Pro yearly OR active Pro trial. See _verify_msi_access.
-# Rate limit: 5 batches/day on trial, 50 batches/day on Pro+/yearly.
+# Gate: any paying user (Pro / Pro yearly / Pro+) OR active Pro trial.
+# 20 may decision (Miguel): MSI no longer gated to Pro+ — opening it to Pro
+# monthly maximizes the learning flywheel (more corrections → better OCR →
+# higher willingness-to-pay later). Rate limit per tier in _OCR_DAILY_IMG_QUOTA.
 
 _MSI_MAX_IMAGES = 10
 _MSI_MAX_IMAGE_B64 = 12_000_000  # ~9 MB per image post-base64
@@ -5208,17 +5212,18 @@ class MSIBatchRequest(BaseModel):
 def _verify_msi_access(auth_user_id: str) -> dict:
     """Gate for /ocr/screenshots-batch. Returns {tier, is_eligible, trial_eligible}.
 
-    Eligible:
+    Eligible (decision Miguel 20 may — abrir MSI a Pro para acelerar el
+    flywheel de aprendizaje):
       - Pro+ paid: promo_plan='pro_plus' AND subscription_source IN ('stripe','revenuecat')
-      - Pro yearly: subscription_period='yearly' (treat as premium tier)
-      - Active trial: promo_plan='pro' AND promo_plan_expires_at > NOW()
-        AND subscription_source IS NULL  (i.e. not paid Pro monthly)
+      - Pro paid (monthly o yearly): promo_plan='pro' AND subscription_source IN ('stripe','revenuecat')
+      - Pro yearly por sub_period: subscription_period='yearly' (any plan name)
+      - Active trial: promo_plan IN ('pro','pro_plus') AND expires > NOW() AND source IS NULL
 
-    Pro paid monthly is NOT eligible — this is the Pro+ differentiator.
+    Solo `free` (sin trial activo y sin pago) cae al paywall. La quota diaria
+    por tier la cubre `_OCR_DAILY_IMG_QUOTA` (trial=pro=30, pro_plus=50).
 
-    Raises HTTPException(403) if not eligible. The detail body always includes
-    `trial_eligible` so the app knows whether to show "Start trial" or
-    "Upgrade to Pro+" in the paywall.
+    Raises HTTPException(403) si no eligible. Detail incluye `trial_eligible`
+    para que la app decida mostrar "Start trial" vs "Upgrade".
     """
     try:
         d = supabase.table("drivers").select(
@@ -5235,6 +5240,7 @@ def _verify_msi_access(auth_user_id: str) -> dict:
     sub_period = row.get("subscription_period")
 
     is_pro_plus_paid = promo == "pro_plus" and sub_src in ("stripe", "revenuecat")
+    is_pro_paid = promo == "pro" and sub_src in ("stripe", "revenuecat")
     is_pro_yearly = sub_period == "yearly"
 
     is_trial = False
@@ -5245,19 +5251,31 @@ def _verify_msi_access(auth_user_id: str) -> dict:
         except (ValueError, AttributeError):
             is_trial = False
 
-    is_eligible = is_pro_plus_paid or is_pro_yearly or is_trial
-    tier = "pro_plus" if is_pro_plus_paid else ("pro_yearly" if is_pro_yearly else ("trial" if is_trial else "none"))
+    is_eligible = is_pro_plus_paid or is_pro_paid or is_pro_yearly or is_trial
+
+    # Tier resolution: pro_plus wins over yearly wins over pro wins over trial.
+    if is_pro_plus_paid:
+        tier = "pro_plus"
+    elif is_pro_yearly:
+        tier = "pro_yearly"
+    elif is_pro_paid:
+        tier = "pro"
+    elif is_trial:
+        tier = "trial"
+    else:
+        tier = "none"
 
     if not is_eligible:
-        # Trial-eligible if user has never used a trial or trial already expired
-        # (we offer extension via email/marketing flow). For now, true if no
-        # subscription at all and trial not currently active.
         trial_eligible = sub_src is None and not is_trial
         raise HTTPException(
             status_code=403,
             detail={
+                # Code kept as 'pro_plus_required' for backwards compat with
+                # the app (4 sites in MultiScreenshotImport / screenshotImport).
+                # After the 20 may decision MSI is open to Pro too — this 403
+                # only fires for users with NO subscription nor active trial.
                 "error": "pro_plus_required",
-                "message": "El importador de pantallazos es exclusivo de Pro+. Activa la prueba o suscríbete.",
+                "message": "El importador de pantallazos requiere suscripción. Activa la prueba o suscríbete.",
                 "trial_eligible": trial_eligible,
             },
         )

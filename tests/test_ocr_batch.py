@@ -165,20 +165,26 @@ class TestMSIGate:
         assert resp.json()["tier"] == "trial"
 
     @pytest.mark.asyncio
-    async def test_pro_monthly_paid_blocked(self, client):
-        """Pro paid (monthly) must be blocked — MSI is Pro+ exclusive."""
+    async def test_pro_monthly_paid_allowed(self, client):
+        """Pro paid (monthly) is allowed since 20 may 2026.
+
+        Decision Miguel: open MSI to Pro normal (not only Pro+) to accelerate
+        the OCR learning flywheel — más correcciones = mejor OCR = mayor
+        willingness-to-pay después. Quota cap en _OCR_DAILY_IMG_QUOTA['pro']=30.
+        """
         row = _drivers_row(
             promo_plan="pro", sub_src="revenuecat", sub_period="monthly"
         )
-        with patch("main.supabase") as mock_sb:
+        with patch("main.supabase") as mock_sb, patch(
+            "main._msi_extract_stops_with_gemini", return_value=_gemini_ok_payload()
+        ):
             mock_sb.table.return_value = _patch_drivers_lookup(row)
             resp = await client.post(
                 "/ocr/screenshots-batch",
                 json={"images": [{"image_base64": "AAAA", "media_type": "image/jpeg"}]},
             )
-        assert resp.status_code == 403
-        detail = resp.json()["detail"]
-        assert detail["error"] == "pro_plus_required"
+        assert resp.status_code == 200
+        assert resp.json()["tier"] == "pro"
 
     @pytest.mark.asyncio
     async def test_free_user_blocked_with_trial_eligible(self, client):
@@ -191,7 +197,9 @@ class TestMSIGate:
             )
         assert resp.status_code == 403
         detail = resp.json()["detail"]
-        assert detail["error"] == "pro_plus_required"
+        # 20 may: error code 'pro_plus_required' renombrado a
+        # 'subscription_required' al abrir MSI a Pro normal.
+        assert detail["error"] == "subscription_required"
         assert detail["trial_eligible"] is True
 
     @pytest.mark.asyncio
