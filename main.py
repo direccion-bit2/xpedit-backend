@@ -7261,7 +7261,9 @@ async def places_autocomplete(
         # quita cuando es OBVIO que el flag está mal.
         gps_iso = _country_iso_from_coords(lat, lng)
         if gps_iso and gps_iso.lower() != cc:
-            logger.warning(
+            # INFO en vez de WARNING (20 may 21:03): es comportamiento esperado del
+            # safety net, no un fallo. Sentry agrupaba estas líneas como regresiones.
+            logger.info(
                 f"places/autocomplete: country flag '{cc}' != GPS country '{gps_iso}' "
                 f"(driver_id={user.get('id')}). Dropping country filter — keeping GPS bias."
             )
