@@ -5349,33 +5349,41 @@ def _msi_gemini_response_schema() -> dict:
     }
 
 
-def _msi_load_dynamic_examples(carrier_hint: Optional[str], limit: int = 3) -> str:
+def _msi_load_dynamic_examples(
+    carrier_hint: Optional[str],
+    country_iso: Optional[str] = None,
+    limit: int = 3,
+) -> str:
     """Lee golden examples desde ocr_corrections para inyectar como few-shot
-    dinámico en el prompt de Gemini. Fix TODO #256 (20 may 2026): hasta hoy
-    el prompt solo tenía ejemplos hardcoded (Zeleris/Paack). Ahora cada
-    nueva corrección golden (driver edit + geocoded, o admin_corrected_parts
-    editado en /admin/ocr-corrections) se convierte en ejemplo de
-    aprendizaje sin redeploy.
+    dinámico en el prompt de Gemini.
 
-    Prefiere admin_corrected_at descendente (los más recientes de Miguel
-    son ground truth más fiable).
+    Historial:
+    - 20 may v1: añadido filtro carrier_hint con ilike case-insensitive.
+    - 20 may v2: si carrier='generic'/None, mezcla ejemplos de varios carriers.
+    - 20 may v3 (lección Miguel): añadido filtro country_iso para NO contaminar
+      OCR de LATAM con seeds ES. Los 113 golden actuales son TODOS de ES — si
+      llega una etiqueta CO/MX/AR/CL/PE/EC y le metemos ejemplos con "C/ Mayor 5
+      28013 Madrid" como pista, el modelo aprende patrones ES (calles "C/",
+      CP 5 dígitos, "Avenida", "Plaza") y los aplica mal a la dirección LATAM.
+      Mejor sin ejemplos (modelo razona desde foto) que con ejemplos del país
+      equivocado. Las primeras correcciones reales LATAM cuando se promuevan a
+      golden alimentarán el few-shot para su propio país.
 
-    20 may v2 — bug Miguel "SENDING no reconoce":
-    - Si carrier='generic' o None, ANTES retornábamos "" y la etiqueta jamás
-      veía ejemplos. Ahora cargamos hasta `limit` golden examples mezclados
-      de TODOS los carriers para que el modelo tenga alguna pista (mejor algo
-      que nada — patrón de extracción cualquier carrier > prompt seco).
-    - `eq("carrier_hint", upper())` fallaba con seeds en mixed case
-      ('Sending', 'PAACK', 'Zeleris'). Cambiado a ilike para tolerar mayúsculas.
+    Prefiere admin_corrected_at descendente (los más recientes son ground truth
+    más fiable).
     """
     try:
         q = supabase.table("ocr_corrections").select(
-            "model_extracted_address, user_final_address, admin_corrected_parts, model_extracted_parts, carrier_hint"
+            "model_extracted_address, user_final_address, admin_corrected_parts, "
+            "model_extracted_parts, carrier_hint, country_iso"
         ).eq("is_golden_example", True)
         if carrier_hint and carrier_hint != "generic":
-            # ilike case-insensitive con el valor exacto (sin wildcards) —
-            # tolera 'sending' vs 'Sending' vs 'SENDING' en BD.
+            # ilike case-insensitive — tolera 'sending'/'Sending'/'SENDING'.
             q = q.ilike("carrier_hint", carrier_hint)
+        if country_iso:
+            # Filtro por país DESTINO. Sin este filtro, drivers LATAM recibían
+            # patrones ES como ejemplo y aprendían formatos equivocados.
+            q = q.ilike("country_iso", country_iso)
         res = q.order("admin_corrected_at", desc=True).limit(limit).execute()
         rows = res.data or []
     except Exception as e:
@@ -5564,7 +5572,7 @@ EJEMPLO F — Paack con dirección manuscrita sobre impresa tachada:
   street: "Calle República Argentina"  number: "31"  floor_etc: "Puerta"
   postal_code: "24009"  city: "León"  province: "León"
 - LECCIÓN: cuando hay manuscrita superpuesta sobre dirección impresa tachada, la MANUSCRITA es la dirección REAL (re-direccionado). "Pdo" en este contexto = "Puerta" (abreviatura manuscrita común en León/Castilla). Expandir abreviaturas conocidas: "Pdo" → Puerta, "Pl" → Planta, "Esc" → Escalera, "Pta" → Puerta.
-{_msi_load_dynamic_examples(carrier_hint)}
+{_msi_load_dynamic_examples(carrier_hint, country_iso=(route_context.country if route_context and route_context.country else None))}
 Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
 
 
