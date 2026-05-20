@@ -779,6 +779,31 @@ def get_ocr_quota_status(driver_id: str, tier: str) -> dict:
     }
 
 
+def _get_msi_bonus_today(driver_id: str) -> int:
+    """Devuelve +10 si el driver contribuyó etiquetas vía /ocr/training-contribute
+    HOY. Reward para incentivar el flywheel de seed crowdsourcing (decisión
+    Miguel 20 may 15:45). El flag persiste en drivers.last_contribution_at;
+    si su fecha == hoy UTC → bonus activo.
+    """
+    try:
+        res = (
+            supabase.table("drivers")
+            .select("last_contribution_at")
+            .eq("id", driver_id)
+            .single()
+            .execute()
+        )
+        last = (res.data or {}).get("last_contribution_at")
+        if not last:
+            return 0
+        last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        if last_dt.astimezone(timezone.utc).date() == datetime.now(timezone.utc).date():
+            return 10
+        return 0
+    except Exception:
+        return 0
+
+
 def check_ocr_image_quota(driver_id: str, tier: str, n_images: int):
     """Enforce a per-driver, per-day OCR image quota. Counts IMAGES, not requests.
     Raises 429 if accepting the new images would push the user over their tier's
@@ -790,7 +815,9 @@ def check_ocr_image_quota(driver_id: str, tier: str, n_images: int):
         return
     now = time.time()
     key = f"ocr_imgs:{driver_id}:daily"
-    max_imgs = _OCR_DAILY_IMG_QUOTA.get(tier, _OCR_DAILY_IMG_QUOTA["free"])
+    base_limit = _OCR_DAILY_IMG_QUOTA.get(tier, _OCR_DAILY_IMG_QUOTA["free"])
+    bonus = _get_msi_bonus_today(driver_id)
+    max_imgs = base_limit + bonus
     _rate_limits[key] = [t for t in _rate_limits[key] if t > now - _OCR_QUOTA_WINDOW]
     if len(_rate_limits[key]) + n_images > max_imgs:
         raise HTTPException(
@@ -5086,6 +5113,126 @@ async def ocr_quota(user=Depends(get_current_user)):
     """
     tier, driver_id = _resolve_user_tier(user["id"])
     return get_ocr_quota_status(driver_id or user["id"], tier)
+
+
+class OCRContributeImage(BaseModel):
+    image_base64: str = Field(..., max_length=12_000_000)  # ~9MB post-base64
+    media_type: Literal["image/jpeg", "image/png", "image/webp"] = "image/jpeg"
+
+
+class OCRContributeRequest(BaseModel):
+    images: List[OCRContributeImage] = Field(..., min_length=1, max_length=10)
+
+
+@app.post("/ocr/training-contribute", tags=["ocr"], summary="Subir etiquetas para entrenar el OCR")
+async def ocr_training_contribute(
+    request: OCRContributeRequest,
+    user=Depends(get_current_user),
+):
+    """Drivers suben 1-10 etiquetas de su galería para entrenar el OCR.
+
+    No pasa por Gemini (no consume Gemini quota ni MSI daily quota). Solo
+    sube las imágenes al bucket `ocr-training` con `source='contribution'`
+    y deja una fila pendiente en `ocr_corrections` para que el admin las
+    revise + promueva a golden manualmente.
+
+    Recompensa (decisión Miguel 20 may 15:50): +10 imágenes bonus MSI
+    quota ese día — registrado vía `drivers.last_contribution_at = NOW()`.
+    `_get_msi_bonus_today` lee ese campo y, si == hoy, suma 10 al límite
+    diario base.
+
+    Rate limit: 1 batch/día/driver (vía same `last_contribution_at` check).
+    Consentimiento: implícito al pulsar el botón en la app (el banner deja
+    claro que las imágenes se usan para mejorar el escáner).
+    """
+    driver_id = await get_user_driver_id(user["id"])
+    if not driver_id:
+        raise HTTPException(status_code=403, detail={"error": "driver_not_found"})
+
+    # Rate limit + dedupe: 1 batch / driver / día.
+    try:
+        d = (
+            supabase.table("drivers")
+            .select("last_contribution_at, country")
+            .eq("id", driver_id)
+            .single()
+            .execute()
+        )
+        row = d.data or {}
+    except Exception as e:
+        logger.warning(f"training-contribute drivers lookup failed: {e}")
+        raise HTTPException(status_code=500, detail={"error": "lookup_failed"}) from e
+
+    last = row.get("last_contribution_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if last_dt.astimezone(timezone.utc).date() == datetime.now(timezone.utc).date():
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "already_contributed_today",
+                        "message": "¡Gracias! Ya has aportado hoy. Vuelve mañana para subir más etiquetas.",
+                    },
+                )
+        except (ValueError, AttributeError):
+            pass
+
+    country_iso = row.get("country")
+
+    # Upload + insert rows. Si falla alguna, seguimos con las demás (best-effort)
+    # y reportamos el conteo final al cliente.
+    import base64
+    import uuid as _uuid
+    inserted = 0
+    failed = 0
+    for img in request.images:
+        try:
+            img_bytes = base64.b64decode(img.image_base64, validate=False)
+            uid = _uuid.uuid4().hex
+            storage_path = f"contribution/{driver_id}/{uid}.jpg"
+            supabase.storage.from_("ocr-training").upload(
+                storage_path,
+                img_bytes,
+                {"content-type": "image/jpeg", "upsert": "true"},
+            )
+            supabase.table("ocr_corrections").insert({
+                "source": "contribution",
+                "driver_id": driver_id,
+                "country_iso": country_iso,
+                "image_storage_path": storage_path,
+                "user_action": "pending",
+                "user_consented_training": True,
+                "is_golden_example": False,
+                "prompt_version": "contribution_v1",
+                "notes": f"contribución voluntaria 20may driver={driver_id[:8]}",
+            }).execute()
+            inserted += 1
+        except Exception as e:
+            failed += 1
+            try:
+                sentry_sdk.capture_exception(e)
+            except Exception:
+                pass
+
+    if inserted == 0:
+        raise HTTPException(status_code=500, detail={"error": "all_uploads_failed"})
+
+    # Marca contribution date para activar el bonus +10 MSI quota hoy
+    try:
+        supabase.table("drivers").update(
+            {"last_contribution_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", driver_id).execute()
+    except Exception as e:
+        logger.warning(f"training-contribute last_contribution_at update failed: {e}")
+
+    return {
+        "ok": True,
+        "uploaded": inserted,
+        "failed": failed,
+        "bonus_quota_msi_today": 10,
+        "message": f"¡Gracias! Subiste {inserted} etiquetas. Tienes +10 imágenes extra hoy para el importador de pantallazos.",
+    }
 
 
 @app.post("/ocr/label", tags=["ocr"], summary="OCR de etiqueta de envío")
