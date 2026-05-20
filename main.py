@@ -5322,9 +5322,62 @@ def _msi_gemini_response_schema() -> dict:
     }
 
 
+def _msi_load_dynamic_examples(carrier_hint: Optional[str], limit: int = 3) -> str:
+    """Lee golden examples desde ocr_corrections para inyectar como few-shot
+    dinámico en el prompt de Gemini. Fix TODO #256 (20 may 2026): hasta hoy
+    el prompt solo tenía ejemplos hardcoded (Zeleris/Paack). Ahora cada
+    nueva corrección golden (driver edit + geocoded, o admin_corrected_parts
+    editado en /admin/ocr-corrections) se convierte en ejemplo de
+    aprendizaje sin redeploy.
+
+    Prefiere admin_corrected_at descendente (los más recientes de Miguel
+    son ground truth más fiable). Si carrier es generic/None, devuelve "".
+    """
+    if not carrier_hint or carrier_hint == "generic":
+        return ""
+    try:
+        carrier_norm = carrier_hint.upper()
+        res = supabase.table("ocr_corrections").select(
+            "model_extracted_address, user_final_address, admin_corrected_parts, model_extracted_parts"
+        ).eq("is_golden_example", True).eq("carrier_hint", carrier_norm).order(
+            "admin_corrected_at", desc=True
+        ).limit(limit).execute()
+        rows = res.data or []
+    except Exception as e:
+        # Sentry capture pero NO romper el OCR si BD está mala
+        try:
+            sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = [
+        f"\n\n15. **EJEMPLOS REALES de {carrier_norm} corregidos por drivers/admin** (aprende estos patrones específicos del carrier):\n"
+    ]
+    for i, r in enumerate(rows, 1):
+        model_addr = (r.get("model_extracted_address") or "").strip()
+        final_addr = (r.get("user_final_address") or "").strip()
+        truth_parts = r.get("admin_corrected_parts") or {}
+        lines.append(f"EJEMPLO REAL #{i}:")
+        if model_addr and final_addr and model_addr != final_addr:
+            lines.append(f'- Modelo extrajo: "{model_addr[:140]}"')
+            lines.append(f'- Resultado correcto: "{final_addr[:140]}"')
+        elif final_addr:
+            lines.append(f'- Dirección correcta: "{final_addr[:140]}"')
+        if isinstance(truth_parts, dict) and truth_parts:
+            kvs = ", ".join(f"{k}={v}" for k, v in truth_parts.items() if v)[:240]
+            if kvs:
+                lines.append(f"- Campos ground-truth: {kvs}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _msi_build_prompt(carrier_hint: Optional[str], route_context: Optional[MSIRouteContext]) -> str:
-    """Builds the system prompt for screenshot extraction. V1 will inject
-    per-carrier few-shot examples (TODO #256). Day 1 ships generic prompt."""
+    """Builds the system prompt for screenshot extraction. Injects per-carrier
+    few-shot examples desde ocr_corrections (TODO #256 cerrado 20 may 2026)."""
     carrier_line = ""
     if carrier_hint and carrier_hint != "generic":
         carrier_line = f"\nEl usuario indica que las pantallas son de la app del courier: {carrier_hint.upper()}. Usa ese contexto para localizar campos."
@@ -5441,7 +5494,7 @@ EJEMPLO F — Paack con dirección manuscrita sobre impresa tachada:
   street: "Calle República Argentina"  number: "31"  floor_etc: "Puerta"
   postal_code: "24009"  city: "León"  province: "León"
 - LECCIÓN: cuando hay manuscrita superpuesta sobre dirección impresa tachada, la MANUSCRITA es la dirección REAL (re-direccionado). "Pdo" en este contexto = "Puerta" (abreviatura manuscrita común en León/Castilla). Expandir abreviaturas conocidas: "Pdo" → Puerta, "Pl" → Planta, "Esc" → Escalera, "Pta" → Puerta.
-
+{_msi_load_dynamic_examples(carrier_hint)}
 Responde EXCLUSIVAMENTE con un JSON válido siguiendo el schema indicado. Sin texto adicional, sin markdown."""
 
 
