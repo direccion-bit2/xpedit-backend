@@ -197,9 +197,11 @@ class TestMSIGate:
             )
         assert resp.status_code == 403
         detail = resp.json()["detail"]
-        # 20 may: error code 'pro_plus_required' renombrado a
-        # 'subscription_required' al abrir MSI a Pro normal.
-        assert detail["error"] == "subscription_required"
+        # Error code se mantiene como 'pro_plus_required' por compat con
+        # la app (MultiScreenshotImport + screenshotImport.ts). Tras la
+        # apertura del 20 may, solo se dispara para users sin sub ni trial
+        # — el mensaje fue ajustado pero el código sigue igual.
+        assert detail["error"] == "pro_plus_required"
         assert detail["trial_eligible"] is True
 
     @pytest.mark.asyncio
