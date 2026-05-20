@@ -5428,7 +5428,6 @@ Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distinta
    - "n12", "Nº 12", "número 12", "núm. 12" → number="12" (solo el dígito).
    - "Pdo" manuscrito junto al número → floor_etc="Puerta" (abreviatura común León/Castilla).
    - "Pta No Aplica" → IGNORAR (no es información útil, no rellenar floor_etc).
-   - "FARMACIA 00", "FARMACIA" sola en línea de número → no es number, es indicador de comercio. Si la dirección no tiene número visible, poner number="S/N" y floor_etc="Farmacia" o usar Farmacia como name si no hay otro destinatario.
    - "P.Bajo", "Pl Bajo", "Bajo L", "Bajo" → floor_etc="Planta Bajo" (o "Planta Bajo (xxx)" si lleva apellido como "Bajo L Mapfre", "Bajo D").
    - "Esc Única", "Esc Izquierda", "Escalera 2" → floor_etc="Esc <X>".
    - "Pl 2 Pta A", "Planta 3 Puerta B" → floor_etc="Pl <X> Pta <Y>".
@@ -5436,6 +5435,19 @@ Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distinta
    - "Carril", "Cortijo", "Pago de", "Camino" son prefijos VÁLIDOS de vía rural (Cádiz, Castilla, Galicia) — no los confundas con texto suelto.
    - PAACK NT4 normaliza "Len" impreso → "León" (typo conocido).
    - Cuando la etiqueta lleva "Adjuntar al pedido X", "Entrega a partir de las HH:MMh", "Entregar en el Hotel X" → va a `notes`, no a otros campos.
+
+8.c **🎯 business_name (CAMPO CRÍTICO PARA GEOCODING)**: cuando la etiqueta lleva un nombre de empresa, comercio, local o establecimiento (sufijo SL/SA/SLU/SAU, palabra FARMACIA/HOTEL/RESTAURANTE/SUPERMERCADO/CLÍNICA/HOSPITAL/COLEGIO, marca conocida como MAPFRE/MERCADONA/EL CORTE INGLÉS, o nombre de fantasía como "Konilcity SL"/"Hotel Arena House"/"Bar Manolo"), **extráelo SIEMPRE en el campo `business_name`** del JSON, NO en floor_etc ni en name.
+
+   Por qué importa: el cliente downstream puede buscarlo en Google Places **directamente** ("Konilcity SL Conil") y Google devuelve la dirección EXACTA del local — muchísimo más fiable que geocodificar una calle sola que a veces es vía rural sin número (Carril Los Limas) o una avenida larga (Avda Dolores Ibárruri). Si la calle viene con la empresa, ambas se quedan: street para fallback, business_name para Place Search prioritario.
+
+   Reglas:
+   - Si ves "Mapfre" junto a "Avda Suero de Quiñones 4 P.Bajo" → business_name="Mapfre", floor_etc="Planta Bajo", street/number SE QUEDAN.
+   - Si ves "Konilcity SL" junto a "Carril Los Limas" → business_name="Konilcity SL", street="Carril Los Limas", number="S/N" si no hay (la empresa GANA al geocodificar).
+   - Si ves "Farmacia" junto a "Avda Dolores Ibárruri" → business_name="Farmacia", street se queda. NO meter "Farmacia" en floor_etc.
+   - Distingue: business_name es el LOCAL DE ENTREGA. name es la PERSONA DESTINATARIA. Pueden coexistir: name="Olga García", business_name="Farmacia".
+   - Si no hay name persona pero hay empresa → business_name está, name puede quedar vacío.
+
+   Añade además `geocoding_hint` (texto libre) con la sugerencia de búsqueda si tu olfato indica que la empresa es muy buscable ("Buscar 'Konilcity SL Conil' en Google Places — devuelve dirección exacta").
 
 9. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
 
