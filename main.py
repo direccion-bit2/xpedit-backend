@@ -5154,7 +5154,10 @@ async def ocr_training_contribute(
     Consentimiento: implícito al pulsar el botón en la app (el banner deja
     claro que las imágenes se usan para mejorar el escáner).
     """
-    driver_id = await get_user_driver_id(user["id"])
+    # get_user_driver_id espera el dict completo (no user["id"]) — la función
+    # internamente hace user["id"] sobre el dict. Pasar string causa TypeError
+    # "string indices must be integers" (PYTHON-FASTAPI-11 20 may 16:53).
+    driver_id = await get_user_driver_id(user)
     if not driver_id:
         raise HTTPException(status_code=403, detail={"error": "driver_not_found"})
 
