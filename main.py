@@ -5382,7 +5382,7 @@ def _msi_build_prompt(carrier_hint: Optional[str], route_context: Optional[MSIRo
     if carrier_hint and carrier_hint != "generic":
         carrier_line = f"\nEl usuario indica que las pantallas son de la app del courier: {carrier_hint.upper()}. Usa ese contexto para localizar campos."
     else:
-        carrier_line = "\nDetecta el courier (CTT, MRW, Seur, GLS, NACEX, Correos Express, TIPSA) por logo, colores o disposición. Si no estás seguro, devuelve 'generic'."
+        carrier_line = "\nDetecta el courier (Zeleris, CTT, MRW, Seur, GLS, NACEX, Correos Express, TIPSA, PAACK, Sending, UPS) por logo, colores o disposición. Si no estás seguro, devuelve 'generic'.\n\n**Señales clave por carrier**:\n- **Zeleris**: logo verde con puntitos al final ('zeleris' o 'Zeleris logística'). Banner verde-lima horizontal con texto 'ZLR DIA SIGUIENTE 0XX-0YY-CIUDAD' o 'ZELERIS 14'. Variante 'VINOSELECCION' con formato Origen/Consignatario/Direccion. Zona reparto tipo '11CONIL', '28MOS-1', '24LEON'. RTEs frecuentes a IGNORAR: KUEHNE Y NAGEL, TME FUSION SAP, TME GRAN PUBLICO, VINOSELECCION, SOLAZZIA, WELEDA, SANYMEDICAL ARAGON, DMYTRO KURAKULOV.\n- **PAACK**: logo 'paack' con flecha verde/morada. Badges esquina 'NT4' (Nike sender), 'CFA' (Anbo China sender), 'ECI' (El Corte Inglés con campo 'Datos de Envío'). Variante co-branded Tiendanimal/Amazon con badge 'paack' arriba derecha.\n- **Sending**: logo 'sending transporte urgente' (figura humana corriendo). Códigos 'XXX LEON', 'XXX MADRID', servicios 'SEND ECOMM', 'SEND MASIVO'.\n- **UPS**: marca clásica 'UPS' escudo marrón/dorado, banner 'UPS STANDARD', tracking '1Z...'.\n- **TIPSA**: logo TIPSA naranja/azul, formato 'ARABA 30', 'XX HORAS' (servicio horario)."
 
     ctx_line = ""
     if route_context:
@@ -5423,6 +5423,19 @@ Recibes 1-10 imágenes que pueden mostrar la MISMA lista (scrolleada en distinta
 7. **NUNCA inventes**. Si no puedes leer un campo y NO hay contexto suficiente, deja el campo vacío (string vacía).
 
 8. Para `floor_etc` extrae expresiones como "4ºB", "Esc 2", "Pta 3", "Portal C", "Pl Bajo", "1º derecha". Estas NUNCA van junto a la calle, van separadas para añadirlas a las notas del repartidor.
+
+8.b **Normalizaciones específicas observadas en etiquetas reales** (lecciones de 25+ ejemplos seed, 20 may 2026):
+   - "n12", "Nº 12", "número 12", "núm. 12" → number="12" (solo el dígito).
+   - "Pdo" manuscrito junto al número → floor_etc="Puerta" (abreviatura común León/Castilla).
+   - "Pta No Aplica" → IGNORAR (no es información útil, no rellenar floor_etc).
+   - "FARMACIA 00", "FARMACIA" sola en línea de número → no es number, es indicador de comercio. Si la dirección no tiene número visible, poner number="S/N" y floor_etc="Farmacia" o usar Farmacia como name si no hay otro destinatario.
+   - "P.Bajo", "Pl Bajo", "Bajo L", "Bajo" → floor_etc="Planta Bajo" (o "Planta Bajo (xxx)" si lleva apellido como "Bajo L Mapfre", "Bajo D").
+   - "Esc Única", "Esc Izquierda", "Escalera 2" → floor_etc="Esc <X>".
+   - "Pl 2 Pta A", "Planta 3 Puerta B" → floor_etc="Pl <X> Pta <Y>".
+   - "Chalet 58", "Casa 12", "Nave 17" en urbanizaciones → number="58"/"12"/"17", floor_etc="Chalet"/"Casa"/"Nave" (la urbanización va en street).
+   - "Carril", "Cortijo", "Pago de", "Camino" son prefijos VÁLIDOS de vía rural (Cádiz, Castilla, Galicia) — no los confundas con texto suelto.
+   - PAACK NT4 normaliza "Len" impreso → "León" (typo conocido).
+   - Cuando la etiqueta lleva "Adjuntar al pedido X", "Entrega a partir de las HH:MMh", "Entregar en el Hotel X" → va a `notes`, no a otros campos.
 
 9. España: provincias con tilde correctamente ("Cádiz", "Córdoba", "Almería"). Códigos postales 5 dígitos.
 
