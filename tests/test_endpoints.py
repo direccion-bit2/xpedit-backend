@@ -671,6 +671,36 @@ class TestPlacesEndpoints:
         assert called_params.get("sessiontoken") == "abc-123-uuid"
 
     @pytest.mark.asyncio
+    async def test_places_details_field_mask_does_not_include_opening_hours(self, client):
+        """REGRESSION GUARD (21 may 2026): el field mask de Place Details NO debe
+        incluir `opening_hours`. Ese campo dispara el SKU Advanced ($17/1000) en
+        vez de Basic ($0 con session token) = 3,4× más caro. Auditoría confirmó
+        que el campo se guardaba en stops.opening_hours pero NUNCA se mostraba al
+        driver (dead data). Si vuelve a aparecer aquí, el bill de Google Places
+        se dispara silenciosamente. Ver [[cambios_log_exhaustivo]] 2026-05-21."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"status": "OK", "result": {}}
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_response
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = False
+
+        with patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/details?place_id=PID")
+        assert response.status_code == 200
+        called_params = mock_http.get.call_args.kwargs.get("params", {})
+        fields = called_params.get("fields", "")
+        assert "opening_hours" not in fields, (
+            f"opening_hours encontrado en field mask: {fields!r}. Eso dispara "
+            f"Place Details Advanced SKU innecesariamente. El campo nunca se "
+            f"muestra al driver (dead data). NO lo añadas sin auditar UX primero."
+        )
+        # Campos críticos que SÍ deben estar (los consume el cliente para crear stops):
+        assert "geometry" in fields, "geometry necesario para lat/lng del stop"
+        assert "formatted_address" in fields, "formatted_address necesario para mostrar dirección"
+        assert "address_components" in fields, "address_components necesario para CP/ciudad/provincia"
+
+    @pytest.mark.asyncio
     async def test_places_autocomplete_country_bias_forwards_components(self, client):
         """country=AR must reach Google as components=country:ar + region=ar.
         Without this, Google defaults to ES and an Argentine driver searching

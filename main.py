@@ -7351,9 +7351,15 @@ async def places_details(
     /places/autocomplete: pasa el MISMO UUID que el cliente generó al abrir
     el input. Si la sesión es válida, Google factura solo este Details
     (los autocompletes salen gratis)."""
+    # Field mask 21 may 2026: quitado `opening_hours` (Miguel + auditoría agentes 21 may 00:24).
+    # `opening_hours` dispara el SKU "Place Details Advanced" ($17/1000) en vez de
+    # "Basic" ($0 con session token) — 3,4× más caro. Auditoría confirmó que el
+    # campo se asignaba en stops.opening_hours pero NUNCA se mostraba al driver
+    # (dead data en frontend + admin). Ahorro estimado $20-100/mes ahora, $300-500
+    # a 100 paying. Registrado en [[cambios_log_exhaustivo]] 2026-05-21.
     params = {
         "place_id": place_id,
-        "fields": "geometry,address_components,formatted_address,name,opening_hours,types",
+        "fields": "geometry,address_components,formatted_address,name,types",
         "language": "es",
         "key": GOOGLE_API_KEY,
     }
