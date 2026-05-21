@@ -7226,6 +7226,86 @@ def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tup
     return norm, bias
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Places autocomplete cache (re-enabled 21 may 2026 — incident 5 may root cause:
+# sync supabase calls inside async handler stalled event loop. Fix: asyncio.to_thread
+# for all DB ops + fire-and-forget writes. Feature flag `places_cache_mode` in
+# app_config gives instant kill-switch: 'off' | 'shadow' | 'on'.
+# ─────────────────────────────────────────────────────────────────────────────
+_places_cache_mode_value: str = "off"
+_places_cache_mode_fetched_at: float = 0.0
+_PLACES_CACHE_MODE_TTL_SEC = 60  # re-read flag from app_config every 60s
+
+
+async def _get_places_cache_mode() -> str:
+    """Returns current flag value. In-memory cached 60s to avoid hammering app_config.
+    Defaults to 'off' on any error (safe-by-default)."""
+    global _places_cache_mode_value, _places_cache_mode_fetched_at
+    now = time.time()
+    if now - _places_cache_mode_fetched_at < _PLACES_CACHE_MODE_TTL_SEC:
+        return _places_cache_mode_value
+    try:
+        def _fetch():
+            r = supabase.table("app_config").select("value").eq("key", "places_cache_mode").limit(1).execute()
+            return ((r.data or [{}])[0].get("value") or "off").strip().lower()
+        mode = await asyncio.to_thread(_fetch)
+        if mode not in ("off", "shadow", "on"):
+            mode = "off"
+        _places_cache_mode_value = mode
+        _places_cache_mode_fetched_at = now
+        return mode
+    except Exception as e:
+        logger.warning(f"_get_places_cache_mode failed (defaulting to 'off'): {e}")
+        return "off"
+
+
+def _places_cache_lookup_sync(norm: str, bias: str) -> Optional[dict]:
+    """Sync Supabase lookup — MUST be called via asyncio.to_thread.
+    Returns dict {predictions, expires_at, hits} or None on miss/error."""
+    try:
+        r = (
+            supabase.table("places_autocomplete_cache")
+            .select("predictions,expires_at,hits")
+            .eq("query_normalized", norm)
+            .eq("bias_geohash5", bias)
+            .gt("expires_at", datetime.now(timezone.utc).isoformat())
+            .limit(1)
+            .execute()
+        )
+        return (r.data or [None])[0]
+    except Exception as e:
+        logger.warning(f"places cache lookup failed: {e}")
+        return None
+
+
+def _places_cache_write_sync(norm: str, bias: str, predictions: list) -> bool:
+    """Sync Supabase upsert — MUST be called via asyncio.to_thread (fire-and-forget)."""
+    try:
+        supabase.table("places_autocomplete_cache").upsert({
+            "query_normalized": norm,
+            "bias_geohash5": bias,
+            "predictions": predictions,
+            "hits": 1,
+            "last_used_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        }, on_conflict="query_normalized,bias_geohash5").execute()
+        return True
+    except Exception as e:
+        logger.warning(f"places cache write failed (non-fatal): {e}")
+        return False
+
+
+def _places_cache_bump_sync(norm: str, bias: str, current_hits: int) -> None:
+    """Sync bump of hits + last_used_at on cache hit (fire-and-forget)."""
+    try:
+        supabase.table("places_autocomplete_cache").update({
+            "hits": current_hits + 1,
+            "last_used_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("query_normalized", norm).eq("bias_geohash5", bias).execute()
+    except Exception:
+        pass  # bump failure is silent — does not break user request
+
+
 def _country_iso_from_coords(lat: Optional[float], lng: Optional[float]) -> Optional[str]:
     """Devuelve ISO-2 del país probable según lat/lng. None si está en zona ambigua
     (frontera, mar, fuera de mercados conocidos).
@@ -7295,15 +7375,32 @@ async def places_autocomplete(
     buscando "Calle Ancha" recibe direcciones de Madrid antes que las suyas.
     """
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
-    import asyncio
 
-    # 5 may incident note: a previous version of this handler did a cache
-    # lookup + write to Supabase BEFORE/AFTER calling Google. Both calls
-    # used the synchronous supabase-py client inside an async handler, which
-    # blocks the worker's event loop. With 6+ drivers typing simultaneously
-    # the workers stalled. Reverted to plain Google call. Cache logic
-    # belongs in a separate path that uses asyncio.to_thread() or the
-    # async Supabase client.
+    # Cache (21 may 2026 re-enabled): respects 5 may incident root cause by
+    # running all Supabase ops via asyncio.to_thread (no event loop blocking)
+    # and fire-and-forget for writes (no added latency on response). Killable
+    # instantly via app_config.places_cache_mode = 'off' (no redeploy).
+    cache_mode = await _get_places_cache_mode()
+    norm_query, bias_key = _ac_cache_key(input, lat, lng)
+    cache_eligible = cache_mode in ("on", "shadow") and norm_query and len(norm_query) >= 3
+    cache_row = None
+    if cache_eligible:
+        try:
+            cache_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_query, bias_key)
+        except Exception as e:
+            logger.warning(f"places cache lookup raised in to_thread: {e}")
+            cache_row = None
+
+    if cache_mode == "on" and cache_row and cache_row.get("predictions"):
+        # HIT — return cache, skip Google entirely. Fire-and-forget bump.
+        logger.info(f"places_cache_event=hit query={norm_query[:30]} bias={bias_key}")
+        try:
+            asyncio.create_task(asyncio.to_thread(
+                _places_cache_bump_sync, norm_query, bias_key, cache_row.get("hits") or 0,
+            ))
+        except Exception:
+            pass
+        return {"status": "OK", "predictions": cache_row["predictions"], "source": "cache"}
 
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
@@ -7363,6 +7460,21 @@ async def places_autocomplete(
                 if not _places_api_healthy:
                     logger.info("Google Places API recovered")
                     _places_api_healthy = True
+                # Cache write (fire-and-forget) — only on OK + non-empty predictions.
+                # Shadow mode logs theoretical hit rate without affecting response.
+                if cache_eligible and status == "OK" and data.get("predictions"):
+                    if cache_mode == "shadow" and cache_row:
+                        logger.info(f"places_cache_event=shadow_would_hit query={norm_query[:30]} bias={bias_key}")
+                    elif cache_mode == "shadow":
+                        logger.info(f"places_cache_event=shadow_miss query={norm_query[:30]} bias={bias_key}")
+                    else:
+                        logger.info(f"places_cache_event=miss_write query={norm_query[:30]} bias={bias_key}")
+                    try:
+                        asyncio.create_task(asyncio.to_thread(
+                            _places_cache_write_sync, norm_query, bias_key, data["predictions"],
+                        ))
+                    except Exception:
+                        pass
                 return data
             if status == "OVER_QUERY_LIMIT":
                 logger.warning(f"Google Places rate limited (attempt {attempt + 1})")
