@@ -7914,6 +7914,8 @@ def _ensure_gcp_creds_loaded() -> bool:
 
 # Flag para no spammear Sentry con DefaultCredentialsError tras la primera vez.
 _gcp_creds_unavailable_logged = False
+# Flag para no spammear con Cloud Monitoring 403 (sin rol monitoring.viewer).
+_gcp_monitoring_403_logged = False
 
 
 async def _fetch_gcp_request_count(service_name: str, start_iso: str, end_iso: str) -> int:
@@ -7956,7 +7958,18 @@ async def _fetch_gcp_request_count(service_name: str, start_iso: str, end_iso: s
         client = google_maps_client()
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
         if resp.status_code != 200:
-            logger.warning(f"Cloud Monitoring {service_name} returned {resp.status_code}")
+            # 403 = service account sin rol monitoring.viewer. Loggear UNA vez.
+            global _gcp_monitoring_403_logged
+            if resp.status_code == 403 and not _gcp_monitoring_403_logged:
+                logger.warning(
+                    f"Cloud Monitoring 403 for {service_name}: service account "
+                    f"needs roles/monitoring.viewer on project {GCP_PROJECT_ID}. "
+                    f"/admin/costs/live returns zeros until granted. "
+                    f"Visit https://console.cloud.google.com/iam-admin/iam?project={GCP_PROJECT_ID}"
+                )
+                _gcp_monitoring_403_logged = True
+            elif resp.status_code != 403:
+                logger.warning(f"Cloud Monitoring {service_name} returned {resp.status_code}")
             return 0
         data = resp.json()
         total = 0
