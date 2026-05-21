@@ -7217,7 +7217,15 @@ _places_api_last_check: Optional[datetime] = None
 
 def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tuple[str, str]:
     """Normalize query + bias for cache lookup.
-    bias_geohash5 is rounded to 1 decimal (~11km cell) when bias is provided."""
+    bias_geohash5 is rounded to 1 decimal (~11km cell) when bias is provided.
+
+    NOTA: el bias_geohash5 incluye SOLO el `lat,lng` (location bias), NO el
+    `origin` (que se usa para calcular distance_meters). Las predictions
+    devueltas por Google no cambian con origin — solo añaden el campo
+    distance_meters. Por eso podemos cachear sin segregar por origin: cualquier
+    cliente que reciba la respuesta puede re-ordenar localmente. Si en el
+    futuro Google cambiase el orden por origin, habría que añadir origin
+    al cache key."""
     norm = " ".join((query or "").lower().strip().split())[:200]
     if lat is None or lng is None:
         bias = ""
@@ -7362,6 +7370,8 @@ async def places_autocomplete(
     lng: Optional[float] = None,
     country: Optional[str] = None,
     sessiontoken: Optional[str] = None,
+    origin_lat: Optional[float] = None,
+    origin_lng: Optional[float] = None,
     user=Depends(get_current_user),
 ):
     """Proxy de Google Places Autocomplete. Solo Google, sin Nominatim.
@@ -7438,6 +7448,13 @@ async def places_autocomplete(
             params["region"] = cc
     if sessiontoken:
         params["sessiontoken"] = sessiontoken
+
+    # origin (21 may 2026): si app pasa la última stop como origen, Google
+    # calcula distance_meters por cada prediction y permite re-ordenar
+    # cliente-side por proximidad real a la zona de la ruta. Sin esto el
+    # cliente solo conoce el orden por relevancia/popularidad de Google.
+    if origin_lat is not None and origin_lng is not None:
+        params["origin"] = f"{origin_lat},{origin_lng}"
 
     # 2 attempts with generous timeouts on the shared HTTPX client (avoids
     # per-request TLS handshake). The earlier shared-client attempt at 10:24
