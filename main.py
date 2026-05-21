@@ -96,6 +96,7 @@ if SENTRY_DSN:
 else:
     logger.warning("SENTRY_DSN not configured — backend errors will NOT be reported")
 
+import places_v1
 from emails import (
     ACTIVE_FREE_PRO_INVITE_SUBJECT,
     TRIAL_EXPIRING_D1_SUBJECT,
@@ -7267,6 +7268,39 @@ async def _get_places_cache_mode() -> str:
         return "off"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Places API version flag (21 may 2026): kill-switch instantáneo entre
+# implementación Legacy (maps.googleapis.com/maps/api/place/*) y New v1
+# (places.googleapis.com/v1/places:*). Default 'legacy' por seguridad.
+# Kill switch: UPDATE app_config SET value='legacy' WHERE key='places_api_version'
+# Revierte en ≤60s sin redeploy.
+# ─────────────────────────────────────────────────────────────────────────────
+_places_api_version_value: str = "legacy"
+_places_api_version_fetched_at: float = 0.0
+_PLACES_API_VERSION_TTL_SEC = 60
+
+
+async def _get_places_api_version() -> str:
+    """Returns 'legacy' or 'v1'. Cached 60s. Defaults to 'legacy' on any error."""
+    global _places_api_version_value, _places_api_version_fetched_at
+    now = time.time()
+    if now - _places_api_version_fetched_at < _PLACES_API_VERSION_TTL_SEC:
+        return _places_api_version_value
+    try:
+        def _fetch():
+            r = supabase.table("app_config").select("value").eq("key", "places_api_version").limit(1).execute()
+            return ((r.data or [{}])[0].get("value") or "legacy").strip().lower()
+        version = await asyncio.to_thread(_fetch)
+        if version not in ("legacy", "v1"):
+            version = "legacy"
+        _places_api_version_value = version
+        _places_api_version_fetched_at = now
+        return version
+    except Exception as e:
+        logger.warning(f"_get_places_api_version failed (defaulting to 'legacy'): {e}")
+        return "legacy"
+
+
 def _places_cache_lookup_sync(norm: str, bias: str) -> Optional[dict]:
     """Sync Supabase lookup — MUST be called via asyncio.to_thread.
     Returns dict {predictions, expires_at, hits} or None on miss/error."""
@@ -7416,6 +7450,55 @@ async def places_autocomplete(
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
         return {"status": "ZERO_RESULTS", "predictions": [], "error_message": "API key not configured"}
 
+    # Flag-driven branch (21 may 2026): if app_config.places_api_version='v1',
+    # use Places API New (places.googleapis.com/v1) which returns distanceMeters
+    # for client-side proximity re-ordering. Kill switch instantáneo via SQL.
+    api_version = await _get_places_api_version()
+    if api_version == "v1":
+        cc_v1 = (country or "").strip().lower()
+        # Apply same safety net as Legacy: drop country filter if GPS clearly
+        # contradicts it (Christian 20 may incident).
+        if len(cc_v1) == 2 and cc_v1.isalpha() and lat is not None and lng is not None:
+            gps_iso = _country_iso_from_coords(lat, lng)
+            if gps_iso and gps_iso.lower() != cc_v1:
+                logger.info(
+                    f"places/autocomplete v1: country flag '{cc_v1}' != GPS country '{gps_iso}' "
+                    f"(driver_id={user.get('id')}). Dropping country filter."
+                )
+                cc_v1 = ""
+        client_v1 = google_maps_client()
+        data = await places_v1.autocomplete_v1(
+            client_v1,
+            GOOGLE_API_KEY,
+            input=input,
+            lat=lat,
+            lng=lng,
+            country=cc_v1 if cc_v1 else None,
+            sessiontoken=sessiontoken,
+            origin_lat=origin_lat,
+            origin_lng=origin_lng,
+        )
+        logger.info(
+            f"places_event=v1_called endpoint=autocomplete status={data.get('status')} "
+            f"results={len(data.get('predictions') or [])} query={input[:30]}"
+        )
+        # Cache write (fire-and-forget) — same flow as Legacy. Mapper already
+        # produced Legacy-shaped predictions so cache schema unchanged.
+        if cache_eligible and data.get("status") == "OK" and data.get("predictions"):
+            if cache_mode == "shadow" and cache_row:
+                logger.info(f"places_cache_event=shadow_would_hit query={norm_query[:30]} bias={bias_key}")
+            elif cache_mode == "shadow":
+                logger.info(f"places_cache_event=shadow_miss query={norm_query[:30]} bias={bias_key}")
+            else:
+                logger.info(f"places_cache_event=miss_write query={norm_query[:30]} bias={bias_key}")
+            try:
+                asyncio.create_task(asyncio.to_thread(
+                    _places_cache_write_sync, norm_query, bias_key, data["predictions"],
+                ))
+            except Exception:
+                pass
+        return data
+
     params = {
         "input": input,
         "language": "es",
@@ -7546,6 +7629,24 @@ async def places_details(
     /places/autocomplete: pasa el MISMO UUID que el cliente generó al abrir
     el input. Si la sesión es válida, Google factura solo este Details
     (los autocompletes salen gratis)."""
+    # Flag-driven branch (21 may 2026): si app_config.places_api_version='v1',
+    # se llama Places API New con field mask Essentials ($5/1000) en vez de
+    # Legacy Place Details Basic ($17/1000). Mapper devuelve formato Legacy.
+    api_version = await _get_places_api_version()
+    if api_version == "v1":
+        client_v1 = google_maps_client()
+        data = await places_v1.details_v1(
+            client_v1,
+            GOOGLE_API_KEY,
+            place_id=place_id,
+            sessiontoken=sessiontoken,
+        )
+        logger.info(
+            f"places_event=v1_called endpoint=details status={data.get('status')} "
+            f"place_id={place_id[:20]}"
+        )
+        return data
+
     # Field mask 21 may 2026: quitado `opening_hours` (Miguel + auditoría agentes 21 may 00:24).
     # `opening_hours` dispara el SKU "Place Details Advanced" ($17/1000) en vez de
     # "Basic" ($0 con session token) — 3,4× más caro. Auditoría confirmó que el
