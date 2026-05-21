@@ -7889,9 +7889,48 @@ _GCP_SERVICE_MAP = {
 }
 
 
+def _ensure_gcp_creds_loaded() -> bool:
+    """Garantiza que GOOGLE_APPLICATION_CREDENTIALS está disponible para
+    google.auth.default(). En Railway las creds vienen via env var JSON; las
+    materializamos a /tmp si aún no se hizo. Idempotente. Returns True si OK.
+    Hot fix (Miguel 21 may 2026 12:09): /admin/costs llamaba google.auth.default()
+    antes de que Vertex AI lo inicializara → DefaultCredentialsError spam Sentry."""
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and os.path.exists(
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+    ):
+        return True
+    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not creds_json:
+        return False
+    creds_path = "/tmp/gcp_vertex_sa.json"
+    try:
+        with open(creds_path, "w") as f:
+            f.write(creds_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+        return True
+    except Exception:
+        return False
+
+
+# Flag para no spammear Sentry con DefaultCredentialsError tras la primera vez.
+_gcp_creds_unavailable_logged = False
+
+
 async def _fetch_gcp_request_count(service_name: str, start_iso: str, end_iso: str) -> int:
     """Llama Cloud Monitoring REST API para sumar request_count entre dos timestamps.
-    Returns 0 if no data or error (no romper dashboard si Cloud Monitoring falla)."""
+    Returns 0 if no data or error (no romper dashboard si Cloud Monitoring falla).
+    NO usa sentry_sdk.capture_exception para errores de creds (sería spam): solo log
+    una vez al startup si falta GOOGLE_APPLICATION_CREDENTIALS_JSON en Railway."""
+    global _gcp_creds_unavailable_logged
+    if not _ensure_gcp_creds_loaded():
+        if not _gcp_creds_unavailable_logged:
+            logger.warning(
+                "GCP creds not available for Cloud Monitoring API "
+                "(GOOGLE_APPLICATION_CREDENTIALS_JSON not set in Railway env). "
+                "/admin/costs/live returns zeros until configured."
+            )
+            _gcp_creds_unavailable_logged = True
+        return 0
     try:
         import google.auth
         from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -7929,13 +7968,14 @@ async def _fetch_gcp_request_count(service_name: str, start_iso: str, end_iso: s
         return total
     except Exception as e:
         logger.warning(f"_fetch_gcp_request_count {service_name} error: {e}")
-        if SENTRY_DSN:
-            sentry_sdk.capture_exception(e)
+        # NO captureException: ya se logueó y _gcp_creds_unavailable_logged evita spam
         return 0
 
 
 async def _fetch_vertex_invocation_count(start_iso: str, end_iso: str) -> int:
     """Vertex AI Gemini invocation count (model_invocation_count metric)."""
+    if not _ensure_gcp_creds_loaded():
+        return 0
     try:
         import google.auth
         from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -7990,8 +8030,13 @@ async def _gather_live_costs(start_iso: str, end_iso: str) -> dict:
         "count": int(vertex_count),
         "cost_usd": round((int(vertex_count) / 1000.0) * _API_PRICING_USD_PER_1K["vertex_gemini"], 4),
     }
-    out["_total_cost_usd"] = round(sum(s["cost_usd"] for s in out.values()), 4)
-    out["_total_calls"] = sum(s["count"] for s in out.values())
+    # BUG FIX (Miguel 21 may 12:09): calcular totales ANTES de añadir las claves
+    # _total_* al dict — si añades _total_cost_usd primero y luego iteras out.values()
+    # para _total_calls, _total_cost_usd es float y `s["count"]` falla con TypeError.
+    # Aislar la suma a solo los dicts de servicios reales (claves que NO empiezan por _).
+    service_dicts = [v for k, v in out.items() if not k.startswith("_") and isinstance(v, dict)]
+    out["_total_cost_usd"] = round(sum(s["cost_usd"] for s in service_dicts), 4)
+    out["_total_calls"] = sum(s["count"] for s in service_dicts)
     return out
 
 
