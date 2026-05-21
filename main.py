@@ -7865,6 +7865,213 @@ async def closures_near(
         raise HTTPException(status_code=500, detail="Failed to query closures")
 
 
+# ============================================================================
+# ADMIN COSTS / API USAGE DASHBOARD (Miguel 21 may 2026 — task #169)
+# Lee Google Cloud Monitoring REST API para devolver request counts por servicio
+# en tiempo real. Cron diario guarda snapshot en daily_api_metrics para histórico
+# 30d+. Dashboard /admin/costs auto-refresca cada 60s.
+# Pricing 2026 (USD per 1.000 calls) — actualizar si cambia:
+# ============================================================================
+_API_PRICING_USD_PER_1K = {
+    "places": 5.0,            # Place Autocomplete + Details mix promedio
+    "geocoding": 5.0,         # Geocoding API
+    "routes": 5.0,            # Routes API v2 Essentials
+    "directions_legacy": 5.0, # Directions API legacy (Sanlúcar pre-cache)
+    "vertex_gemini": 10.0,    # ~$0.01 por imagen OCR (mix input+output Pro 2.5)
+}
+
+# Mapping servicio interno → service name del Google Cloud Monitoring
+_GCP_SERVICE_MAP = {
+    "places": "places-backend.googleapis.com",
+    "geocoding": "geocoding-backend.googleapis.com",
+    "routes": "routes.googleapis.com",
+    "directions_legacy": "directions-backend.googleapis.com",
+}
+
+
+async def _fetch_gcp_request_count(service_name: str, start_iso: str, end_iso: str) -> int:
+    """Llama Cloud Monitoring REST API para sumar request_count entre dos timestamps.
+    Returns 0 if no data or error (no romper dashboard si Cloud Monitoring falla)."""
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/monitoring.read"])
+        creds.refresh(GoogleAuthRequest())
+        token = creds.token
+
+        # Filter por service. Aggregation: SUM por ALIGN_SUM en bucket único.
+        period_seconds = max(60, int((datetime.fromisoformat(end_iso.replace("Z", "+00:00")) -
+                                       datetime.fromisoformat(start_iso.replace("Z", "+00:00"))).total_seconds()))
+        url = (
+            f"https://monitoring.googleapis.com/v3/projects/{GCP_PROJECT_ID}/timeSeries"
+            f"?filter=metric.type%3D%22serviceruntime.googleapis.com%2Fapi%2Frequest_count%22"
+            f"%20AND%20resource.labels.service%3D%22{service_name}%22"
+            f"&interval.startTime={start_iso}"
+            f"&interval.endTime={end_iso}"
+            f"&aggregation.alignmentPeriod={period_seconds}s"
+            f"&aggregation.perSeriesAligner=ALIGN_SUM"
+            f"&aggregation.crossSeriesReducer=REDUCE_SUM"
+        )
+
+        client = google_maps_client()
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"Cloud Monitoring {service_name} returned {resp.status_code}")
+            return 0
+        data = resp.json()
+        total = 0
+        for ts in data.get("timeSeries", []):
+            for point in ts.get("points", []):
+                val = point.get("value", {}).get("int64Value")
+                if val is not None:
+                    total += int(val)
+        return total
+    except Exception as e:
+        logger.warning(f"_fetch_gcp_request_count {service_name} error: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        return 0
+
+
+async def _fetch_vertex_invocation_count(start_iso: str, end_iso: str) -> int:
+    """Vertex AI Gemini invocation count (model_invocation_count metric)."""
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/monitoring.read"])
+        creds.refresh(GoogleAuthRequest())
+        token = creds.token
+        period_seconds = max(60, int((datetime.fromisoformat(end_iso.replace("Z", "+00:00")) -
+                                       datetime.fromisoformat(start_iso.replace("Z", "+00:00"))).total_seconds()))
+        url = (
+            f"https://monitoring.googleapis.com/v3/projects/{GCP_PROJECT_ID}/timeSeries"
+            f"?filter=metric.type%3D%22aiplatform.googleapis.com%2Fpublisher%2Fonline_serving%2Fmodel_invocation_count%22"
+            f"&interval.startTime={start_iso}"
+            f"&interval.endTime={end_iso}"
+            f"&aggregation.alignmentPeriod={period_seconds}s"
+            f"&aggregation.perSeriesAligner=ALIGN_SUM"
+            f"&aggregation.crossSeriesReducer=REDUCE_SUM"
+        )
+        client = google_maps_client()
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if resp.status_code != 200:
+            return 0
+        data = resp.json()
+        total = 0
+        for ts in data.get("timeSeries", []):
+            for point in ts.get("points", []):
+                val = point.get("value", {}).get("int64Value")
+                if val is not None:
+                    total += int(val)
+        return total
+    except Exception as e:
+        logger.warning(f"_fetch_vertex_invocation_count error: {e}")
+        return 0
+
+
+async def _gather_live_costs(start_iso: str, end_iso: str) -> dict:
+    """Llama todos los servicios en paralelo y calcula costes estimados.
+    Devuelve dict service → {count, cost_usd}."""
+    services_results = await asyncio.gather(
+        *[_fetch_gcp_request_count(svc, start_iso, end_iso) for svc in _GCP_SERVICE_MAP.values()],
+        _fetch_vertex_invocation_count(start_iso, end_iso),
+        return_exceptions=True,
+    )
+    out = {}
+    for (local_name, _gcp_name), count in zip(_GCP_SERVICE_MAP.items(), services_results[:-1]):
+        if isinstance(count, Exception):
+            count = 0
+        cost = (count / 1000.0) * _API_PRICING_USD_PER_1K[local_name]
+        out[local_name] = {"count": int(count), "cost_usd": round(cost, 4)}
+    vertex_count = services_results[-1] if not isinstance(services_results[-1], Exception) else 0
+    out["vertex_gemini"] = {
+        "count": int(vertex_count),
+        "cost_usd": round((int(vertex_count) / 1000.0) * _API_PRICING_USD_PER_1K["vertex_gemini"], 4),
+    }
+    out["_total_cost_usd"] = round(sum(s["cost_usd"] for s in out.values()), 4)
+    out["_total_calls"] = sum(s["count"] for s in out.values())
+    return out
+
+
+@app.get("/admin/costs/live", tags=["admin", "costs"], summary="Costes API en tiempo real (Cloud Monitoring)")
+async def admin_costs_live(
+    hours: int = 24,
+    user=Depends(require_admin),
+):
+    """Llama Google Cloud Monitoring REST API para sumar request counts por servicio
+    en las últimas N horas (default 24h). Latencia 3-8s. Cacheable a nivel cliente.
+    Devuelve estimación de coste USD basada en pricing 2026."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=max(1, min(hours, 720)))  # cap 30d
+    start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    by_service = await _gather_live_costs(start_iso, end_iso)
+
+    return {
+        "ok": True,
+        "interval": {"start": start_iso, "end": end_iso, "hours": hours},
+        "by_service": by_service,
+        "pricing_usd_per_1k": _API_PRICING_USD_PER_1K,
+        "fetched_at": now.isoformat(),
+    }
+
+
+@app.get("/admin/costs/history", tags=["admin", "costs"], summary="Histórico snapshots diarios (daily_api_metrics)")
+async def admin_costs_history(
+    days: int = 30,
+    user=Depends(require_admin),
+):
+    """Devuelve histórico de daily_api_metrics agrupado por fecha + servicio."""
+    try:
+        days = max(1, min(days, 90))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+        rows = (
+            supabase.table("daily_api_metrics")
+            .select("date,service,request_count,est_cost_usd")
+            .gte("date", cutoff)
+            .order("date")
+            .execute()
+        )
+        return {"ok": True, "days": days, "rows": rows.data or []}
+    except Exception as e:
+        logger.exception("admin_costs_history failed")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail=f"history failed: {e}")
+
+
+async def run_daily_costs_snapshot():
+    """Cron diario 09:00 UTC: snapshot del día anterior. Persistente histórico."""
+    try:
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        start_iso = f"{yesterday.isoformat()}T00:00:00Z"
+        end_iso = f"{yesterday.isoformat()}T23:59:59Z"
+        by_service = await _gather_live_costs(start_iso, end_iso)
+        rows_to_upsert = []
+        for svc, vals in by_service.items():
+            if svc.startswith("_"):
+                continue
+            rows_to_upsert.append({
+                "date": yesterday.isoformat(),
+                "service": svc,
+                "request_count": vals["count"],
+                "est_cost_usd": vals["cost_usd"],
+                "snapshot_at": datetime.now(timezone.utc).isoformat(),
+            })
+        if rows_to_upsert:
+            supabase.table("daily_api_metrics").upsert(
+                rows_to_upsert, on_conflict="date,service"
+            ).execute()
+        logger.info(f"Daily costs snapshot saved for {yesterday}: {len(rows_to_upsert)} services")
+    except Exception as e:
+        logger.exception("run_daily_costs_snapshot failed")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+
+
 async def run_all_closure_scrapers():
     """Scheduled job: run every closure scraper and upsert. Logged + Sentry-captured on failure.
 
@@ -8296,6 +8503,13 @@ async def start_social_scheduler():
         next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),  # first run 2 min after boot
     )
     logger.info("Closures scrapers: every 30 min")
+    # Daily costs snapshot (Miguel 21 may 2026 — task #169): snapshot del día
+    # anterior cada día a las 09:17 UTC (minuto :17 para evitar ruido cron).
+    social_scheduler.add_job(
+        run_daily_costs_snapshot, "cron", hour=9, minute=17,
+        id="daily_costs_snapshot", replace_existing=True,
+    )
+    logger.info("Daily costs snapshot: cron 09:17 UTC")
     # Siempre arrancar el scheduler (tambien para backups y retention)
     if not social_scheduler.running:
         social_scheduler.start()
