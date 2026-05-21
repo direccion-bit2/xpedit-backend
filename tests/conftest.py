@@ -227,6 +227,18 @@ def clear_rate_limits():
 
 
 @pytest.fixture(autouse=True)
+def clear_msi_geocode_cache():
+    """Clear MSI geocoding cache between tests (Miguel 21 may 2026).
+    Sin esto, tests que llaman `_msi_geocode_one` con la misma stop reciben
+    cache hit y NO se llama Google → asserts sobre `mock_client.get` fallan.
+    """
+    from main import _MSI_GEOCODE_CACHE
+    _MSI_GEOCODE_CACHE.clear()
+    yield
+    _MSI_GEOCODE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _default_ocr_tier(monkeypatch):
     """All OCR endpoints (`/ocr/label`, `/ocr/screenshots-batch`) now look up
     the caller's tier to enforce a per-driver daily image quota. Existing

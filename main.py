@@ -5948,6 +5948,54 @@ def _msi_compute_centroid_bbox(coords: list) -> Optional[dict]:
     }
 
 
+# ===== MSI Geocoding cache (Miguel 21 may 2026) =====
+# Saves ~$510/mes hoy, ~$1200/mes a 100 paying. Repartidores típicos
+# importan las mismas zonas repetidamente — hit rate alto.
+# TTL 24h: conservador vs Google ToS (max 30d para lat/lng).
+# Max 5000 entradas: ~500KB memoria (~100 bytes/entry).
+# In-memory por proceso: restart Railway lo borra (acceptable).
+# Solo cachea status=ok — errores se reintentan en próxima llamada.
+# Solo cachea round 1 (sin bbox) — round 2 con bbox altera deliberadamente.
+_MSI_GEOCODE_CACHE: dict[str, tuple[float, dict]] = {}
+_MSI_GEOCODE_CACHE_MAX = 5000
+_MSI_GEOCODE_CACHE_TTL_S = 24 * 3600  # 24h
+
+
+def _msi_geocode_cache_key(stop: dict, country: str) -> Optional[str]:
+    """Build cache key. Returns None if stop too vague to safely cache.
+    Requires street + (cp OR city) to avoid collisions / wrong results.
+    """
+    street = (stop.get("street") or "").strip().lower()
+    number = (stop.get("number") or "").strip().lower()
+    cp = (stop.get("postal_code") or "").strip().lower()
+    city = (stop.get("city") or "").strip().lower()
+    country_n = country.upper()
+    if not street or not (cp or city):
+        return None
+    return f"{country_n}|{cp}|{city}|{street}|{number}"
+
+
+def _msi_geocode_cache_get(key: str) -> Optional[dict]:
+    import time as _time
+    entry = _MSI_GEOCODE_CACHE.get(key)
+    if not entry:
+        return None
+    cached_at, value = entry
+    if _time.time() - cached_at > _MSI_GEOCODE_CACHE_TTL_S:
+        _MSI_GEOCODE_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _msi_geocode_cache_set(key: str, value: dict) -> None:
+    import time as _time
+    if len(_MSI_GEOCODE_CACHE) >= _MSI_GEOCODE_CACHE_MAX:
+        # Eviction LRU: borrar la entrada más antigua
+        oldest_key = min(_MSI_GEOCODE_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _MSI_GEOCODE_CACHE.pop(oldest_key, None)
+    _MSI_GEOCODE_CACHE[key] = (_time.time(), value)
+
+
 async def _msi_geocode_one(
     client: "httpx.AsyncClient",
     stop: dict,
@@ -5962,9 +6010,23 @@ async def _msi_geocode_one(
 
     NEVER includes floor_etc in the geocoded address — that's preserved
     separately for the driver's delivery_instructions.
+
+    CACHE (Miguel 21 may 2026): si NO hay bbox (= round 1) Y la stop tiene
+    street + (cp OR city), buscar primero en `_MSI_GEOCODE_CACHE`. Si HIT con
+    TTL válido (<24h), devolver directamente. Si MISS, geocodificar y cachear
+    solo si status=ok. Saves ~$510/mes.
     """
     if not GOOGLE_API_KEY:
         return {"status": "error", "error": "no_api_key"}
+
+    # CACHE lookup (solo round 1: sin bbox)
+    cache_key: Optional[str] = None
+    if bbox is None:
+        cache_key = _msi_geocode_cache_key(stop, country)
+        if cache_key:
+            cached = _msi_geocode_cache_get(cache_key)
+            if cached is not None:
+                return {**cached, "_from_cache": True}
 
     parts = []
     if stop.get("street"):
@@ -6012,7 +6074,7 @@ async def _msi_geocode_one(
 
     r = data["results"][0]
     geom = r.get("geometry", {})
-    return {
+    result = {
         "status": "ok",
         "lat": geom.get("location", {}).get("lat"),
         "lng": geom.get("location", {}).get("lng"),
@@ -6020,6 +6082,10 @@ async def _msi_geocode_one(
         "location_type": geom.get("location_type", ""),  # ROOFTOP|RANGE_INTERPOLATED|GEOMETRIC_CENTER|APPROXIMATE
         "place_id": r.get("place_id", ""),
     }
+    # CACHE: guardar SOLO si tenemos key válida (round 1, stop específica)
+    if cache_key:
+        _msi_geocode_cache_set(cache_key, result)
+    return result
 
 
 def _msi_classify_confidence(stop: dict, geo: dict) -> str:
