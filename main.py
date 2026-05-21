@@ -8720,6 +8720,17 @@ async def start_social_scheduler():
         id="daily_costs_snapshot", replace_existing=True,
     )
     logger.info("Daily costs snapshot: cron 09:17 UTC")
+    # Bootstrap único 22 may 2026: ejecutar snapshot 60s tras startup para
+    # backfill inmediato (tabla daily_api_metrics estaba vacía por bug TypeError
+    # ya corregido). on_conflict del upsert hace idempotente esta ejecución
+    # extra. Tras primer snapshot, el cron diario continúa normal.
+    from datetime import timedelta as _td
+    social_scheduler.add_job(
+        run_daily_costs_snapshot, "date",
+        run_date=datetime.now(timezone.utc) + _td(seconds=60),
+        id="daily_costs_snapshot_bootstrap", replace_existing=True,
+    )
+    logger.info("Daily costs snapshot: bootstrap run in 60s")
     # Siempre arrancar el scheduler (tambien para backups y retention)
     if not social_scheduler.running:
         social_scheduler.start()
