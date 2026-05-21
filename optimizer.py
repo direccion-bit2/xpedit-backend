@@ -426,7 +426,10 @@ def solve_with_pyvrp(
     for i, frm in enumerate(all_locs):
         for j, to in enumerate(all_locs):
             dist = distance_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
-            if duration_matrix is not None:
+            if i == j:
+                # Self-loop: PyVRP requiere distance=0 y duration=0
+                dur_min = 0
+            elif duration_matrix is not None:
                 # OSRM duración viene en segundos → convertir a minutos
                 dur_min = max(1, int(duration_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]] / 60))
             else:
