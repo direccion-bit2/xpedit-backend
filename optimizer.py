@@ -415,11 +415,24 @@ def solve_with_pyvrp(
 
     # Add edges between ALL location pairs
     # Use model.locations (returns objects in order: depot, then clients)
+    # IMPORTANT (21 may 2026 fix): `duration` debe estar en MINUTOS para que cuadre
+    # con tw_early/tw_late (que vienen de _parse_time_to_minutes). Antes pasábamos
+    # `duration=dist` (metros) y PyVRP 0.13.x interpretaba esos metros como minutos,
+    # haciendo que rutas de varios km parecieran tardar miles de minutos → infeasible
+    # con cualquier time_window. Repro: 25 stops Madrid (1-3 km entre stops) + 1 TW
+    # → siempre infeasible. Stops a 10-15m + misma TW → OK. Fix: usar duration_matrix
+    # OSRM (segundos→minutos) si disponible, sino aproximar 40 km/h urbano.
     all_locs = list(model.locations)
     for i, frm in enumerate(all_locs):
         for j, to in enumerate(all_locs):
             dist = distance_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]]
-            model.add_edge(frm, to, distance=dist, duration=dist)
+            if duration_matrix is not None:
+                # OSRM duración viene en segundos → convertir a minutos
+                dur_min = max(1, int(duration_matrix[pyvrp_to_orig[i]][pyvrp_to_orig[j]] / 60))
+            else:
+                # Fallback: estimar 40 km/h urbano = 1.5 min/km
+                dur_min = max(1, int(dist / 1000 / 40 * 60))
+            model.add_edge(frm, to, distance=dist, duration=dur_min)
 
     # Solve
     result = model.solve(stop=MaxRuntime(time_limit_s), display=False)
