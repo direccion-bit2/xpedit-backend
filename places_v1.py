@@ -80,23 +80,45 @@ async def autocomplete_v1(
         "input": input,
         "languageCode": "es",
     }
-    if lat is not None and lng is not None:
+
+    # Dual bias strategy (21 may 2026 — replica Spoke/Circuit behaviour):
+    #   - Si hay origin (= última stop conocida): bias estrecho 5 km centrado en
+    #     esa stop. Caso "siguiente parada" típico: el driver ya está en una
+    #     ciudad concreta y la próxima parada SUELE ser cerca. Bias estrecho
+    #     evita que Google traiga matches exactos en otras ciudades cuando hay
+    #     número específico ("calle X 12").
+    #   - Si NO hay origin (= primera parada o búsqueda sin contexto): bias
+    #     amplio 30 km centrado en GPS. Permite descubrir direcciones a través
+    #     de la zona de reparto sin sesgar a una calle concreta.
+    # Recomendación oficial Google: "consider specifying a smaller radius" para
+    # mejorar el ranking de establishments cuando el bias point es preciso.
+    if origin_lat is not None and origin_lng is not None:
+        body["locationBias"] = {
+            "circle": {
+                "center": {
+                    "latitude": float(origin_lat),
+                    "longitude": float(origin_lng),
+                },
+                "radius": 5000.0,
+            }
+        }
+        body["origin"] = {
+            "latitude": float(origin_lat),
+            "longitude": float(origin_lng),
+        }
+    elif lat is not None and lng is not None:
         body["locationBias"] = {
             "circle": {
                 "center": {"latitude": float(lat), "longitude": float(lng)},
                 "radius": 30000.0,
             }
         }
+
     cc = (country or "").strip().lower()
     if len(cc) == 2 and cc.isalpha():
         body["includedRegionCodes"] = [cc]
     if sessiontoken:
         body["sessionToken"] = sessiontoken
-    if origin_lat is not None and origin_lng is not None:
-        body["origin"] = {
-            "latitude": float(origin_lat),
-            "longitude": float(origin_lng),
-        }
 
     headers = {
         "X-Goog-Api-Key": api_key,

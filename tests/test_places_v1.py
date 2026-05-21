@@ -14,7 +14,6 @@ import pytest
 
 import places_v1
 
-
 # ───────────────────────────── Field mask defense ──────────────────────────
 
 class TestFieldMaskWhitelist:
@@ -27,7 +26,7 @@ class TestFieldMaskWhitelist:
         Adding displayName, rating, regularOpeningHours, etc. would silently
         promote every Details call from Essentials ($5) to Pro ($17) SKU.
         """
-        from places_v1 import DETAILS_ESSENTIALS_ALLOWLIST, _DETAILS_FIELD_MASK
+        from places_v1 import _DETAILS_FIELD_MASK, DETAILS_ESSENTIALS_ALLOWLIST
 
         used = set(_DETAILS_FIELD_MASK.split(","))
         not_in_allowlist = used - DETAILS_ESSENTIALS_ALLOWLIST
@@ -235,14 +234,14 @@ class TestDetailsV1Errors:
 class TestAutocompleteV1RequestBody:
 
     @pytest.mark.asyncio
-    async def test_body_includes_location_bias_when_lat_lng_provided(self):
+    async def test_lat_lng_without_origin_gets_wide_bias_30km(self):
+        """Sin origin (primera parada / búsqueda sin contexto), bias amplio
+        30 km centrado en GPS. Permite descubrir direcciones por toda la zona."""
         client = MagicMock()
         captured = {}
 
         async def capture(url, json=None, headers=None, timeout=None):
-            captured["url"] = url
             captured["json"] = json
-            captured["headers"] = headers
             return MagicMock(status_code=200, json=lambda: {"suggestions": []})
 
         client.post = capture
@@ -252,9 +251,13 @@ class TestAutocompleteV1RequestBody:
         assert captured["json"]["locationBias"]["circle"]["center"]["latitude"] == 36.78
         assert captured["json"]["locationBias"]["circle"]["center"]["longitude"] == -6.35
         assert captured["json"]["locationBias"]["circle"]["radius"] == 30000.0
+        assert "origin" not in captured["json"]
 
     @pytest.mark.asyncio
-    async def test_body_includes_origin_when_provided(self):
+    async def test_origin_gets_narrow_bias_5km_centered_on_origin(self):
+        """Con origin (= última stop), bias estrecho 5 km centrado en la stop.
+        Replica el patrón Spoke/Circuit: priorizar fuerte la ciudad/zona de la
+        parada anterior cuando hay match exacto en otras ciudades del país."""
         client = MagicMock()
         captured = {}
 
@@ -266,8 +269,34 @@ class TestAutocompleteV1RequestBody:
         await places_v1.autocomplete_v1(
             client, "k", input="x", origin_lat=36.78, origin_lng=-6.35
         )
+        # locationBias centered on origin (not GPS), radius 5km (not 30km)
+        assert captured["json"]["locationBias"]["circle"]["center"]["latitude"] == 36.78
+        assert captured["json"]["locationBias"]["circle"]["center"]["longitude"] == -6.35
+        assert captured["json"]["locationBias"]["circle"]["radius"] == 5000.0
+        # origin also propagated so Google returns distanceMeters per prediction
         assert captured["json"]["origin"]["latitude"] == 36.78
         assert captured["json"]["origin"]["longitude"] == -6.35
+
+    @pytest.mark.asyncio
+    async def test_origin_overrides_gps_lat_lng_for_bias(self):
+        """Si llegan AMBOS gps (lat/lng) y origin, el bias se centra en
+        origin (= última stop). El GPS se ignora para bias en este caso."""
+        client = MagicMock()
+        captured = {}
+
+        async def capture(url, json=None, headers=None, timeout=None):
+            captured["json"] = json
+            return MagicMock(status_code=200, json=lambda: {"suggestions": []})
+
+        client.post = capture
+        await places_v1.autocomplete_v1(
+            client, "k", input="x",
+            lat=40.0, lng=-3.0,  # GPS Madrid
+            origin_lat=36.78, origin_lng=-6.35,  # última stop Sanlúcar
+        )
+        # Bias debe ir a origin (Sanlúcar), no a GPS Madrid
+        assert captured["json"]["locationBias"]["circle"]["center"]["latitude"] == 36.78
+        assert captured["json"]["locationBias"]["circle"]["radius"] == 5000.0
 
     @pytest.mark.asyncio
     async def test_country_2letter_becomes_included_region_codes(self):
