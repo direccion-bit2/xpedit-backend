@@ -108,16 +108,44 @@ async def _directions_polyline(
 
 
 async def geocode_record(
-    client: httpx.AsyncClient, google_api_key: str, record: ClosureRecord
+    client: httpx.AsyncClient,
+    google_api_key: str,
+    record: ClosureRecord,
+    existing: dict | None = None,
 ) -> None:
     """Mutates `record` with geocoded coordinates and (if a segment) the polyline.
 
-    Strategy:
+    CACHE STRATEGY (Miguel 21 may 2026 — saves ~$900/mes Sanlúcar):
+    If `existing` row is provided (looked up by source_url) AND:
+      - has lat/lng (was geocoded successfully before)
+      - raw_payload.localizacion text hasn't changed (street/segment is the
+        same as what we previously geocoded)
+    → REUSE the cached coords + polyline. Skip Google calls entirely.
+
+    If localizacion changed (rare — closure was edited in source), or no
+    existing row, fall through to live geocoding.
+
+    Original strategy:
     - If we have BOTH segment_from and segment_to: geocode each intersection
       separately and ask Directions API for the road geometry between them.
       Set lat_from/to, lng_from/to, street_polyline, and lat/lng=midpoint.
     - Else: geocode the street centroid only. Set lat/lng.
     """
+    # CACHE HIT: reusar coords y polyline si la localización no cambió
+    if existing and existing.get("lat") is not None and existing.get("lng") is not None:
+        old_raw = existing.get("raw_payload") or {}
+        old_loc = (old_raw.get("localizacion") if isinstance(old_raw, dict) else None) or ""
+        new_loc = (record.raw_payload.get("localizacion") if record.raw_payload else None) or ""
+        if old_loc.strip() == new_loc.strip():
+            record.lat = existing["lat"]
+            record.lng = existing["lng"]
+            record.lat_from = existing.get("lat_from")
+            record.lng_from = existing.get("lng_from")
+            record.lat_to = existing.get("lat_to")
+            record.lng_to = existing.get("lng_to")
+            record.street_polyline = existing.get("street_polyline")
+            return  # ZERO Google calls
+
     if record.segment_from and record.segment_to:
         # Try the two intersections in series so we don't double-bill if one fails.
         q_from = f"{record.street_name} y {record.segment_from}, {record.city}, España"
@@ -251,11 +279,14 @@ def _parse_franja(franja: str | None) -> tuple[bool, str | None, str | None]:
 
 
 async def scrape_sanlucar(
-    *, google_api_key: str, max_items: int = 50
+    *, google_api_key: str, max_items: int = 50, supabase=None
 ) -> list[ClosureRecord]:
     """Scrape Sanlúcar de Barrameda's official street closures page.
     Each detail page is parsed via Drupal field selectors (resilient to layout
     changes that don't rename the fields). Geocoding happens after parsing.
+
+    If `supabase` (admin client) is provided, looks up existing rows by
+    source_url BEFORE geocoding to reuse cached coords/polyline (huge $$ save).
     """
     out: list[ClosureRecord] = []
     async with httpx.AsyncClient(
@@ -334,9 +365,43 @@ async def scrape_sanlucar(
             )
             out.append(record)
 
-        # 5. Geocode + Directions polyline for each record (in series; ~10 records max)
+        # 5. Cache lookup (Miguel 21 may 2026): query existing rows by source_url
+        # to reuse coords/polyline already geocoded. Avoids ~6000 Google calls/día
+        # solo Sanlúcar = ~$900/mes.
+        existing_by_url: dict[str, dict] = {}
+        if supabase and out:
+            source_urls = [r.source_url for r in out]
+            try:
+                cached = supabase.table("street_closures").select(
+                    "source_url,lat,lng,lat_from,lng_from,lat_to,lng_to,"
+                    "street_polyline,raw_payload"
+                ).in_("source_url", source_urls).execute()
+                if cached.data:
+                    existing_by_url = {row["source_url"]: row for row in cached.data}
+                logger.info(
+                    f"Sanlúcar cache lookup: {len(existing_by_url)}/{len(out)} "
+                    f"records found in DB"
+                )
+            except Exception as e:
+                logger.warning(f"Sanlúcar cache lookup failed (will geocode all): {e}")
+
+        # 6. Geocode + Directions polyline for each record (skips Google calls
+        # when localizacion matches cached row)
+        cache_hits = cache_misses = 0
         for rec in out:
-            await geocode_record(client, google_api_key, rec)
+            existing = existing_by_url.get(rec.source_url)
+            had_lat_before = rec.lat is not None
+            await geocode_record(client, google_api_key, rec, existing=existing)
+            # Track if cache served us (lat present + was provided by existing)
+            if existing and existing.get("lat") is not None and rec.lat == existing["lat"]:
+                cache_hits += 1
+            elif not had_lat_before and rec.lat is not None:
+                cache_misses += 1
+        if out:
+            logger.info(
+                f"Sanlúcar geocoding: {cache_hits} cache hits, "
+                f"{cache_misses} fresh geocodes ({len(out)} total)"
+            )
 
     return out
 

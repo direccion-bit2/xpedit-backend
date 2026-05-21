@@ -7695,7 +7695,8 @@ async def admin_scrape_closures(city: str, user=Depends(require_admin)):
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
     try:
-        records = await scraper(google_api_key=GOOGLE_API_KEY)
+        # Pass supabase para que el scraper use cache lookup (Miguel 21 may 2026)
+        records = await scraper(google_api_key=GOOGLE_API_KEY, supabase=supabase)
     except Exception as e:
         logger.exception(f"Scraper '{city}' failed")
         if SENTRY_DSN:
@@ -7799,13 +7800,18 @@ async def closures_near(
 
 
 async def run_all_closure_scrapers():
-    """Scheduled job: run every closure scraper and upsert. Logged + Sentry-captured on failure."""
+    """Scheduled job: run every closure scraper and upsert. Logged + Sentry-captured on failure.
+
+    Pasamos `supabase` al scraper para que pueda hacer cache lookup por source_url
+    (Miguel 21 may 2026): cierres ya geocodificados antes NO se vuelven a geocodificar
+    si la `localizacion` no cambió. Ahorro ~$900/mes solo Sanlúcar.
+    """
     if not GOOGLE_API_KEY:
         logger.info("Skipping closures scrape: GOOGLE_API_KEY missing")
         return
     for city, scraper in _CLOSURE_SCRAPERS.items():
         try:
-            records = await scraper(google_api_key=GOOGLE_API_KEY)
+            records = await scraper(google_api_key=GOOGLE_API_KEY, supabase=supabase)
             counts = _upsert_closures(supabase, records)
             logger.info(f"Closures scrape [{city}]: {len(records)} scraped, {counts}")
         except Exception as e:
