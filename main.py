@@ -14,7 +14,7 @@ import random
 import re
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Literal, Optional
 from zoneinfo import ZoneInfo
 
@@ -7880,6 +7880,13 @@ _API_PRICING_USD_PER_1K = {
     "vertex_gemini": 10.0,    # ~$0.01 por imagen OCR (mix input+output Pro 2.5)
 }
 
+# Google Maps Platform regala $200 USD/mes de crédito que se descuenta de la
+# factura. Aplica al pool conjunto de todos los servicios Maps (places, geocoding,
+# routes, directions). Vertex AI NO tiene free tier — cobra desde la 1ª llamada.
+_MAPS_FREE_TIER_USD_MONTHLY = 200.0
+_MAPS_SERVICES = {"places", "geocoding", "routes", "directions_legacy"}
+_VERTEX_SERVICES = {"vertex_gemini"}
+
 # Mapping servicio interno → service name del Google Cloud Monitoring
 _GCP_SERVICE_MAP = {
     "places": "places-backend.googleapis.com",
@@ -8047,9 +8054,42 @@ async def _gather_live_costs(start_iso: str, end_iso: str) -> dict:
     # _total_* al dict — si añades _total_cost_usd primero y luego iteras out.values()
     # para _total_calls, _total_cost_usd es float y `s["count"]` falla con TypeError.
     # Aislar la suma a solo los dicts de servicios reales (claves que NO empiezan por _).
-    service_dicts = [v for k, v in out.items() if not k.startswith("_") and isinstance(v, dict)]
-    out["_total_cost_usd"] = round(sum(s["cost_usd"] for s in service_dicts), 4)
-    out["_total_calls"] = sum(s["count"] for s in service_dicts)
+    service_dicts = {k: v for k, v in out.items() if not k.startswith("_") and isinstance(v, dict)}
+    gross_total = round(sum(s["cost_usd"] for s in service_dicts.values()), 4)
+    gross_maps = round(sum(v["cost_usd"] for k, v in service_dicts.items() if k in _MAPS_SERVICES), 4)
+    gross_vertex = round(sum(v["cost_usd"] for k, v in service_dicts.items() if k in _VERTEX_SERVICES), 4)
+
+    # Descuento Google Maps free tier prorrateado al intervalo consultado.
+    # Cálculo (Miguel 21 may 14:05): muestra el coste NETO que realmente se paga
+    # para que las cifras no asusten. El "regalo" se reporta aparte como KPI.
+    try:
+        period_hours = (
+            datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            - datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        ).total_seconds() / 3600.0
+    except Exception:
+        period_hours = 24.0
+    # Días en el mes actual (más preciso que asumir 30) para prorratear $200/mes.
+    now_utc = datetime.now(timezone.utc)
+    days_in_month = (
+        date(now_utc.year + (1 if now_utc.month == 12 else 0),
+             1 if now_utc.month == 12 else now_utc.month + 1, 1)
+        - date(now_utc.year, now_utc.month, 1)
+    ).days
+    free_tier_per_hour = _MAPS_FREE_TIER_USD_MONTHLY / (days_in_month * 24.0)
+    free_credit_available = round(free_tier_per_hour * period_hours, 4)
+    free_credit_applied = round(min(gross_maps, free_credit_available), 4)
+    net_maps = round(max(0.0, gross_maps - free_credit_available), 4)
+    net_total = round(net_maps + gross_vertex, 4)
+
+    out["_total_cost_usd"] = net_total  # ← lo que muestra "Coste estimado" (NETO)
+    out["_total_cost_gross_usd"] = gross_total
+    out["_total_cost_maps_gross_usd"] = gross_maps
+    out["_total_cost_vertex_usd"] = gross_vertex
+    out["_free_tier_available_usd"] = free_credit_available
+    out["_free_tier_applied_usd"] = free_credit_applied
+    out["_free_tier_monthly_usd"] = _MAPS_FREE_TIER_USD_MONTHLY
+    out["_total_calls"] = sum(s["count"] for s in service_dicts.values())
     return out
 
 
