@@ -8438,15 +8438,20 @@ async def admin_cache_backfill_missing(
                 return False
             if data.get("status") == "OK" and data.get("predictions"):
                 norm, bias = _ac_cache_key(q, lat, lng)
-                # INSERT con hits=0 (NO incrementar artificial — solo escribir bytes)
+                # INSERT con hits=0 (NO incrementar artificial — solo escribir bytes).
+                # last_used_at tiene constraint NOT NULL en BD → usamos NOW() pero
+                # el flag REAL anti-inflación es hits=0: el bump real de drivers
+                # incrementa hits → cualquier query con hits>0 = uso real driver,
+                # hits=0 = solo backfill (cuenta correcta sin contar las inserciones).
                 try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
                     await asyncio.to_thread(
                         lambda: supabase.table("places_autocomplete_cache").upsert({
                             "query_normalized": norm,
                             "bias_geohash5": bias,
                             "predictions": data["predictions"],
                             "hits": 0,
-                            "last_used_at": None,
+                            "last_used_at": now_iso,
                             "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
                         }, on_conflict="query_normalized,bias_geohash5").execute()
                     )
