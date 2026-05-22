@@ -14,13 +14,17 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_cache_mode_memo():
-    """Invalidate the 60s in-memory cache of the flag between tests."""
+    """Invalidate the 60s in-memory cache of the flag + L1 cache + counters between tests."""
     import main
     main._places_cache_mode_fetched_at = 0.0
     main._places_cache_mode_value = "off"
+    main._places_l1_cache.clear()
+    for k in main._places_source_counters:
+        main._places_source_counters[k] = 0
     yield
     main._places_cache_mode_fetched_at = 0.0
     main._places_cache_mode_value = "off"
+    main._places_l1_cache.clear()
 
 
 class TestPlacesCacheFlag:
@@ -418,6 +422,128 @@ class TestStopsFuzzyLookup:
         with patch("main.supabase.rpc", side_effect=Exception("Supabase down")):
             result = _stops_fuzzy_lookup_sync("calle ancha", 36.78, -6.35)
         assert result == []
+
+
+class TestL1InMemoryCache:
+    """REGRESSION GUARD (22 may 2026 P1): cache L1 in-memory antes de Supabase.
+    Latencia esperada ~5ms (vs ~500ms Supabase round-trip). TTL 5min, max 1000."""
+
+    def test_l1_put_get_roundtrip(self):
+        from main import _l1_get, _l1_put, _places_l1_cache
+        _places_l1_cache.clear()
+        _l1_put("calle ancha", "36.75,-6.25", {"predictions": [{"description": "A"}]})
+        got = _l1_get("calle ancha", "36.75,-6.25")
+        assert got is not None
+        assert got["predictions"][0]["description"] == "A"
+
+    def test_l1_miss_returns_none(self):
+        from main import _l1_get, _places_l1_cache
+        _places_l1_cache.clear()
+        assert _l1_get("no existe", "0,0") is None
+
+    def test_l1_lru_eviction_at_max(self):
+        """Cuando el cache supera _PLACES_L1_MAX, evicta el oldest."""
+        import main
+        main._places_l1_cache.clear()
+        # Forzar maxsize pequeño para test
+        original_max = main._PLACES_L1_MAX
+        main._PLACES_L1_MAX = 3
+        try:
+            main._l1_put("q1", "b", {"v": 1})
+            main._l1_put("q2", "b", {"v": 2})
+            main._l1_put("q3", "b", {"v": 3})
+            main._l1_put("q4", "b", {"v": 4})  # debe expulsar q1
+            assert main._l1_get("q1", "b") is None
+            assert main._l1_get("q4", "b") is not None
+            assert len(main._places_l1_cache) == 3
+        finally:
+            main._PLACES_L1_MAX = original_max
+
+    def test_l1_ttl_expires(self):
+        """Entrada con timestamp > TTL no devuelve cache."""
+        import main, time as _t
+        main._places_l1_cache.clear()
+        # Insertar con timestamp viejo manualmente
+        main._places_l1_cache[("q1", "b")] = (_t.time() - main._PLACES_L1_TTL_SEC - 1, {"v": 1})
+        assert main._l1_get("q1", "b") is None  # expirado
+
+
+class TestSourceCounters:
+    """REGRESSION GUARD (22 may 2026 P1): contadores in-memory por source
+    para medir hit rate real en /admin/cache/places-stats."""
+
+    def test_bump_counter_increments(self):
+        import main
+        main._places_source_counters["hit"] = 0
+        main._bump_source_counter("hit")
+        main._bump_source_counter("hit")
+        assert main._places_source_counters["hit"] == 2
+
+    def test_bump_unknown_source_is_noop(self):
+        """Sources no registrados no rompen — no-op silencioso."""
+        import main
+        main._bump_source_counter("invented_source_xyz")
+        # No crash, no entry creada
+        assert "invented_source_xyz" not in main._places_source_counters
+
+
+class TestTtlEscalonado:
+    """REGRESSION GUARD (22 may 2026 P1): TTL escalonado por popularidad.
+    Direcciones con muchos hits extienden expires_at para reducir re-llamadas
+    Google al expirar el TTL base 30d."""
+
+    def test_bump_at_hit_10_extends_ttl_90d(self):
+        """Cuando hits llega a 10, expires_at se renueva a +90d."""
+        import main
+        captured = {}
+        def fake_update_chain(payload):
+            captured["payload"] = payload
+            mock_chain = MagicMock()
+            mock_chain.eq.return_value = mock_chain
+            mock_chain.execute.return_value = MagicMock(data=[])
+            return mock_chain
+        with patch("main.supabase.table") as mock_tbl:
+            mock_tbl.return_value.update.side_effect = fake_update_chain
+            main._places_cache_bump_sync("q", "b", 9)  # current_hits=9, becomes 10
+        assert "expires_at" in captured["payload"]
+        # Verifica que el TTL extendido es razonable (+90d desde now)
+        from datetime import datetime, timezone, timedelta
+        exp = datetime.fromisoformat(captured["payload"]["expires_at"].replace("Z", "+00:00"))
+        delta = exp - datetime.now(timezone.utc)
+        assert 89 <= delta.days <= 91, f"Expected ~90d, got {delta.days}d"
+
+    def test_bump_at_hit_30_extends_ttl_180d(self):
+        """Cuando hits llega a 30, expires_at se renueva a +180d."""
+        import main
+        captured = {}
+        def fake_update_chain(payload):
+            captured["payload"] = payload
+            mock_chain = MagicMock()
+            mock_chain.eq.return_value = mock_chain
+            mock_chain.execute.return_value = MagicMock(data=[])
+            return mock_chain
+        with patch("main.supabase.table") as mock_tbl:
+            mock_tbl.return_value.update.side_effect = fake_update_chain
+            main._places_cache_bump_sync("q", "b", 29)  # becomes 30
+        from datetime import datetime, timezone
+        exp = datetime.fromisoformat(captured["payload"]["expires_at"].replace("Z", "+00:00"))
+        delta = exp - datetime.now(timezone.utc)
+        assert 179 <= delta.days <= 181
+
+    def test_bump_at_regular_hit_does_not_extend_ttl(self):
+        """En hits intermedios (no milestones), no se toca expires_at."""
+        import main
+        captured = {}
+        def fake_update_chain(payload):
+            captured["payload"] = payload
+            mock_chain = MagicMock()
+            mock_chain.eq.return_value = mock_chain
+            mock_chain.execute.return_value = MagicMock(data=[])
+            return mock_chain
+        with patch("main.supabase.table") as mock_tbl:
+            mock_tbl.return_value.update.side_effect = fake_update_chain
+            main._places_cache_bump_sync("q", "b", 5)  # becomes 6, no milestone
+        assert "expires_at" not in captured["payload"]
 
 
 class TestAdminCachePlacesStatsEndpoint:

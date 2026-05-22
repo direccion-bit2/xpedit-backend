@@ -7396,6 +7396,62 @@ _places_cache_mode_value: str = "off"
 _places_cache_mode_fetched_at: float = 0.0
 _PLACES_CACHE_MODE_TTL_SEC = 60  # re-read flag from app_config every 60s
 
+# Métricas in-memory por source (22 may 2026): contador desde último cold-start.
+# Para medir hit rate REAL distinguiendo exact / prefix / fuzzy / negative / google.
+# Reset al deploy (acepto). Devuelto en /admin/cache/places-stats.
+_places_source_counters: dict[str, int] = {
+    "hit": 0,                 # exact cache hit
+    "prefix_hit": 0,          # composite street prefix hit
+    "stops_fuzzy_hit": 0,     # pg_trgm fuzzy match en stops
+    "negative_hit": 0,        # cached ZERO_RESULTS
+    "miss_write": 0,          # Google → cached
+    "negative_write": 0,      # Google ZERO_RESULTS → cached negative
+    "shadow_would_hit": 0,    # shadow mode: cache habría hit
+    "shadow_miss": 0,         # shadow mode: cache miss
+    "skipped": 0,             # cache_mode=off o query <3 chars
+}
+_places_counters_started_at: float = time.time()
+
+
+def _bump_source_counter(source: str) -> None:
+    """Increment in-memory counter para source. Used in /admin/cache/places-stats."""
+    if source in _places_source_counters:
+        _places_source_counters[source] += 1
+
+
+# L1 in-memory cache (22 may 2026 P1): antes de Supabase lookup, mira LRU local.
+# Primera capa de defensa más rápida (~5ms vs ~500ms Supabase round-trip).
+# TTL corto (5 min) para no servir datos muy stale. maxsize 1000 entries con
+# eviction LRU (insertion order Python 3.7+ + OrderedDict.move_to_end).
+from collections import OrderedDict as _OrderedDict
+_PLACES_L1_MAX = 1000
+_PLACES_L1_TTL_SEC = 300
+_places_l1_cache: "_OrderedDict[tuple[str, str], tuple[float, dict]]" = _OrderedDict()
+
+
+def _l1_get(norm: str, bias: str) -> Optional[dict]:
+    """L1 lookup. Returns cached value if fresh, None if miss/stale."""
+    key = (norm, bias)
+    entry = _places_l1_cache.get(key)
+    if entry is None:
+        return None
+    ts, value = entry
+    if time.time() - ts > _PLACES_L1_TTL_SEC:
+        _places_l1_cache.pop(key, None)
+        return None
+    # LRU touch: move to end (most recent)
+    _places_l1_cache.move_to_end(key)
+    return value
+
+
+def _l1_put(norm: str, bias: str, value: dict) -> None:
+    """L1 store with LRU eviction when at max capacity."""
+    key = (norm, bias)
+    _places_l1_cache[key] = (time.time(), value)
+    _places_l1_cache.move_to_end(key)
+    while len(_places_l1_cache) > _PLACES_L1_MAX:
+        _places_l1_cache.popitem(last=False)  # evict oldest
+
 
 async def _get_places_cache_mode() -> str:
     """Returns current flag value. In-memory cached 60s to avoid hammering app_config.
@@ -7522,12 +7578,29 @@ def _places_cache_write_sync(norm: str, bias: str, predictions: list, ttl_days: 
 
 
 def _places_cache_bump_sync(norm: str, bias: str, current_hits: int) -> None:
-    """Sync bump of hits + last_used_at on cache hit (fire-and-forget)."""
+    """Sync bump of hits + last_used_at on cache hit (fire-and-forget).
+
+    TTL escalonado (22 may 2026 P1): direcciones populares (>=10 hits)
+    extienden expires_at +90d, >=30 hits extienden +180d. Razón: la
+    geografía no cambia, una calle que se ha pedido 50 veces seguro
+    sigue existiendo el próximo mes. Reduce re-llamadas Google al
+    expirar el TTL base 30d para hits populares (ahorro pasivo).
+    """
+    new_hits = current_hits + 1
+    update_payload: dict = {
+        "hits": new_hits,
+        "last_used_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Extend TTL based on popularity (only on milestone hits to avoid Update spam)
+    if new_hits in (10, 30, 100):
+        days = 180 if new_hits >= 30 else 90
+        update_payload["expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=days)
+        ).isoformat()
     try:
-        supabase.table("places_autocomplete_cache").update({
-            "hits": current_hits + 1,
-            "last_used_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("query_normalized", norm).eq("bias_geohash5", bias).execute()
+        supabase.table("places_autocomplete_cache").update(update_payload).eq(
+            "query_normalized", norm
+        ).eq("bias_geohash5", bias).execute()
     except Exception:
         pass  # bump failure is silent — does not break user request
 
@@ -7609,13 +7682,21 @@ async def places_autocomplete(
     cache_mode = await _get_places_cache_mode()
     norm_query, bias_key = _ac_cache_key(input, lat, lng)
     cache_eligible = cache_mode in ("on", "shadow") and norm_query and len(norm_query) >= 3
+    if not cache_eligible:
+        _bump_source_counter("skipped")
     cache_row = None
     if cache_eligible:
-        try:
-            cache_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_query, bias_key)
-        except Exception as e:
-            logger.warning(f"places cache lookup raised in to_thread: {e}")
-            cache_row = None
+        # L1 in-memory lookup primero (~5ms vs ~500ms Supabase)
+        cache_row = _l1_get(norm_query, bias_key)
+        if cache_row is None:
+            try:
+                cache_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_query, bias_key)
+            except Exception as e:
+                logger.warning(f"places cache lookup raised in to_thread: {e}")
+                cache_row = None
+            # Solo cachea en L1 si vino de Supabase con datos (no None)
+            if cache_row is not None:
+                _l1_put(norm_query, bias_key, cache_row)
 
     if cache_mode == "on" and cache_row and cache_row.get("predictions") is not None:
         # HIT — return cache, skip Google entirely. Fire-and-forget bump.
@@ -7625,6 +7706,7 @@ async def places_autocomplete(
         # query no devolvió resultados (Google ZERO_RESULTS). Devolvemos vacío
         # sin llamar Google (evita driver con typo recurrente quemando $$).
         if not cached_predictions:
+            _bump_source_counter("negative_hit")
             logger.info(f"places_cache_event=negative_hit query={norm_query[:30]} bias={bias_key}")
             return {"status": "ZERO_RESULTS", "predictions": [], "source": "cache_negative"}
 
@@ -7651,6 +7733,7 @@ async def places_autocomplete(
                 if filtered:
                     cached_predictions = filtered
 
+        _bump_source_counter("hit")
         logger.info(f"places_cache_event=hit query={norm_query[:30]} bias={bias_key} country={cc or '-'}")
         try:
             asyncio.create_task(asyncio.to_thread(
@@ -7682,6 +7765,7 @@ async def places_autocomplete(
                     number = num_match.group(0)
                     filtered = _filter_predictions_containing_number(prefix_row["predictions"], number)
                     if filtered:
+                        _bump_source_counter("prefix_hit")
                         logger.info(
                             f"places_cache_event=prefix_hit query={norm_query[:30]} "
                             f"prefix={street_prefix[:30]} number={number} matches={len(filtered)}"
@@ -7711,6 +7795,7 @@ async def places_autocomplete(
             logger.warning(f"stops fuzzy lookup raised in to_thread: {e}")
             fuzzy_predictions = []
         if fuzzy_predictions:
+            _bump_source_counter("stops_fuzzy_hit")
             logger.info(
                 f"places_cache_event=stops_fuzzy_hit query={norm_query[:30]} "
                 f"matches={len(fuzzy_predictions)} top_sim={fuzzy_predictions[0].get('_xpedit_similarity', 0):.2f}"
@@ -7781,10 +7866,13 @@ async def places_autocomplete(
                 # Tanto shadow como on escriben — la diferencia es que shadow NO lee.
                 if cache_eligible and status == "OK" and data.get("predictions"):
                     if cache_mode == "shadow" and cache_row:
+                        _bump_source_counter("shadow_would_hit")
                         logger.info(f"places_cache_event=shadow_would_hit query={norm_query[:30]} bias={bias_key}")
                     elif cache_mode == "shadow":
+                        _bump_source_counter("shadow_miss")
                         logger.info(f"places_cache_event=shadow_miss query={norm_query[:30]} bias={bias_key}")
                     else:
+                        _bump_source_counter("miss_write")
                         logger.info(f"places_cache_event=miss_write query={norm_query[:30]} bias={bias_key}")
                     try:
                         asyncio.create_task(asyncio.to_thread(
@@ -7795,6 +7883,7 @@ async def places_autocomplete(
                 elif cache_eligible and status == "ZERO_RESULTS" and cache_mode != "shadow":
                     # Negative cache TTL 24h (vs 30d normal). Direcciones típicamente
                     # NO desaparecen pero typos pueden corregirse, queremos re-validar antes.
+                    _bump_source_counter("negative_write")
                     logger.info(f"places_cache_event=negative_write query={norm_query[:30]} bias={bias_key}")
                     try:
                         asyncio.create_task(asyncio.to_thread(
@@ -8639,6 +8728,19 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
             .execute()
         )
 
+        # Métricas in-memory por source (desde último cold-start del backend)
+        counters_uptime_min = round((time.time() - _places_counters_started_at) / 60, 1)
+        total_lookups = sum(_places_source_counters.values()) or 1  # avoid div by 0
+        free_hits = (
+            _places_source_counters["hit"]
+            + _places_source_counters["prefix_hit"]
+            + _places_source_counters["stops_fuzzy_hit"]
+            + _places_source_counters["negative_hit"]
+        )
+        hit_rate_pct = round(free_hits / total_lookups * 100, 1)
+        # Real-time savings (since last cold-start)
+        rt_savings_usd = round(free_hits * price_per_call, 4)
+
         return {
             "ok": True,
             "cache_mode": cache_mode,  # off | shadow | on
@@ -8651,6 +8753,17 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
             "savings_7d_usd": round(hits_7d * price_per_call, 4),
             "price_per_call_usd": price_per_call,
             "top_queries": top_q.data or [],
+            # Métricas in-memory (desde último deploy):
+            "realtime": {
+                "uptime_minutes": counters_uptime_min,
+                "total_lookups": total_lookups - (1 if total_lookups == 1 and free_hits == 0 else 0),
+                "by_source": dict(_places_source_counters),
+                "hit_rate_pct": hit_rate_pct,
+                "savings_usd_since_deploy": rt_savings_usd,
+                "l1_in_memory_entries": len(_places_l1_cache),
+                "l1_max": _PLACES_L1_MAX,
+                "l1_ttl_seconds": _PLACES_L1_TTL_SEC,
+            },
         }
     except Exception as e:
         logger.exception("admin_cache_places_stats failed")
