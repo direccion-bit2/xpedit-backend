@@ -8281,21 +8281,35 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
 
         # Stats agregadas (pricing autocomplete legacy: $2.83 por 1000 = $0.00283 por call)
         price_per_call = 0.00283
-        stats_q = supabase.rpc("get_places_cache_stats").execute() if False else None
-        # Sin RPC, hacer query directa:
-        all_rows = (
-            supabase.table("places_autocomplete_cache")
-            .select("hits, created_at, last_used_at, expires_at")
-            .limit(10000)
-            .execute()
-        )
-        rows = all_rows.data or []
         now_iso = datetime.now(timezone.utc)
-        seven_days_ago = now_iso - timedelta(days=7)
+        seven_days_ago_iso = (now_iso - timedelta(days=7)).isoformat()
+
+        # PAGINACIÓN: PostgREST Supabase Cloud cap a 1000 rows por request
+        # (feedback_supabase_pagination_cap). Cache tiene >1000 entries tras
+        # backfill (22 may, 1.6k+ queries) → iteramos páginas hasta agotar.
+        rows = []
+        page = 0
+        page_size = 1000
+        while True:
+            chunk = (
+                supabase.table("places_autocomplete_cache")
+                .select("hits, created_at, last_used_at, expires_at")
+                .range(page * page_size, (page + 1) * page_size - 1)
+                .execute()
+            )
+            if not chunk.data:
+                break
+            rows.extend(chunk.data)
+            if len(chunk.data) < page_size:
+                break
+            page += 1
+            if page > 20:  # safety cap 20k entries (no debería pasar nunca)
+                break
 
         total_entries = len(rows)
         total_hits = sum(int(r.get("hits") or 0) for r in rows)
         active_entries = sum(1 for r in rows if r.get("expires_at") and datetime.fromisoformat(r["expires_at"].replace("Z", "+00:00")) > now_iso)
+        seven_days_ago = now_iso - timedelta(days=7)
         entries_7d = sum(1 for r in rows if r.get("created_at") and datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")) >= seven_days_ago)
         hits_7d = sum(int(r.get("hits") or 0) for r in rows if r.get("last_used_at") and datetime.fromisoformat(r["last_used_at"].replace("Z", "+00:00")) >= seven_days_ago)
 
