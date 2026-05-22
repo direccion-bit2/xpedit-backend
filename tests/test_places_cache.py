@@ -177,3 +177,182 @@ class TestPlacesCacheBackcompat:
         assert response.status_code == 200
         params = mock_http.get.call_args.kwargs.get("params", {})
         assert params.get("sessiontoken") == "uuid-abc"
+
+
+class TestAcCacheKeyGranularity:
+    """REGRESSION GUARD (22 may 2026 commit ab68af4): _ac_cache_key bias grid
+    es 0.25° (~27km). Antes era 0.1° (~11km) y drivers en ciudades vecinas
+    (Sanlúcar/Chipiona/Jerez/El Puerto, <30km) NO compartían cache → hit rate
+    empírico <10%. Si alguien vuelve a round(lat,1), el bug regresa silencioso.
+    Estos tests fallan al instante si se cambia la granularidad."""
+
+    def test_bias_uses_quarter_degree_grid_lat(self):
+        """lat redondeado a múltiplos de 0.25°."""
+        from main import _ac_cache_key
+        # lat 36.78 → round(36.78*4)/4 = round(147.12)/4 = 147/4 = 36.75
+        _, bias = _ac_cache_key("calle ancha", 36.78, -6.35)
+        # 36.78 cae más cerca de 36.75 que de 37.00
+        assert bias.startswith("36.75,"), f"expected lat=36.75, got bias={bias!r}"
+
+    def test_bias_uses_quarter_degree_grid_lng(self):
+        """lng redondeado a múltiplos de 0.25°."""
+        from main import _ac_cache_key
+        # lng -6.35 → round(-6.35*4)/4 = round(-25.4)/4 = -25/4 = -6.25
+        _, bias = _ac_cache_key("calle ancha", 36.78, -6.35)
+        assert bias.endswith(",-6.25"), f"expected lng=-6.25, got bias={bias!r}"
+
+    def test_bias_shared_across_27km_neighbors(self):
+        """Drivers a ~10-20km de distancia comparten cache (mismo bias bucket).
+        Sanlúcar (36.78,-6.35), Chipiona (36.74,-6.43): ambos → 36.75,-6.50/-6.25."""
+        from main import _ac_cache_key
+        _, sanlucar = _ac_cache_key("calle ancha", 36.78, -6.35)
+        _, chipiona_a = _ac_cache_key("calle ancha", 36.79, -6.37)
+        # Mismo bucket: ambos → 36.75,-6.25
+        assert sanlucar == chipiona_a, (
+            f"jitter 1km debería caer en mismo bucket — got {sanlucar!r} vs {chipiona_a!r}"
+        )
+
+    def test_bias_distinct_across_50km_cities(self):
+        """Ciudades a >50km NO comparten bias (Cádiz vs Sevilla → buckets distintos)."""
+        from main import _ac_cache_key
+        _, cadiz = _ac_cache_key("calle ancha", 36.53, -6.30)   # Cádiz
+        _, sevilla = _ac_cache_key("calle ancha", 37.39, -5.99)  # Sevilla (~100km NE)
+        assert cadiz != sevilla, (
+            f"Cádiz y Sevilla a 100km deberían tener bias distintos — got {cadiz!r} == {sevilla!r}"
+        )
+
+    def test_bias_empty_when_no_coords(self):
+        """Sin lat/lng (query genérica) → bias vacío."""
+        from main import _ac_cache_key
+        _, bias = _ac_cache_key("calle ancha", None, None)
+        assert bias == ""
+
+    def test_query_normalize_strips_whitespace_and_lowercases(self):
+        """query_normalized = lowercase + whitespace colapsado, max 200 chars."""
+        from main import _ac_cache_key
+        norm, _ = _ac_cache_key("  Calle   ANCHA  ", 36.78, -6.35)
+        assert norm == "calle ancha"
+
+
+class TestAdminCachePlacesStatsEndpoint:
+    """REGRESSION GUARD (22 may 2026 commits d180646 + bb3a68a):
+    /admin/cache/places-stats devuelve stats agregados del cache + pagina
+    PostgREST cap 1000. Si rompemos shape o paginación, el panel admin
+    muestra datos falsos (Miguel detectó 'Entradas 1000/1000' que era
+    subestimación porque .limit(10000) silenciosamente capa a 1000)."""
+
+    @pytest.mark.asyncio
+    async def test_admin_cache_places_stats_returns_expected_shape(self, admin_client):
+        """Verifica fields exactos del JSON response — si cambian, panel website /admin/costs se rompe."""
+        # Mock: 3 entries, una expirada, 2 activas; total 5 hits.
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        future = (now + timedelta(days=5)).isoformat()
+        past = (now - timedelta(days=1)).isoformat()
+        recent = (now - timedelta(hours=2)).isoformat()
+        old = (now - timedelta(days=10)).isoformat()
+        mock_rows = [
+            {"hits": 3, "created_at": recent, "last_used_at": recent, "expires_at": future},
+            {"hits": 2, "created_at": old, "last_used_at": old, "expires_at": future},
+            {"hits": 0, "created_at": old, "last_used_at": None, "expires_at": past},  # expirada
+        ]
+        mock_chunk = MagicMock(data=mock_rows)
+        mock_empty = MagicMock(data=[])
+        flag_row = MagicMock(data=[{"value": "on"}])
+        top_q = MagicMock(data=[{"query_normalized": "calle ancha", "hits": 3, "bias_geohash5": "36.75,-6.25", "last_used_at": recent}])
+
+        # supabase.table().select().X().Y().execute() chainable
+        def make_chain(final):
+            chain = MagicMock()
+            chain.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.limit.return_value = chain
+            chain.range.side_effect = [chain, chain]
+            chain.order.return_value = chain
+            chain.execute.side_effect = [final, mock_empty]
+            return chain
+
+        def table_side_effect(name):
+            if name == "app_config":
+                c = MagicMock()
+                c.select.return_value = c; c.eq.return_value = c; c.limit.return_value = c
+                c.execute.return_value = flag_row
+                return c
+            if name == "places_autocomplete_cache":
+                c = MagicMock()
+                c.select.return_value = c
+                # Primera vez (paginación): chunk con datos, 2ª vez: vacío
+                # Segunda vez (top queries): top_q
+                exec_calls = [mock_chunk, mock_empty, top_q]
+                c.range.return_value = c
+                c.order.return_value = c
+                c.limit.return_value = c
+                c.execute.side_effect = exec_calls
+                return c
+            return MagicMock()
+
+        with patch("main.supabase.table", side_effect=table_side_effect):
+            response = await admin_client.get("/admin/cache/places-stats")
+        assert response.status_code == 200
+        d = response.json()
+        # Fields críticos que el panel website consume:
+        for f in ("ok", "cache_mode", "total_entries", "active_entries", "total_hits",
+                  "entries_added_7d", "hits_7d", "savings_total_usd", "savings_7d_usd",
+                  "price_per_call_usd", "top_queries"):
+            assert f in d, f"missing field {f!r} in response — panel admin/costs se romperá"
+        assert d["cache_mode"] == "on"
+        assert d["total_entries"] == 3
+        assert d["total_hits"] == 5  # 3 + 2 + 0
+        assert d["active_entries"] == 2  # las 2 con expires_at futuro
+
+    @pytest.mark.asyncio
+    async def test_admin_cache_places_stats_paginates_beyond_1000(self, admin_client):
+        """REGRESSION (22 may 2026 commit bb3a68a): PostgREST Supabase Cloud
+        capa silenciosamente a 1000 rows/request. .limit(10000) NO funciona.
+        Si quitan el while-paginate, total_entries vuelve a subestimarse a 1000.
+        Este test simula 1500 entries reales → debe devolver 1500."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        future = (now + timedelta(days=5)).isoformat()
+        # 3 páginas de cache (1000 + 500 + vacía) + 1 query top_queries final.
+        page1_data = [{"hits": 1, "created_at": now.isoformat(), "last_used_at": now.isoformat(), "expires_at": future} for _ in range(1000)]
+        page2_data = [{"hits": 1, "created_at": now.isoformat(), "last_used_at": now.isoformat(), "expires_at": future} for _ in range(500)]
+        # State compartido entre calls (el endpoint llama supabase.table() en cada iteración del loop)
+        cache_call_counter = {"n": 0}
+        cache_responses = [
+            MagicMock(data=page1_data),
+            MagicMock(data=page2_data),
+            MagicMock(data=[]),         # 3ª llamada paginación = fin del loop
+            MagicMock(data=[]),         # 4ª llamada = top_queries
+        ]
+
+        def table_side_effect(name):
+            if name == "app_config":
+                c = MagicMock()
+                c.select.return_value = c; c.eq.return_value = c; c.limit.return_value = c
+                c.execute.return_value = MagicMock(data=[{"value": "on"}])
+                return c
+            if name == "places_autocomplete_cache":
+                c = MagicMock()
+                c.select.return_value = c
+                c.range.return_value = c
+                c.order.return_value = c
+                c.limit.return_value = c
+                # Cada call de execute() devuelve la siguiente respuesta del state compartido
+                def exec_next():
+                    idx = cache_call_counter["n"]
+                    cache_call_counter["n"] += 1
+                    return cache_responses[min(idx, len(cache_responses) - 1)]
+                c.execute.side_effect = exec_next
+                return c
+            return MagicMock()
+
+        with patch("main.supabase.table", side_effect=table_side_effect):
+            response = await admin_client.get("/admin/cache/places-stats")
+        assert response.status_code == 200
+        d = response.json()
+        assert d["total_entries"] == 1500, (
+            f"paginación rota: esperaba 1500 entries, got {d['total_entries']}. "
+            "Si volvió a 1000, alguien quitó el while-paginate."
+        )
+        assert d["total_hits"] == 1500

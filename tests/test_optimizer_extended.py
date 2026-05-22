@@ -725,3 +725,236 @@ class TestSolveWithPyvrp:
             result = solve_with_pyvrp(locs)
         assert result["success"] is False
         assert "PyVRP not available" in result["error"]
+
+
+# ===================== PYVRP DURATION UNITS (regression 22 may 2026) =====================
+
+
+class _FakePyVRPLocation:
+    """Marker object used as `from`/`to` in add_edge so we can identify pairs."""
+
+    def __init__(self, idx: int) -> None:
+        self.idx = idx
+
+
+class _FakePyVRPRoute:
+    def __init__(self) -> None:
+        self._visits: list[int] = []
+
+    def visits(self):
+        return self._visits
+
+
+class _FakePyVRPSolution:
+    def __init__(self, routes_visits: list[list[int]]) -> None:
+        self._routes = []
+        for visits in routes_visits:
+            r = _FakePyVRPRoute()
+            r._visits = visits
+            self._routes.append(r)
+
+    def routes(self):
+        return self._routes
+
+    def distance(self):
+        return 1234
+
+
+class _FakePyVRPResult:
+    def __init__(self, feasible: bool, routes_visits: list[list[int]]) -> None:
+        self._feasible = feasible
+        self.best = _FakePyVRPSolution(routes_visits)
+
+    def is_feasible(self):
+        return self._feasible
+
+
+class _FakePyVRPModel:
+    """Captures every model call so we can assert that durations are MINUTES."""
+
+    instances: list = []
+
+    def __init__(self) -> None:
+        self.depot_kwargs: dict = {}
+        self.client_kwargs_list: list[dict] = []
+        self.vehicle_kwargs: dict = {}
+        # Each entry: {"from": loc, "to": loc, "distance": int, "duration": int}
+        self.edges: list[dict] = []
+        self._locs: list[_FakePyVRPLocation] = []
+        _FakePyVRPModel.instances.append(self)
+
+    def add_depot(self, **kwargs):
+        self.depot_kwargs = kwargs
+        loc = _FakePyVRPLocation(idx=len(self._locs))
+        self._locs.append(loc)
+        return loc
+
+    def add_client(self, **kwargs):
+        self.client_kwargs_list.append(kwargs)
+        loc = _FakePyVRPLocation(idx=len(self._locs))
+        self._locs.append(loc)
+        return loc
+
+    def add_vehicle_type(self, **kwargs):
+        self.vehicle_kwargs = kwargs
+
+    @property
+    def locations(self):
+        return list(self._locs)
+
+    def add_edge(self, frm, to, distance, duration):
+        # PyVRP rejects self-loops with duration > 0 in real life; record so we
+        # can assert i==j has duration=0 without invoking the real binding.
+        self.edges.append({"from": frm, "to": to, "distance": distance, "duration": duration})
+
+    def solve(self, stop, display=False):
+        # Visits ordered: simply 1..N (clients) — enough for the optimizer to
+        # build an `optimized_route` and return success. visits() indices map to
+        # `model.locations` order: [depot, client0, client1, ...].
+        client_indices = [i + 1 for i in range(len(self._locs) - 1)]
+        return _FakePyVRPResult(feasible=True, routes_visits=[client_indices])
+
+
+class _FakeMaxRuntime:
+    def __init__(self, *_a, **_kw):
+        pass
+
+
+class TestPyVrpDurationUnits:
+    """Regression tests for commit e8bde70 (22 may 2026).
+
+    Bug: optimizer.py:422 pasaba `model.add_edge(... duration=dist)` con `dist`
+    en METROS. PyVRP 0.13.x interpretaba esos metros como minutos al cuadrarlos
+    con tw_early/tw_late (que vienen en minutos), produciendo siempre infeasible
+    en rutas urbanas (~1500m/edge) con ventanas de 2h.
+
+    Fix: convertir a minutos vía OSRM duration_matrix (segundos→minutos) o,
+    en su defecto, aproximar 40 km/h (1.5 min/km). Self-loops siempre duration=0.
+    """
+
+    def _patch_pyvrp(self, monkeypatch):
+        _FakePyVRPModel.instances.clear()
+        monkeypatch.setattr("optimizer.HAS_PYVRP", True)
+        # raising=False so test runs even when PyVRP isn't installed locally
+        # (HAS_PYVRP=False path leaves these names absent from the module).
+        monkeypatch.setattr("optimizer.PyVRPModel", _FakePyVRPModel, raising=False)
+        monkeypatch.setattr("optimizer.MaxRuntime", _FakeMaxRuntime, raising=False)
+
+    def test_pyvrp_duration_uses_minutes_with_duration_matrix(self, monkeypatch):
+        """duration_matrix viene en SEGUNDOS → debe traducirse a MINUTOS (s/60).
+
+        Antes del fix se pasaba `duration=distance_matrix[i][j]` (metros). Aquí
+        verificamos que para una entry de 600 segundos (=10 min) llegue exactamente
+        10 al `add_edge`, NO 600 ni el valor en metros.
+        """
+        self._patch_pyvrp(monkeypatch)
+        from optimizer import solve_with_pyvrp
+
+        locs = [
+            {"lat": 40.4168, "lng": -3.7038, "id": "depot"},
+            {"lat": 40.4065, "lng": -3.6895, "id": "a"},
+            {"lat": 40.4153, "lng": -3.6845, "id": "b"},
+        ]
+        # 3x3 distance matrix in METERS (real numbers don't matter, just non-zero)
+        dist_m = [
+            [0, 1500, 2200],
+            [1500, 0, 1800],
+            [2200, 1800, 0],
+        ]
+        # duration matrix in SECONDS — must be converted to minutes inside solver
+        # 600s=10min, 720s=12min, 480s=8min, etc.
+        dur_s = [
+            [0, 600, 1320],
+            [600, 0, 720],
+            [1320, 720, 0],
+        ]
+
+        result = solve_with_pyvrp(locs, distance_matrix=dist_m, duration_matrix=dur_s)
+        assert result["success"] is True
+
+        model = _FakePyVRPModel.instances[-1]
+        # Map each edge by (from_idx, to_idx) and check duration
+        edge_by_pair = {(e["from"].idx, e["to"].idx): e for e in model.edges}
+
+        # depot(idx0) -> client_a(idx1): distance 1500m, duration 600s = 10 min
+        e01 = edge_by_pair[(0, 1)]
+        assert e01["distance"] == 1500, "distance must stay in meters"
+        assert e01["duration"] == 10, (
+            f"duration must be MINUTES (600s/60=10), got {e01['duration']} — "
+            "likely passing seconds or meters again"
+        )
+
+        # client_a(idx1) -> client_b(idx2): 1800m, 720s = 12 min
+        e12 = edge_by_pair[(1, 2)]
+        assert e12["distance"] == 1800
+        assert e12["duration"] == 12
+
+        # depot(0) -> client_b(2): 2200m, 1320s = 22 min
+        e02 = edge_by_pair[(0, 2)]
+        assert e02["distance"] == 2200
+        assert e02["duration"] == 22
+
+    def test_pyvrp_duration_fallback_40kmh_when_no_duration_matrix(self, monkeypatch):
+        """Sin duration_matrix, debe estimar 40 km/h urbano = 1.5 min/km.
+
+        Fórmula del fix: `dur_min = max(1, int(dist / 1000 / 40 * 60))`.
+        Para 1500m: 1500/1000/40*60 = 2.25 → int = 2 min.
+        Para 2200m: 2200/1000/40*60 = 3.3 → int = 3 min.
+        """
+        self._patch_pyvrp(monkeypatch)
+        from optimizer import solve_with_pyvrp
+
+        locs = [
+            {"lat": 40.4168, "lng": -3.7038, "id": "depot"},
+            {"lat": 40.4065, "lng": -3.6895, "id": "a"},
+            {"lat": 40.4153, "lng": -3.6845, "id": "b"},
+        ]
+        dist_m = [
+            [0, 1500, 2200],
+            [1500, 0, 1800],
+            [2200, 1800, 0],
+        ]
+
+        result = solve_with_pyvrp(locs, distance_matrix=dist_m, duration_matrix=None)
+        assert result["success"] is True
+
+        model = _FakePyVRPModel.instances[-1]
+        edge_by_pair = {(e["from"].idx, e["to"].idx): e for e in model.edges}
+
+        # 1500m at 40 km/h ≈ 2.25 min → int(2.25) = 2
+        assert edge_by_pair[(0, 1)]["duration"] == 2
+        # 2200m at 40 km/h ≈ 3.3 min → int(3.3) = 3
+        assert edge_by_pair[(0, 2)]["duration"] == 3
+        # 1800m at 40 km/h = 2.7 → int = 2
+        assert edge_by_pair[(1, 2)]["duration"] == 2
+
+        # Distance must remain in METERS — the fix only touches duration
+        assert edge_by_pair[(0, 1)]["distance"] == 1500
+
+    def test_pyvrp_self_loop_has_zero_duration(self, monkeypatch):
+        """Self-loop (i==j) debe tener duration=0 — PyVRP rechaza self-loops con
+        duration>0 con ValueError. Antes del fix se enviaba el valor 0 metros
+        como duración, que coincidía pero por accidente; ahora es explícito.
+        """
+        self._patch_pyvrp(monkeypatch)
+        from optimizer import solve_with_pyvrp
+
+        locs = [
+            {"lat": 40.4168, "lng": -3.7038, "id": "depot"},
+            {"lat": 40.4065, "lng": -3.6895, "id": "a"},
+        ]
+        dist_m = [[0, 800], [800, 0]]
+        dur_s = [[0, 300], [300, 0]]
+
+        result = solve_with_pyvrp(locs, distance_matrix=dist_m, duration_matrix=dur_s)
+        assert result["success"] is True
+
+        model = _FakePyVRPModel.instances[-1]
+        # Every (i, i) edge must be duration=0 AND distance=0
+        for e in model.edges:
+            if e["from"].idx == e["to"].idx:
+                assert e["duration"] == 0, (
+                    f"self-loop ({e['from'].idx}->{e['to'].idx}) must have duration=0, "
+                    f"got {e['duration']}"
+                )
+                assert e["distance"] == 0
