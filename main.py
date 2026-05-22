@@ -705,6 +705,84 @@ async def _bump_anyio_thread_pool():
     except Exception as e:
         logger.warning(f"Could not raise anyio thread limiter: {e}")
 
+
+@app.on_event("startup")
+async def _startup_smoke_test():
+    """SMOKE TEST POST-DEPLOY (22 may 2026 — lessons learned bug HTTP/1.1):
+    valida en arranque que las dependencias críticas funcionan ANTES de
+    aceptar tráfico. Si falla, marca el backend como degraded en Sentry
+    pero NO crashea (Railway puede reiniciar infinitamente lo que peor).
+
+    Caso real bug ab88484: el cliente httpx Supabase quedó sin base_url tras
+    refactor → TODO el backend rompió Supabase 1h sin que nada lo detectara
+    hasta que un email Sentry llegó a Miguel. Este test lo habría cazado en
+    el primer startup post-deploy.
+
+    Validaciones:
+    1. Supabase responde a query trivial (app_config)
+    2. supabase.postgrest.session tiene base_url válido http(s)://
+    3. GOOGLE_API_KEY env var configurada (si !places no funcionaría)
+    4. JWT secret presente (auth rompería todo si falta)
+    """
+    failures: list[str] = []
+
+    # 1. Supabase real query
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("app_config").select("key").limit(1).execute()
+        )
+        if not isinstance(result.data, list):
+            failures.append(f"Supabase query returned non-list: {type(result.data)}")
+        else:
+            logger.info("smoke ✓ Supabase query OK")
+    except Exception as e:
+        failures.append(f"Supabase query failed: {type(e).__name__}: {e}")
+
+    # 2. postgrest session base_url valid
+    try:
+        session = getattr(supabase, "postgrest", None)
+        session = getattr(session, "session", None) if session else None
+        base_url = str(getattr(session, "base_url", "")) if session else ""
+        if not base_url.startswith(("http://", "https://")):
+            failures.append(f"postgrest session base_url INVALID: {base_url!r}")
+        else:
+            logger.info(f"smoke ✓ postgrest base_url OK ({base_url[:50]})")
+    except Exception as e:
+        failures.append(f"postgrest base_url check failed: {e}")
+
+    # 3. GOOGLE_API_KEY
+    if not GOOGLE_API_KEY:
+        failures.append("GOOGLE_API_KEY env var missing (places/* would not work)")
+    else:
+        logger.info("smoke ✓ GOOGLE_API_KEY set")
+
+    # 4. JWT secret
+    if not SUPABASE_JWT_SECRET:
+        failures.append("SUPABASE_JWT_SECRET env var missing (all auth would break)")
+    else:
+        logger.info("smoke ✓ SUPABASE_JWT_SECRET set")
+
+    if failures:
+        msg = f"STARTUP SMOKE TEST FAILED ({len(failures)} checks): " + " | ".join(failures)
+        logger.error(msg)
+        if SENTRY_DSN:
+            try:
+                sentry_sdk.capture_message(msg, level="fatal")
+            except Exception:
+                pass
+        # Marcamos health degraded para que Railway/admin lo vean. No
+        # hacemos sys.exit — preferimos backend degradado a backend OFF.
+        global _startup_smoke_failures
+        _startup_smoke_failures = failures
+    else:
+        logger.info(f"STARTUP SMOKE TEST PASSED ({4} checks)")
+        global _startup_smoke_ok
+        _startup_smoke_ok = True
+
+
+_startup_smoke_ok: bool = False
+_startup_smoke_failures: list[str] = []
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -8690,6 +8768,86 @@ async def admin_costs_history(
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail=f"history failed: {e}")
+
+
+@app.get("/admin/diag/smoke", tags=["admin", "diag"], summary="Smoke test on-demand: Supabase + Google + JWT + httpx config")
+async def admin_diag_smoke(user=Depends(require_admin)):
+    """Healthcheck profundo on-demand para validar que el backend tiene todas
+    sus dependencias OK.
+
+    Añadido 22 may 2026 tras incidente 1h con bug httpx HTTP/1.1 que rompió
+    TODO Supabase silenciosamente (50+ events, ventana 14:42→15:55 CEST).
+    El startup hook _startup_smoke_test corre solo al boot — este endpoint
+    deja al admin verificarlo MANUAL después de cualquier deploy/cambio.
+
+    Returns 200 con detalles si todo OK, 500 si alguna check falla."""
+    checks: dict = {}
+
+    # 1. Supabase real query
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("app_config").select("key").limit(1).execute()
+        )
+        checks["supabase_query"] = {"ok": isinstance(result.data, list), "rows": len(result.data or [])}
+    except Exception as e:
+        checks["supabase_query"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 2. postgrest session base_url
+    try:
+        session = supabase.postgrest.session
+        base_url = str(session.base_url)
+        checks["postgrest_base_url"] = {
+            "ok": base_url.startswith(("http://", "https://")),
+            "value": base_url,
+        }
+    except Exception as e:
+        checks["postgrest_base_url"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 3. Env vars críticas
+    checks["env"] = {
+        "GOOGLE_API_KEY": bool(GOOGLE_API_KEY),
+        "SUPABASE_JWT_SECRET": bool(SUPABASE_JWT_SECRET),
+        "SUPABASE_URL": bool(os.getenv("SUPABASE_URL")),
+        "SUPABASE_SERVICE_KEY": bool(SUPABASE_SERVICE_KEY),
+    }
+    checks["env"]["ok"] = all(v for k, v in checks["env"].items() if k != "ok")
+
+    # 4. Google Places ping (HEAD a la API endpoint, no real query)
+    try:
+        client = google_maps_client()
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+            params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
+            timeout=5.0,
+        )
+        gdata = resp.json() if resp.status_code == 200 else {}
+        # Google devuelve status OK o REQUEST_DENIED (key invalida)
+        checks["google_places"] = {
+            "ok": gdata.get("status") in ("OK", "ZERO_RESULTS"),
+            "google_status": gdata.get("status"),
+        }
+    except Exception as e:
+        checks["google_places"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 5. Startup smoke result (referencia histórica)
+    checks["startup_smoke"] = {
+        "passed": _startup_smoke_ok,
+        "failures_at_boot": _startup_smoke_failures,
+    }
+
+    # Veredicto global
+    all_ok = (
+        checks["supabase_query"].get("ok", False)
+        and checks["postgrest_base_url"].get("ok", False)
+        and checks["env"].get("ok", False)
+        and checks["google_places"].get("ok", False)
+    )
+    from fastapi.responses import JSONResponse as _DiagJSONResponse
+    status_code = 200 if all_ok else 500
+    return _DiagJSONResponse(
+        status_code=status_code,
+        content={"ok": all_ok, "checks": checks, "timestamp": datetime.now(timezone.utc).isoformat()},
+    )
 
 
 @app.get("/admin/cache/places-stats", tags=["admin", "costs"], summary="Stats cache Places Autocomplete")
