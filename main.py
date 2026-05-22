@@ -7218,6 +7218,42 @@ _places_api_last_check: Optional[datetime] = None
 _STREET_PREFIX_RE = re.compile(r"^(.+?)\s*,?\s+[#]?[\d][\w\-/]*\s*$")
 _TRAILING_NUMBER_RE = re.compile(r"[\d][\w\-/]*$")
 
+# Mapa de abreviaturas → forma canónica para normalización (22 may 2026):
+# Drivers escriben "c/Mayor 5" o "Av Andalucía" — esto crea cache miss vs
+# entries con "calle mayor 5" cacheadas. Expandimos antes del key lookup.
+# Soporta tanto "c/" pegado ("c/Mayor") como "c " con espacio ("c Mayor").
+_ABBREVIATIONS = {
+    r"\bc\.?/+\s*": "calle ",       # c/, c/X, c./X → calle
+    r"\bc\.\s+": "calle ",          # c. X → calle
+    r"\bcl\.?\s+": "calle ",
+    r"\bav\.?\s+": "avenida ",
+    r"\bavda\.?\s+": "avenida ",
+    r"\bavd\.?\s+": "avenida ",
+    r"\bpza\.?\s+": "plaza ",
+    r"\bplz\.?\s+": "plaza ",
+    r"\bps\.?\s+": "paseo ",
+    r"\bctra\.?\s+": "carretera ",
+    r"\bcra\.?\s+": "carrera ",     # LATAM (Colombia)
+    r"\bavd\.?a\.?\s+": "avenida ",
+}
+_ABBREV_PATTERNS = [(re.compile(pat, re.IGNORECASE), rep) for pat, rep in _ABBREVIATIONS.items()]
+_PUNCT_RE = re.compile(r"[^\w\s\-]")  # quitar puntuación excepto guión
+
+# Para filter country en cache HIT — Google predictions.terms[].value contiene
+# el nombre del país (e.g. "España", "Argentina"). Mapping inverso por ISO.
+_COUNTRY_NAME_BY_ISO = {
+    "ES": "ESPAÑA",
+    "AR": "ARGENTINA",
+    "CL": "CHILE",
+    "CO": "COLOMBIA",
+    "MX": "MÉXICO",
+    "PE": "PERÚ",
+    "EC": "ECUADOR",
+    "UY": "URUGUAY",
+    "BO": "BOLIVIA",
+    "PY": "PARAGUAY",
+}
+
 
 def _extract_street_prefix(query: str) -> Optional[str]:
     """Quita el último número (portal) para lookup secundario de cache.
@@ -7226,8 +7262,15 @@ def _extract_street_prefix(query: str) -> Optional[str]:
         'calle de la cepa, 16' → 'calle de la cepa'
         'carrera 39c, 84a-07' → 'carrera 39c' (mantiene primer número que es parte calle)
         'pago zahora' → None (no hay número final)
+        'calle 13 23' (LATAM) → None (prefix ya contiene número, evita falsos positivos)
 
-    Devuelve None si no hay número final o el prefix sería <5 chars."""
+    Devuelve None si:
+    - no hay número final
+    - el prefix sería <5 chars
+    - el prefix ya contiene número (LATAM "calle 13 23" donde 13 es parte del nombre
+      de calle, no portal). Sin este guard, el regex \\b23\\b matchearía también
+      "Calle 23 con Carrera 13" y devolvería predictions WRONG → riesgo entrega
+      en sitio equivocado. (Guard añadido 22 may 2026 tras audit.)"""
     q = (query or "").strip()
     if not q:
         return None
@@ -7236,6 +7279,11 @@ def _extract_street_prefix(query: str) -> Optional[str]:
         return None
     prefix = m.group(1).strip().rstrip(",").strip()
     if len(prefix) < 5 or prefix.lower() == q.lower():
+        return None
+    # Guard LATAM: si el prefix YA contiene un número, NO usar prefix lookup
+    # (evita "calle 13 23" → buscar "calle 13" → filtrar por "23" → match con
+    # "Calle 23 con Carrera 13" que es OTRA dirección).
+    if re.search(r"\d", prefix):
         return None
     return prefix
 
@@ -7255,6 +7303,39 @@ def _filter_predictions_containing_number(predictions: list, number: str) -> lis
     return [p for p in predictions if isinstance(p, dict) and rx.search(p.get("description", ""))]
 
 
+def _normalize_query_aggressive(query: str) -> str:
+    """Normalización agresiva para maximizar cache hit rate (22 may 2026).
+
+    Antes solo: lower + collapse spaces. Resultado: 'Calle María', 'calle maria',
+    'C/ Maria', 'calle maria,' generaban 4 entries distintas. Audit del 22 may
+    estimó 30-40% de las 1.700 entries son duplicadas por esto = ~€270/mes
+    en calls Google evitables.
+
+    Pasos:
+    1. Lower-case
+    2. Quitar acentos (NFD + strip combining marks): María → maria
+    3. Expandir abreviaturas: c/ → calle, av → avenida, ctra → carretera, etc.
+    4. Quitar puntuación (mantener guión y espacios)
+    5. Collapse whitespace múltiple
+    6. Max 200 chars
+    """
+    import unicodedata
+    if not query:
+        return ""
+    q = query.lower().strip()
+    # NFD decomposes "á" → "a" + "´", encode/ignore strips the combining marks.
+    q = unicodedata.normalize("NFD", q)
+    q = q.encode("ascii", "ignore").decode("ascii")
+    # Expandir abreviaturas ANTES de quitar puntuación (algunas llevan punto: "c.").
+    for pat, rep in _ABBREV_PATTERNS:
+        q = pat.sub(rep, q)
+    # Quitar puntuación (preserve - y space)
+    q = _PUNCT_RE.sub(" ", q)
+    # Collapse whitespace + trim
+    q = " ".join(q.split())
+    return q[:200]
+
+
 def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tuple[str, str]:
     """Normalize query + bias for cache lookup.
 
@@ -7266,8 +7347,11 @@ def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tup
     0.25° (~27km) → ciudades vecinas comparten cache. Hit rate esperado 40-60%.
     Tradeoff: Google recibirá el mismo bias para zona más grande, sus
     predictions seguirán siendo locales (Google también pondera por GPS real
-    del cliente cuando está disponible)."""
-    norm = " ".join((query or "").lower().strip().split())[:200]
+    del cliente cuando está disponible).
+
+    Query normalization (22 may 2026): se usa normalización agresiva (acentos,
+    abreviaturas, puntuación) para maximizar hit rate. Ver _normalize_query_aggressive."""
+    norm = _normalize_query_aggressive(query)
     if lat is None or lng is None:
         bias = ""
     else:
@@ -7328,8 +7412,11 @@ def _places_cache_lookup_sync(norm: str, bias: str) -> Optional[dict]:
         return None
 
 
-def _places_cache_write_sync(norm: str, bias: str, predictions: list) -> bool:
-    """Sync Supabase upsert — MUST be called via asyncio.to_thread (fire-and-forget)."""
+def _places_cache_write_sync(norm: str, bias: str, predictions: list, ttl_days: int = 30) -> bool:
+    """Sync Supabase upsert — MUST be called via asyncio.to_thread (fire-and-forget).
+
+    ttl_days: 30 default. Para negative cache (predictions=[]), pasar 1.
+    """
     try:
         supabase.table("places_autocomplete_cache").upsert({
             "query_normalized": norm,
@@ -7337,7 +7424,7 @@ def _places_cache_write_sync(norm: str, bias: str, predictions: list) -> bool:
             "predictions": predictions,
             "hits": 1,
             "last_used_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat(),
         }, on_conflict="query_normalized,bias_geohash5").execute()
         return True
     except Exception as e:
@@ -7441,16 +7528,48 @@ async def places_autocomplete(
             logger.warning(f"places cache lookup raised in to_thread: {e}")
             cache_row = None
 
-    if cache_mode == "on" and cache_row and cache_row.get("predictions"):
+    if cache_mode == "on" and cache_row and cache_row.get("predictions") is not None:
         # HIT — return cache, skip Google entirely. Fire-and-forget bump.
-        logger.info(f"places_cache_event=hit query={norm_query[:30]} bias={bias_key}")
+        cached_predictions = cache_row["predictions"]
+
+        # Negative cache (22 may 2026): si predictions == [], significa que la
+        # query no devolvió resultados (Google ZERO_RESULTS). Devolvemos vacío
+        # sin llamar Google (evita driver con typo recurrente quemando $$).
+        if not cached_predictions:
+            logger.info(f"places_cache_event=negative_hit query={norm_query[:30]} bias={bias_key}")
+            return {"status": "ZERO_RESULTS", "predictions": [], "source": "cache_negative"}
+
+        # Country filter en HIT (22 may 2026 fix B3 audit): driver Sanlúcar pidió
+        # 'avenida andalucía', cache HIT con entry de otro driver Sevilla → devolvía
+        # Sevilla. Filtramos por country flag si llega + verificamos GPS coherente.
+        cc = (country or "").strip().upper()
+        if cc and len(cc) == 2 and cc.isalpha():
+            gps_iso = _country_iso_from_coords(lat, lng)
+            # Si GPS contradice el flag, NO aplicamos filter (safety net mismo que línea 7580)
+            if not gps_iso or gps_iso == cc:
+                filtered = [
+                    p for p in cached_predictions
+                    if isinstance(p, dict) and (
+                        not p.get("terms") or
+                        any(
+                            (t.get("value", "").upper() in {cc, _COUNTRY_NAME_BY_ISO.get(cc, "")})
+                            for t in p.get("terms", [])
+                        )
+                    )
+                ]
+                # Si el filter elimina TODO, mejor devolver el original cached que ir a Google.
+                # En la práctica las predictions Google con country flag siempre llevan el país.
+                if filtered:
+                    cached_predictions = filtered
+
+        logger.info(f"places_cache_event=hit query={norm_query[:30]} bias={bias_key} country={cc or '-'}")
         try:
             asyncio.create_task(asyncio.to_thread(
                 _places_cache_bump_sync, norm_query, bias_key, cache_row.get("hits") or 0,
             ))
         except Exception:
             pass
-        return {"status": "OK", "predictions": cache_row["predictions"], "source": "cache"}
+        return {"status": "OK", "predictions": cached_predictions, "source": "cache"}
 
     # COMPOSITE LOOKUP (22 may 2026): si la query exacta MISS y contiene número
     # al final (ej 'calle bolsa 32'), busca el prefix de calle ('calle bolsa').
@@ -7546,8 +7665,10 @@ async def places_autocomplete(
                 if not _places_api_healthy:
                     logger.info("Google Places API recovered")
                     _places_api_healthy = True
-                # Cache write (fire-and-forget) — only on OK + non-empty predictions.
-                # Shadow mode logs theoretical hit rate without affecting response.
+                # Cache write (fire-and-forget). Para OK con predictions, cachea
+                # las predictions normales (TTL 30d). Para ZERO_RESULTS, cachea
+                # negativo (predictions=[]) con TTL 1d para evitar typos recurrentes.
+                # Tanto shadow como on escriben — la diferencia es que shadow NO lee.
                 if cache_eligible and status == "OK" and data.get("predictions"):
                     if cache_mode == "shadow" and cache_row:
                         logger.info(f"places_cache_event=shadow_would_hit query={norm_query[:30]} bias={bias_key}")
@@ -7558,6 +7679,16 @@ async def places_autocomplete(
                     try:
                         asyncio.create_task(asyncio.to_thread(
                             _places_cache_write_sync, norm_query, bias_key, data["predictions"],
+                        ))
+                    except Exception:
+                        pass
+                elif cache_eligible and status == "ZERO_RESULTS" and cache_mode != "shadow":
+                    # Negative cache TTL 24h (vs 30d normal). Direcciones típicamente
+                    # NO desaparecen pero typos pueden corregirse, queremos re-validar antes.
+                    logger.info(f"places_cache_event=negative_write query={norm_query[:30]} bias={bias_key}")
+                    try:
+                        asyncio.create_task(asyncio.to_thread(
+                            _places_cache_write_sync, norm_query, bias_key, [], 1,
                         ))
                     except Exception:
                         pass

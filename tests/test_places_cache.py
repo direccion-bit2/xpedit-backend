@@ -233,6 +233,44 @@ class TestAcCacheKeyGranularity:
         norm, _ = _ac_cache_key("  Calle   ANCHA  ", 36.78, -6.35)
         assert norm == "calle ancha"
 
+    def test_query_normalize_strips_accents(self):
+        """REGRESSION (22 may 2026 P0): 'María' y 'Maria' deben generar la misma key.
+        Audit estimó 30-40% entries duplicadas por esto = ~€270/mes evitables."""
+        from main import _ac_cache_key
+        norm1, _ = _ac_cache_key("Calle María", None, None)
+        norm2, _ = _ac_cache_key("calle maria", None, None)
+        assert norm1 == norm2
+        assert norm1 == "calle maria"
+
+    def test_query_normalize_expands_abbreviations_es(self):
+        """REGRESSION: abreviaturas ES expandidas. 'C/Mayor 5' = 'calle mayor 5'."""
+        from main import _ac_cache_key
+        cases = [
+            ("C/Mayor 5", "calle mayor 5"),
+            ("Av Andalucía", "avenida andalucia"),
+            ("Avda. España", "avenida espana"),
+            ("Pza España, 12", "plaza espana 12"),
+            ("Ctra. Sevilla, 5", "carretera sevilla 5"),
+        ]
+        for inp, expected in cases:
+            got, _ = _ac_cache_key(inp, None, None)
+            assert got == expected, f"{inp!r} → {got!r} (expected {expected!r})"
+
+    def test_query_normalize_expands_abbreviations_latam(self):
+        """REGRESSION: 'CRA' (Colombia) expandido a 'carrera'."""
+        from main import _ac_cache_key
+        norm, _ = _ac_cache_key("CRA 39c, 84a-07", None, None)
+        assert norm == "carrera 39c 84a-07"
+
+    def test_query_normalize_strips_punctuation_preserves_dash(self):
+        """REGRESSION: comas/puntos eliminados, pero - preservado (LATAM '84a-07')."""
+        from main import _ac_cache_key
+        norm, _ = _ac_cache_key("Calle Mayor, 5.", None, None)
+        assert norm == "calle mayor 5"
+        # Guión preservado
+        norm2, _ = _ac_cache_key("Carrera 39c 84a-07", None, None)
+        assert "84a-07" in norm2
+
 
 class TestCompositeStreetPrefixLookup:
     """REGRESSION GUARD (22 may 2026): cuando cache exact MISS pero la query
@@ -248,11 +286,21 @@ class TestCompositeStreetPrefixLookup:
         from main import _extract_street_prefix
         assert _extract_street_prefix("calle de la cepa, 16") == "calle de la cepa"
 
-    def test_extract_street_prefix_keeps_street_number_strips_portal(self):
-        """En direcciones LATAM tipo 'carrera 39c, 84a-07' el primer número
-        forma parte del nombre de calle, solo se quita el portal del final."""
+    def test_extract_street_prefix_skips_latam_addresses_with_number_in_prefix(self):
+        """REGRESSION (22 may 2026 audit): direcciones LATAM tipo 'calle 13 23'
+        donde el primer número forma parte del nombre de calle (no portal).
+        El guard devuelve None para evitar que el filtro \\b23\\b matchee
+        OTRA dirección como 'Calle 23 con Carrera 13' y devuelva predictions
+        WRONG → riesgo de entrega en sitio equivocado.
+
+        ANTES: matcheaba como 'carrera 39c' prefix → riesgo entrega mala.
+        AHORA: devuelve None → cae a Google → respuesta correcta."""
         from main import _extract_street_prefix
-        assert _extract_street_prefix("carrera 39c, 84a-07") == "carrera 39c"
+        assert _extract_street_prefix("carrera 39c, 84a-07") is None
+        assert _extract_street_prefix("calle 13 23") is None
+        assert _extract_street_prefix("avenida 5 de mayo 12") is None
+        # Confirma que el guard SOLO afecta prefix con número
+        assert _extract_street_prefix("calle bolsa 32") == "calle bolsa"  # OK ES
 
     def test_extract_street_prefix_returns_none_when_no_number(self):
         from main import _extract_street_prefix
