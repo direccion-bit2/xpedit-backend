@@ -8253,6 +8253,71 @@ async def admin_costs_history(
         raise HTTPException(status_code=500, detail=f"history failed: {e}")
 
 
+@app.get("/admin/cache/places-stats", tags=["admin", "costs"], summary="Stats cache Places Autocomplete")
+async def admin_cache_places_stats(user=Depends(require_admin)):
+    """Devuelve estado del cache `places_autocomplete_cache`: tamaño, hits, hit
+    rate estimado y ahorro USD. Útil para decidir cuándo activar cache mode
+    de off → shadow → on."""
+    try:
+        # Read flag actual del cache
+        flag_row = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "places_cache_mode")
+            .limit(1)
+            .execute()
+        )
+        cache_mode = (flag_row.data[0]["value"] if flag_row.data else "off") or "off"
+
+        # Stats agregadas (pricing autocomplete legacy: $2.83 por 1000 = $0.00283 por call)
+        price_per_call = 0.00283
+        stats_q = supabase.rpc("get_places_cache_stats").execute() if False else None
+        # Sin RPC, hacer query directa:
+        all_rows = (
+            supabase.table("places_autocomplete_cache")
+            .select("hits, created_at, last_used_at, expires_at")
+            .limit(10000)
+            .execute()
+        )
+        rows = all_rows.data or []
+        now_iso = datetime.now(timezone.utc)
+        seven_days_ago = now_iso - timedelta(days=7)
+
+        total_entries = len(rows)
+        total_hits = sum(int(r.get("hits") or 0) for r in rows)
+        active_entries = sum(1 for r in rows if r.get("expires_at") and datetime.fromisoformat(r["expires_at"].replace("Z", "+00:00")) > now_iso)
+        entries_7d = sum(1 for r in rows if r.get("created_at") and datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")) >= seven_days_ago)
+        hits_7d = sum(int(r.get("hits") or 0) for r in rows if r.get("last_used_at") and datetime.fromisoformat(r["last_used_at"].replace("Z", "+00:00")) >= seven_days_ago)
+
+        # Top 10 queries por hits (segunda query, ordenada)
+        top_q = (
+            supabase.table("places_autocomplete_cache")
+            .select("query_normalized, hits, bias_geohash5, last_used_at")
+            .order("hits", desc=True)
+            .limit(10)
+            .execute()
+        )
+
+        return {
+            "ok": True,
+            "cache_mode": cache_mode,  # off | shadow | on
+            "total_entries": total_entries,
+            "active_entries": active_entries,
+            "total_hits": total_hits,
+            "entries_added_7d": entries_7d,
+            "hits_7d": hits_7d,
+            "savings_total_usd": round(total_hits * price_per_call, 4),
+            "savings_7d_usd": round(hits_7d * price_per_call, 4),
+            "price_per_call_usd": price_per_call,
+            "top_queries": top_q.data or [],
+        }
+    except Exception as e:
+        logger.exception("admin_cache_places_stats failed")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail=f"cache stats failed: {e}")
+
+
 async def run_daily_costs_snapshot():
     """Cron diario 09:00 UTC: snapshot del día anterior. Persistente histórico."""
     try:
