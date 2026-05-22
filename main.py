@@ -10763,7 +10763,12 @@ async def start_monitoring_jobs():
         id="trial_feedback_emails",
         replace_existing=True,
     )
-    # Daily health digest (08:00 Europe/Madrid — detect silent regressions)
+    # Daily health digest (08:00 Europe/Madrid — detect silent regressions).
+    # coalesce=True + max_instances=1 + misfire_grace_time=300: si tras un
+    # deploy el job se registra varias veces o se solapan disparos (incidente
+    # 22 may 2026: llegaron 2 emails 06:00:05 y 06:00:07 con datos opuestos
+    # porque el primero leyó snapshots aún no calculados), APScheduler
+    # descarta los disparos extra automáticamente.
     social_scheduler.add_job(
         send_daily_health_digest_job,
         "cron",
@@ -10772,6 +10777,9 @@ async def start_monitoring_jobs():
         timezone=ZoneInfo("Europe/Madrid"),
         id="daily_health_digest",
         replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
     )
     # Reactivation push 5h follow-up (hourly at :15 → email if user did not open the app after push)
     social_scheduler.add_job(
