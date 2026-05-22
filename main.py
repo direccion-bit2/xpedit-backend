@@ -176,6 +176,32 @@ supabase: Client = create_client(
     SUPABASE_SERVICE_KEY
 )
 
+# Fix bug #222 (22 may 2026): forzar HTTP/1.1 en el cliente httpx que PostgREST
+# usa internamente. HTTP/2 con Supabase causa ráfagas "Server disconnected"
+# cuando el stream pool se satura (visto en LATAM concurrente). HTTP/1.1
+# reconnecta por request → no comparte pool problemático. Trade-off: ~10ms
+# extra por handshake TLS reusado en keepalive, irrelevante para nuestro QPS.
+# Aplicamos tras create_client porque PostgREST inicializa su httpx.Client
+# lazy en la primera query — sobrescribimos la sesión cuando ya existe.
+try:
+    import httpx as _httpx_supabase
+    # PostgREST client (queries .table())
+    _new_session = _httpx_supabase.Client(
+        http1=True,
+        http2=False,
+        timeout=30.0,
+        limits=_httpx_supabase.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0),
+    )
+    if hasattr(supabase, "postgrest") and hasattr(supabase.postgrest, "session"):
+        try:
+            supabase.postgrest.session.close()
+        except Exception:
+            pass
+        supabase.postgrest.session = _new_session
+    logger.info("Supabase httpx client forced to HTTP/1.1 (bug #222 mitigation)")
+except Exception as _e:
+    logger.warning(f"Failed to force HTTP/1.1 on Supabase client (continuing with default): {_e}")
+
 # Supabase JWT secret for token verification
 _raw_jwt = os.getenv("SUPABASE_JWT_SECRET", "")
 # Railway strips trailing '=' — restore base64 padding
