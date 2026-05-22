@@ -7217,12 +7217,22 @@ _places_api_last_check: Optional[datetime] = None
 
 def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tuple[str, str]:
     """Normalize query + bias for cache lookup.
-    bias_geohash5 is rounded to 1 decimal (~11km cell) when bias is provided."""
+
+    Bias grid: 0.25° (~27km lat × ~21km lng).
+    Antes (22 may 2026): round(lat, 1) = 0.1° (~11km) era demasiado granular —
+    drivers en ciudades vecinas (Sanlúcar / Chipiona / Jerez / El Puerto, todas
+    a <30km) NO compartían cache y cada uno gastaba autocompletes Google
+    para las mismas calles. Hit rate empírico <10%. Subimos granularidad a
+    0.25° (~27km) → ciudades vecinas comparten cache. Hit rate esperado 40-60%.
+    Tradeoff: Google recibirá el mismo bias para zona más grande, sus
+    predictions seguirán siendo locales (Google también pondera por GPS real
+    del cliente cuando está disponible)."""
     norm = " ".join((query or "").lower().strip().split())[:200]
     if lat is None or lng is None:
         bias = ""
     else:
-        bias = f"{round(lat, 1)},{round(lng, 1)}"
+        # Round a múltiplos de 0.25 (~27km lat, ~21km lng en España)
+        bias = f"{round(lat * 4) / 4:.2f},{round(lng * 4) / 4:.2f}"
     return norm, bias
 
 
