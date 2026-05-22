@@ -5952,6 +5952,7 @@ _MSI_FLOOR_RE = re.compile(
 # escapes guard against false positives inside other words.
 _MSI_STREET_TYPE_RE = re.compile(
     r"\b("
+    # ES estándar
     r"av(?:\.|enida)?|"
     r"c\/|c\.|calle|"
     r"plaza|pza|plza|"
@@ -5968,7 +5969,15 @@ _MSI_STREET_TYPE_RE = re.compile(
     r"bulevar|bvar|blvd|"
     r"glorieta|glta|"
     r"rambla|"
-    r"cl|av\b"
+    r"cl|av\b|"
+    # LATAM additions (Miguel 22 may rescue): formas válidas de direcciones
+    # rurales/informales en RD, MX, AR, CO, etc. que ANTES no se reconocían
+    # como "tipo de vía" → backend marcaba is_empty=true → app las ocultaba.
+    r"hacienda|reparto|residencial|res\.|pago\s+de|colonia|col\.|"
+    r"barrio|bda\.|barriada|sector|fracc(?:\.|ionamiento)?|"
+    r"manzana|mza\.|lote\b|km\b|kil(?:o|ó)metro|"
+    r"diagonal|transversal|circular|circunvalaci(?:o|ó)n|"
+    r"cortijo|finca|chalet|casa\b|nave\b|edificio|edif\.|bloque"
     r")\b\.?\s",
     re.IGNORECASE,
 )
