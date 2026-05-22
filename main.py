@@ -8342,6 +8342,222 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
         raise HTTPException(status_code=500, detail=f"cache stats failed: {e}")
 
 
+@app.post("/admin/cache/backfill-missing", tags=["admin", "costs"], summary="Backfill cache con queries faltantes")
+async def admin_cache_backfill_missing(
+    min_appearances: int = 2,
+    days_lookback: int = 90,
+    limit: int = 1000,
+    user=Depends(require_admin),
+):
+    """Backfill places_autocomplete_cache con queries en stops que aún NO están cacheadas.
+
+    Diseñado para ejecutar puntualmente (después de purgar cache o tras descubrir
+    direcciones nuevas no cubiertas). Bypass del rate limit /places/* del user
+    (llama Google directamente con backend GOOGLE_API_KEY).
+
+    Inserta con hits=0 para no inflar el contador de hits reales de drivers
+    (contrast: _places_cache_write_sync usa hits=1 porque sirvió una llamada).
+
+    Params:
+        min_appearances: solo cachear queries que aparezcan ≥N veces en stops (default 2)
+        days_lookback: ventana stops a considerar (default 90 días)
+        limit: máximo de queries a procesar en una llamada (default 1000, hard cap 2000)
+
+    Returns:
+        {processed, ok, fail, duration_seconds, sample_failures[:5]}
+    """
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+
+    limit = min(limit, 2000)  # safety cap
+    import time as _time
+    start_ts = _time.monotonic()
+
+    # 1. Identificar queries faltantes via SQL agregada
+    sql = """
+    WITH should_be_cached AS (
+      SELECT
+        LOWER(TRIM(REGEXP_REPLACE(SPLIT_PART(address, E'\\n', 1), '\\s+', ' ', 'g'))) AS q,
+        AVG(lat)::float AS lat,
+        AVG(lng)::float AS lng,
+        COUNT(*) AS n
+      FROM stops
+      WHERE created_at >= NOW() - (%s::text || ' days')::interval
+        AND deleted_at IS NULL
+        AND lat IS NOT NULL AND lng IS NOT NULL
+        AND address IS NOT NULL AND LENGTH(address) > 8
+      GROUP BY 1 HAVING COUNT(*) >= %s
+    )
+    SELECT q, lat, lng, n
+    FROM should_be_cached s
+    WHERE NOT EXISTS (SELECT 1 FROM places_autocomplete_cache c WHERE c.query_normalized = s.q)
+      AND LENGTH(TRIM(q)) >= 5
+      AND NOT (s.lat BETWEEN 34.0 AND 35.0 AND s.lng BETWEEN -16.0 AND -15.0)
+    ORDER BY n DESC
+    LIMIT %s;
+    """
+    try:
+        missing_resp = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "exec_sql_select",
+                {"q": sql, "params": [days_lookback, min_appearances, limit]},
+            ).execute()
+        )
+        missing = missing_resp.data or []
+    except Exception:
+        # Fallback: la RPC exec_sql_select puede no existir. Usar query directa.
+        # Limitación: SQL via supabase-py requiere RPC o construir via PostgREST.
+        # Hacemos la agregación en Python paginando stops.
+        logger.info("admin_cache_backfill: falling back to in-app aggregation")
+        missing = await _backfill_compute_missing_in_app(days_lookback, min_appearances, limit)
+
+    if not missing:
+        return {"processed": 0, "ok": 0, "fail": 0, "duration_seconds": 0, "message": "no missing queries found"}
+
+    # 2. Para cada faltante, llamar Google Places Autocomplete directo
+    client = google_maps_client()
+    ok = fail = 0
+    sample_failures: list[str] = []
+
+    async def _backfill_one(q: str, lat: float, lng: float) -> bool:
+        params = {
+            "input": q,
+            "key": GOOGLE_API_KEY,
+            "language": "es",
+            "location": f"{lat},{lng}",
+            "radius": "20000",  # bias 20km
+        }
+        try:
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                params=params,
+                timeout=15.0,
+            )
+            data = resp.json()
+            if data.get("status") not in ("OK", "ZERO_RESULTS"):
+                return False
+            if data.get("status") == "OK" and data.get("predictions"):
+                norm, bias = _ac_cache_key(q, lat, lng)
+                # INSERT con hits=0 (NO incrementar artificial — solo escribir bytes)
+                try:
+                    await asyncio.to_thread(
+                        lambda: supabase.table("places_autocomplete_cache").upsert({
+                            "query_normalized": norm,
+                            "bias_geohash5": bias,
+                            "predictions": data["predictions"],
+                            "hits": 0,
+                            "last_used_at": None,
+                            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+                        }, on_conflict="query_normalized,bias_geohash5").execute()
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(f"backfill cache write failed: {e}")
+                    return False
+            return True  # ZERO_RESULTS también "OK" (no es fallo, no hay nada que cachear)
+        except Exception as e:
+            logger.warning(f"backfill Google call failed for {q[:30]}: {e}")
+            return False
+
+    # Procesar en chunks de 20 concurrentes (margen QPS Google = 50)
+    chunk_size = 20
+    for i in range(0, len(missing), chunk_size):
+        chunk = missing[i:i + chunk_size]
+        results = await asyncio.gather(
+            *[_backfill_one(m["q"], m["lat"], m["lng"]) for m in chunk],
+            return_exceptions=True,
+        )
+        for m, r in zip(chunk, results):
+            if r is True:
+                ok += 1
+            else:
+                fail += 1
+                if len(sample_failures) < 5:
+                    sample_failures.append(m["q"][:60])
+
+    duration = _time.monotonic() - start_ts
+    logger.info(f"admin_cache_backfill_missing done: ok={ok} fail={fail} in {duration:.1f}s")
+    return {
+        "processed": len(missing),
+        "ok": ok,
+        "fail": fail,
+        "duration_seconds": round(duration, 1),
+        "sample_failures": sample_failures,
+    }
+
+
+async def _backfill_compute_missing_in_app(days_lookback: int, min_appearances: int, limit: int) -> list[dict]:
+    """Fallback Python si exec_sql_select RPC no existe.
+
+    Lista en cache existentes (set de query_normalized) + lista de stops paginadas
+    + group by Python. Más lento pero independiente de RPCs custom."""
+    # 1. Set de queries ya cacheadas
+    cached_q: set[str] = set()
+    offset = 0
+    while True:
+        chunk = await asyncio.to_thread(
+            lambda: supabase.table("places_autocomplete_cache")
+            .select("query_normalized")
+            .range(offset, offset + 999)
+            .execute()
+        )
+        if not chunk.data:
+            break
+        for r in chunk.data:
+            cached_q.add(r["query_normalized"])
+        if len(chunk.data) < 1000:
+            break
+        offset += 1000
+
+    # 2. Stops paginadas + group by en Python
+    from collections import defaultdict
+    agg: dict[str, list] = defaultdict(lambda: [0.0, 0.0, 0])  # q → [lat_sum, lng_sum, n]
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_lookback)).isoformat()
+    offset = 0
+    while True:
+        chunk = await asyncio.to_thread(
+            lambda: supabase.table("stops")
+            .select("address,lat,lng")
+            .gte("created_at", cutoff)
+            .is_("deleted_at", "null")
+            .not_.is_("lat", "null")
+            .not_.is_("lng", "null")
+            .not_.is_("address", "null")
+            .range(offset, offset + 999)
+            .execute()
+        )
+        if not chunk.data:
+            break
+        for row in chunk.data:
+            addr = (row.get("address") or "").strip()
+            lat = row.get("lat"); lng = row.get("lng")
+            if not addr or lat is None or lng is None or len(addr) < 9:
+                continue
+            q = " ".join(addr.split("\n")[0].lower().strip().split())[:200]
+            if not q or len(q) < 5:
+                continue
+            # Excluir demo Madrid sintético
+            if 34.0 < lat < 35.0 and -16.0 < lng < -15.0:
+                continue
+            agg[q][0] += float(lat)
+            agg[q][1] += float(lng)
+            agg[q][2] += 1
+        if len(chunk.data) < 1000:
+            break
+        offset += 1000
+
+    # 3. Filtrar faltantes + ordenar por n DESC + limit
+    missing = []
+    for q, (lat_sum, lng_sum, n) in agg.items():
+        if n < min_appearances:
+            continue
+        if q in cached_q:
+            continue
+        missing.append({"q": q, "lat": lat_sum / n, "lng": lng_sum / n, "n": n})
+    missing.sort(key=lambda x: -x["n"])
+    return missing[:limit]
+
+
 async def run_daily_costs_snapshot():
     """Cron diario 09:00 UTC: snapshot del día anterior. Persistente histórico."""
     try:
