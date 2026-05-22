@@ -8746,6 +8746,177 @@ async def admin_costs_live(
     }
 
 
+@app.get("/admin/costs/sustainability", tags=["admin", "costs"], summary="Unit economics: €/paying, €/driver activo, €/stop, free tier ETA")
+async def admin_costs_sustainability(user=Depends(require_admin)):
+    """KPIs de sostenibilidad de costes API (22 may 2026 audit dashboard).
+
+    Devuelve:
+    - cost_per_paying_daily_eur: € totales 24h / paying real → unit economics
+    - cost_per_active_driver_daily_eur: € 24h / drivers con actividad hoy
+    - cost_per_stop_eur: € 24h / stops creadas hoy
+    - free_tier: % consumido del crédito $200/mes Google Maps + ETA día agotamiento
+    - weekly_comparison: total esta semana vs anterior + % delta
+    """
+    USD_TO_EUR = 0.92
+    FREE_TIER_USD = 200.0
+
+    now = datetime.now(timezone.utc)
+    today_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Coste 24h NETO (post free tier)
+    costs_24h = await _gather_live_costs(
+        (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        today_iso,
+    )
+    eur_24h_neto = float(costs_24h.get("_total_cost_usd") or 0) * USD_TO_EUR
+
+    # Coste mes (consumido del free tier — Google Maps gross only)
+    # Suma de daily_api_metrics desde día 1 del mes para servicios que cuentan
+    # contra free tier (Maps Platform: Places, Routes, Geocoding, Snap, etc.)
+    try:
+        month_rows = (
+            supabase.table("daily_api_metrics")
+            .select("date,service,est_cost_usd")
+            .gte("date", month_start.date().isoformat())
+            .execute()
+        ).data or []
+    except Exception:
+        month_rows = []
+
+    # Free tier aplica solo a APIs Google Maps (no Vertex, no Resend, etc.)
+    GMAPS_SERVICES = {"places", "routes", "geocoding", "snap", "directions", "distance_matrix"}
+    month_consumed_usd = sum(
+        float(r.get("est_cost_usd") or 0)
+        for r in month_rows
+        if (r.get("service") or "").lower() in GMAPS_SERVICES
+    )
+    days_in_month = (now.replace(month=now.month % 12 + 1, day=1) - timedelta(days=1)).day if now.month < 12 else 31
+    day_of_month = now.day
+    days_elapsed = max(day_of_month, 1)
+    daily_avg_usd = month_consumed_usd / days_elapsed if days_elapsed else 0
+    days_until_free_tier_exhausted = (
+        int((FREE_TIER_USD - month_consumed_usd) / daily_avg_usd) + day_of_month
+        if daily_avg_usd > 0 else 999
+    )
+    pct_consumed = (month_consumed_usd / FREE_TIER_USD * 100) if FREE_TIER_USD else 0
+
+    # Paying count + activos + stops creadas hoy (todo en paralelo con asyncio.to_thread)
+    async def _paying_count():
+        try:
+            r = await asyncio.to_thread(
+                lambda: supabase.table("drivers")
+                .select("id", count="exact", head=True)
+                .not_.is_("subscription_source", "null")
+                .execute()
+            )
+            return int(getattr(r, "count", 0) or 0)
+        except Exception:
+            return 0
+
+    async def _active_drivers_today():
+        try:
+            # CEST midnight
+            cest_offset = 2
+            today_cest_start = (now - timedelta(hours=cest_offset)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(hours=cest_offset)
+            r = await asyncio.to_thread(
+                lambda: supabase.table("location_history")
+                .select("driver_id")
+                .gte("recorded_at", today_cest_start.isoformat())
+                .limit(10000)
+                .execute()
+            )
+            return len({row["driver_id"] for row in (r.data or []) if row.get("driver_id")})
+        except Exception:
+            return 0
+
+    async def _stops_created_today():
+        try:
+            today_date = day_start.date().isoformat()
+            r = await asyncio.to_thread(
+                lambda: supabase.table("stops")
+                .select("id", count="exact", head=True)
+                .gte("created_at", today_date)
+                .is_("deleted_at", "null")
+                .execute()
+            )
+            return int(getattr(r, "count", 0) or 0)
+        except Exception:
+            return 0
+
+    paying, active_drivers, stops_today = await asyncio.gather(
+        _paying_count(), _active_drivers_today(), _stops_created_today()
+    )
+
+    cost_per_paying = (eur_24h_neto / paying) if paying else 0
+    cost_per_driver = (eur_24h_neto / active_drivers) if active_drivers else 0
+    cost_per_stop = (eur_24h_neto / stops_today) if stops_today else 0
+
+    # Comparativa semanal: ISO weeks current vs previous
+    try:
+        cutoff_2w = (now - timedelta(days=14)).date().isoformat()
+        history = (
+            supabase.table("daily_api_metrics")
+            .select("date,est_cost_usd")
+            .gte("date", cutoff_2w)
+            .execute()
+        ).data or []
+        # Agrupar por semana ISO
+        from collections import defaultdict
+        by_week: dict = defaultdict(float)
+        for row in history:
+            d = datetime.fromisoformat(row["date"]).date() if isinstance(row["date"], str) else row["date"]
+            iso_year, iso_week, _ = d.isocalendar()
+            by_week[(iso_year, iso_week)] += float(row.get("est_cost_usd") or 0)
+        current_y, current_w, _ = now.date().isocalendar()
+        prev_date = (now - timedelta(days=7)).date()
+        prev_y, prev_w, _ = prev_date.isocalendar()
+        current_week_usd = by_week.get((current_y, current_w), 0)
+        prev_week_usd = by_week.get((prev_y, prev_w), 0)
+        delta_pct = (
+            (current_week_usd - prev_week_usd) / prev_week_usd * 100
+            if prev_week_usd > 0 else 0
+        )
+    except Exception:
+        current_week_usd = 0
+        prev_week_usd = 0
+        delta_pct = 0
+
+    return {
+        "ok": True,
+        "fetched_at": now.isoformat(),
+        "kpis": {
+            "cost_per_paying_daily_eur": round(cost_per_paying, 4),
+            "cost_per_active_driver_daily_eur": round(cost_per_driver, 4),
+            "cost_per_stop_eur": round(cost_per_stop, 5),
+            "paying_count": paying,
+            "active_drivers_today": active_drivers,
+            "stops_created_today": stops_today,
+            "eur_24h_neto": round(eur_24h_neto, 2),
+        },
+        "free_tier": {
+            "monthly_credit_usd": FREE_TIER_USD,
+            "monthly_credit_eur": round(FREE_TIER_USD * USD_TO_EUR, 2),
+            "consumed_usd": round(month_consumed_usd, 2),
+            "consumed_eur": round(month_consumed_usd * USD_TO_EUR, 2),
+            "pct_consumed": round(pct_consumed, 1),
+            "day_of_month": day_of_month,
+            "days_in_month": days_in_month,
+            "eta_exhaustion_day": min(days_until_free_tier_exhausted, 99),
+            "will_exhaust_this_month": days_until_free_tier_exhausted <= days_in_month,
+            "daily_avg_usd": round(daily_avg_usd, 3),
+        },
+        "weekly": {
+            "current_week_eur": round(current_week_usd * USD_TO_EUR, 2),
+            "prev_week_eur": round(prev_week_usd * USD_TO_EUR, 2),
+            "delta_pct": round(delta_pct, 1),
+        },
+    }
+
+
 @app.get("/admin/costs/history", tags=["admin", "costs"], summary="Histórico snapshots diarios (daily_api_metrics)")
 async def admin_costs_history(
     days: int = 30,
