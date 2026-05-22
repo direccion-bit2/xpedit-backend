@@ -6047,11 +6047,16 @@ async def _msi_geocode_one(
     if stop.get("postal_code"):
         components_parts.append(f"postal_code:{stop['postal_code']}")
 
+    # FIX 22 may 18:15 (Miguel OCR rescue): region hardcoded "es" hacía que
+    # Google geocodificara stops DOM/MX/AR/CL al centro de Madrid (España
+    # APPROXIMATE). Ahora region sigue el country del driver — para drivers
+    # ES sigue siendo "es", para DOM "do", para AR "ar", etc.
+    cc_lower = (country or "ES").strip().lower()
     params = {
         "address": address_query,
         "components": "|".join(components_parts),
         "language": "es",
-        "region": "es",
+        "region": cc_lower,
         "key": GOOGLE_API_KEY,
     }
     if bbox:
@@ -6252,8 +6257,19 @@ async def _msi_normalize_and_geocode(
             if s.get("city"):
                 flat_address = f"{flat_address} {s['city']}".strip()
 
+        # FIX 22 may 18:15 (Miguel OCR rescue): NO devolver coords si Google
+        # marcó APPROXIMATE — eso significa que solo encontró centroide del
+        # país/región, NO la dirección real. Devolver esas coords al cliente
+        # hace que la stop se cree en el centro de Madrid (drivers DOM
+        # afectados — geocoding con country wrong daba siempre APPROXIMATE).
+        # La stop sigue llegando al cliente pero sin coords → review screen
+        # la marca en rojo y driver puede editar manualmente.
+        _is_usable_geo = (
+            geo.get("status") == "ok"
+            and geo.get("location_type") in ("ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER")
+        )
         s["coords"] = (
-            {"lat": geo["lat"], "lng": geo["lng"]} if geo.get("status") == "ok" else None
+            {"lat": geo["lat"], "lng": geo["lng"]} if _is_usable_geo else None
         )
         s["formatted_address"] = "" if is_empty else (geo.get("formatted_address") or flat_address)
         s["place_id"] = geo.get("place_id", "")
