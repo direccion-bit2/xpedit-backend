@@ -7430,6 +7430,12 @@ def _filter_predictions_containing_number(predictions: list, number: str) -> lis
     return [p for p in predictions if isinstance(p, dict) and rx.search(p.get("description", ""))]
 
 
+_VIA_PREFIXES_STRIP = (
+    # ordenados largo→corto para evitar matches parciales (carretera antes que carrera)
+    "carretera ", "avenida ", "carrera ", "paseo ", "plaza ", "calle ", "av ",
+)
+
+
 def _normalize_query_aggressive(query: str) -> str:
     """Normalización agresiva para maximizar cache hit rate (22 may 2026).
 
@@ -7444,7 +7450,11 @@ def _normalize_query_aggressive(query: str) -> str:
     3. Expandir abreviaturas: c/ → calle, av → avenida, ctra → carretera, etc.
     4. Quitar puntuación (mantener guión y espacios)
     5. Collapse whitespace múltiple
-    6. Max 200 chars
+    6. Strip prefijo tipo de vía (calle/avenida/plaza/paseo/carrera/carretera/av)
+       SI: queda ≥2 tokens después Y el siguiente token NO es número (guard LATAM
+       "calle 43" donde 43 es nombre de calle, no portal). Razón: drivers
+       inconsistentes escriben "calle X" vs "X" → 2 entries hoy → 1 entry.
+    7. Max 200 chars
     """
     import unicodedata
     if not query:
@@ -7460,6 +7470,21 @@ def _normalize_query_aggressive(query: str) -> str:
     q = _PUNCT_RE.sub(" ", q)
     # Collapse whitespace + trim
     q = " ".join(q.split())
+    # Strip prefijo tipo de vía (paso 6 — añadido 22 may 2026 audit Miguel)
+    for prefix in _VIA_PREFIXES_STRIP:
+        if q.startswith(prefix):
+            rest = q[len(prefix):].lstrip()
+            rest_tokens = rest.split()
+            # ≥2 tokens restantes Y primer token NO EMPIEZA por dígito
+            # (guard LATAM: "calle 43", "carrera 39c", "avenida 5 de mayo" donde
+            # el número o número+letra es nombre de calle, NO portal).
+            if (
+                len(rest_tokens) >= 2
+                and rest_tokens[0]  # no vacío
+                and not rest_tokens[0][0].isdigit()
+            ):
+                q = rest
+            break  # solo un prefijo
     return q[:200]
 
 

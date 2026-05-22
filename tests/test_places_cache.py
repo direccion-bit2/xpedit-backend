@@ -247,21 +247,25 @@ class TestAcCacheKeyGranularity:
         assert norm1 == "calle maria"
 
     def test_query_normalize_expands_abbreviations_es(self):
-        """REGRESSION: abreviaturas ES expandidas. 'C/Mayor 5' = 'calle mayor 5'."""
+        """REGRESSION: abreviaturas ES expandidas + tipo vía stripped si seguro.
+        'C/Mayor 5' → 'calle mayor 5' (abreviatura expandida) → 'mayor 5'
+        (prefijo stripped porque ≥2 tokens y 'mayor' no empieza por dígito).
+        'Av Andalucía' → 'avenida andalucia' (sin strip: solo 1 token después)."""
         from main import _ac_cache_key
         cases = [
-            ("C/Mayor 5", "calle mayor 5"),
-            ("Av Andalucía", "avenida andalucia"),
-            ("Avda. España", "avenida espana"),
-            ("Pza España, 12", "plaza espana 12"),
-            ("Ctra. Sevilla, 5", "carretera sevilla 5"),
+            ("C/Mayor 5", "mayor 5"),                  # strip "calle" + "mayor 5"
+            ("Av Andalucía", "avenida andalucia"),     # 1 token → no strip
+            ("Avda. España", "avenida espana"),        # 1 token → no strip
+            ("Pza España, 12", "espana 12"),           # strip "plaza" + "espana 12"
+            ("Ctra. Sevilla, 5", "sevilla 5"),         # strip "carretera" + "sevilla 5"
         ]
         for inp, expected in cases:
             got, _ = _ac_cache_key(inp, None, None)
             assert got == expected, f"{inp!r} → {got!r} (expected {expected!r})"
 
     def test_query_normalize_expands_abbreviations_latam(self):
-        """REGRESSION: 'CRA' (Colombia) expandido a 'carrera'."""
+        """REGRESSION: 'CRA' (Colombia) expandido a 'carrera'. 'carrera 39c 84a-07'
+        NO strippea porque '39c' empieza por dígito (guard LATAM: es nombre, no portal)."""
         from main import _ac_cache_key
         norm, _ = _ac_cache_key("CRA 39c, 84a-07", None, None)
         assert norm == "carrera 39c 84a-07"
@@ -270,10 +274,64 @@ class TestAcCacheKeyGranularity:
         """REGRESSION: comas/puntos eliminados, pero - preservado (LATAM '84a-07')."""
         from main import _ac_cache_key
         norm, _ = _ac_cache_key("Calle Mayor, 5.", None, None)
-        assert norm == "calle mayor 5"
+        # Tras strip prefijo "calle" → "mayor 5"
+        assert norm == "mayor 5"
         # Guión preservado
         norm2, _ = _ac_cache_key("Carrera 39c 84a-07", None, None)
         assert "84a-07" in norm2
+
+    def test_query_normalize_strips_via_prefix_when_safe(self):
+        """REGRESSION (22 may 2026 audit Miguel): 'calle X' y 'X' deben caer en
+        la misma cache key cuando hay ≥2 tokens restantes y el siguiente NO es
+        dígito. Drivers inconsistentes generan duplicados sin esto."""
+        from main import _ac_cache_key
+        # Caso clásico: con/sin "calle"
+        n1, _ = _ac_cache_key("calle san francisco 43 zafra", None, None)
+        n2, _ = _ac_cache_key("san francisco 43 zafra", None, None)
+        assert n1 == n2 == "san francisco 43 zafra"
+
+        # avenida
+        n3, _ = _ac_cache_key("avenida andalucia 4", None, None)
+        n4, _ = _ac_cache_key("andalucia 4", None, None)
+        assert n3 == n4 == "andalucia 4"
+
+        # plaza
+        n5, _ = _ac_cache_key("plaza españa 12", None, None)
+        n6, _ = _ac_cache_key("españa 12", None, None)
+        assert n5 == n6 == "espana 12"
+
+        # carrera (LATAM, pero con nombre alfabético después)
+        n7, _ = _ac_cache_key("carrera dorada 100", None, None)
+        n8, _ = _ac_cache_key("dorada 100", None, None)
+        assert n7 == n8 == "dorada 100"
+
+    def test_query_normalize_does_not_strip_via_prefix_with_numeric_latam(self):
+        """REGRESSION LATAM: 'calle 43' NO se debe stripear porque '43' es
+        nombre de calle (no portal). Riesgo: 'calle 43' → '43' colisión con
+        otro contexto. Igual para 'carrera 39c' (Colombia)."""
+        from main import _ac_cache_key
+        # "calle 43" → "calle 43" (no se quita, segundo token es número)
+        n1, _ = _ac_cache_key("calle 43", None, None)
+        assert n1 == "calle 43"
+
+        # "carrera 39c" → "carrera 39c" (39c es nombre LATAM)
+        n2, _ = _ac_cache_key("carrera 39c", None, None)
+        assert n2 == "carrera 39c"
+
+        # "avenida 5 de mayo" → "avenida 5 de mayo" (5 es nombre, no portal)
+        n3, _ = _ac_cache_key("avenida 5 de mayo", None, None)
+        assert n3 == "avenida 5 de mayo"
+
+    def test_query_normalize_does_not_strip_via_prefix_when_only_2_tokens(self):
+        """REGRESSION: 'plaza mayor' tiene solo 2 tokens. Stripear → 'mayor'
+        sería demasiado genérico (matchearía 'calle mayor', 'paseo mayor', etc).
+        Solo se stripea si quedan ≥2 tokens DESPUÉS (es decir, query ≥3 tokens)."""
+        from main import _ac_cache_key
+        n1, _ = _ac_cache_key("plaza mayor", None, None)
+        assert n1 == "plaza mayor"  # NO stripear
+
+        n2, _ = _ac_cache_key("calle ancha", None, None)
+        assert n2 == "calle ancha"  # NO stripear
 
 
 class TestCompositeStreetPrefixLookup:
