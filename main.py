@@ -8804,14 +8804,21 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
 
     # Paying count + activos + stops creadas hoy (todo en paralelo con asyncio.to_thread)
     async def _paying_count():
+        # NOTA: usamos .in_() con lista explícita (no .not_.is_(...,'null') + head=True
+        # porque en postgrest-py head=True no siempre devuelve count fiable).
+        # Source canónico paying = subscription_source IN ('stripe','revenuecat').
         try:
             r = await asyncio.to_thread(
                 lambda: supabase.table("drivers")
-                .select("id", count="exact", head=True)
-                .not_.is_("subscription_source", "null")
+                .select("id", count="exact")
+                .in_("subscription_source", ["stripe", "revenuecat"])
+                .limit(1)
                 .execute()
             )
-            return int(getattr(r, "count", 0) or 0)
+            cnt = getattr(r, "count", None)
+            if cnt is None:
+                cnt = len(r.data or [])
+            return int(cnt or 0)
         except Exception:
             return 0
 
@@ -8834,16 +8841,23 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
             return 0
 
     async def _stops_created_today():
+        # CEST midnight, no UTC — usuario quiere "hoy" en su zona horaria.
+        # NOTA: sin head=True por el mismo motivo que _paying_count.
         try:
-            today_date = day_start.date().isoformat()
+            cest_offset = 2
+            today_cest_start = (now - timedelta(hours=cest_offset)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(hours=cest_offset)
             r = await asyncio.to_thread(
                 lambda: supabase.table("stops")
-                .select("id", count="exact", head=True)
-                .gte("created_at", today_date)
+                .select("id", count="exact")
+                .gte("created_at", today_cest_start.isoformat())
                 .is_("deleted_at", "null")
+                .limit(1)
                 .execute()
             )
-            return int(getattr(r, "count", 0) or 0)
+            cnt = getattr(r, "count", None)
+            return int(cnt or 0)
         except Exception:
             return 0
 
