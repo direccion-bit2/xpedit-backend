@@ -94,7 +94,9 @@ if SENTRY_DSN:
     except Exception as e:
         logger.warning(f"Sentry startup ping failed: {e}")
 else:
-    logger.warning("SENTRY_DSN not configured — backend errors will NOT be reported")
+    # INFO en vez de WARNING (22 may 2026): solo informativo en local dev.
+    # En prod SENTRY_DSN siempre está configurado, este branch no aplica.
+    logger.info("SENTRY_DSN not configured — backend errors will NOT be reported (expected in local dev)")
 
 from emails import (
     ACTIVE_FREE_PRO_INVITE_SUBJECT,
@@ -179,26 +181,42 @@ supabase: Client = create_client(
 # Fix bug #222 (22 may 2026): forzar HTTP/1.1 en el cliente httpx que PostgREST
 # usa internamente. HTTP/2 con Supabase causa ráfagas "Server disconnected"
 # cuando el stream pool se satura (visto en LATAM concurrente). HTTP/1.1
-# reconnecta por request → no comparte pool problemático. Trade-off: ~10ms
-# extra por handshake TLS reusado en keepalive, irrelevante para nuestro QPS.
-# Aplicamos tras create_client porque PostgREST inicializa su httpx.Client
-# lazy en la primera query — sobrescribimos la sesión cuando ya existe.
+# reconnecta por request → no comparte pool problemático.
+#
+# IMPORTANTE (regresión 22 may 15:54): el nuevo httpx.Client DEBE preservar
+# `base_url` y `headers` del cliente original que postgrest configuró con
+# la URL/key de Supabase. Sin esto, requests con path relativo fallan con
+# "Request URL is missing an 'http://' or 'https://' protocol".
+# 20 events en 30s con drivers Bogotá afectados antes de detectarlo.
 try:
     import httpx as _httpx_supabase
-    # PostgREST client (queries .table())
-    _new_session = _httpx_supabase.Client(
-        http1=True,
-        http2=False,
-        timeout=30.0,
-        limits=_httpx_supabase.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0),
-    )
     if hasattr(supabase, "postgrest") and hasattr(supabase.postgrest, "session"):
-        try:
-            supabase.postgrest.session.close()
-        except Exception:
-            pass
-        supabase.postgrest.session = _new_session
-    logger.info("Supabase httpx client forced to HTTP/1.1 (bug #222 mitigation)")
+        _orig_session = supabase.postgrest.session
+        _orig_base_url = getattr(_orig_session, "base_url", None)
+        _orig_headers = dict(getattr(_orig_session, "headers", {}) or {})
+        if _orig_base_url and str(_orig_base_url).startswith(("http://", "https://")):
+            _new_session = _httpx_supabase.Client(
+                base_url=_orig_base_url,
+                headers=_orig_headers,
+                http1=True,
+                http2=False,
+                timeout=30.0,
+                limits=_httpx_supabase.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=100,
+                    keepalive_expiry=30.0,
+                ),
+            )
+            try:
+                _orig_session.close()
+            except Exception:
+                pass
+            supabase.postgrest.session = _new_session
+            logger.info(f"Supabase httpx client forced to HTTP/1.1 (base_url={_orig_base_url})")
+        else:
+            logger.warning(
+                f"Skip HTTP/1.1 fix — base_url invalid or missing on original session: {_orig_base_url!r}"
+            )
 except Exception as _e:
     logger.warning(f"Failed to force HTTP/1.1 on Supabase client (continuing with default): {_e}")
 
@@ -7264,6 +7282,11 @@ _ABBREVIATIONS = {
 }
 _ABBREV_PATTERNS = [(re.compile(pat, re.IGNORECASE), rep) for pat, rep in _ABBREVIATIONS.items()]
 _PUNCT_RE = re.compile(r"[^\w\s\-]")  # quitar puntuación excepto guión
+
+# Bajado de WARNING → INFO 22 may: estos 3 warnings spammean cada cold-start
+# en local (SENTRY_DSN ausente, VROOM/PyVRP no instalados local) y NO aportan.
+# En prod sí están configurados, por eso nunca aparecen. Mantenemos info-level
+# para tener trazabilidad en logs sin contaminar terminal del dev.
 
 # Para filter country en cache HIT — Google predictions.terms[].value contiene
 # el nombre del país (e.g. "España", "Argentina"). Mapping inverso por ISO.

@@ -21,7 +21,9 @@ try:
     logger.info("VROOM solver loaded successfully")
 except Exception as e:
     HAS_VROOM = False
-    logger.warning(f"VROOM solver unavailable: {e}")
+    # INFO en vez de WARNING (22 may 2026): VROOM no se instala local sin C++.
+    # En prod siempre está. OR-Tools cubre fallback si faltase.
+    logger.info(f"VROOM solver unavailable (local dev expected): {e}")
 
 try:
     import pyvrp  # noqa: F401
@@ -31,7 +33,9 @@ try:
     logger.info("PyVRP solver loaded successfully")
 except Exception as e:
     HAS_PYVRP = False
-    logger.warning(f"PyVRP solver unavailable: {e}")
+    # INFO en vez de WARNING (22 may 2026): PyVRP requiere C++ build local.
+    # En prod siempre está. Fallback a VROOM/OR-Tools.
+    logger.info(f"PyVRP solver unavailable (local dev expected): {e}")
 
 
 def haversine_distance(coord1: Tuple[float, float], coord2: Tuple[float, float]) -> int:
