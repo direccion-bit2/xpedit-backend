@@ -7412,6 +7412,69 @@ def _places_cache_lookup_sync(norm: str, bias: str) -> Optional[dict]:
         return None
 
 
+def _stops_fuzzy_lookup_sync(
+    query: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    max_distance_km: float = 50.0,
+    similarity_threshold: float = 0.4,
+    limit_count: int = 5,
+) -> list:
+    """Búsqueda fuzzy en `stops` table vía RPC `find_similar_stop_addresses`.
+
+    Devuelve lista de predictions formato Google-compatible (con `description`,
+    `place_id`, `lat`, `lng`, `_source`). Usado por places_autocomplete como
+    último lookup local antes de pegar a Google. CERO coste Google si hit.
+
+    Ventaja única Xpedit: drivers REPITEN direcciones (rutas reparto recurrentes).
+    Con 13.9k stops válidas + 10.8k direcciones distintas en BD, el hit rate
+    fuzzy esperado para queries de clientes recurrentes es alto.
+
+    Returns: list de dicts compatibles con Google Places Autocomplete response.
+    """
+    if not query or len(query) < 3:
+        return []
+    try:
+        resp = supabase.rpc("find_similar_stop_addresses", {
+            "q": query,
+            "lat_in": lat,
+            "lng_in": lng,
+            "max_distance_km": max_distance_km,
+            "similarity_threshold": similarity_threshold,
+            "limit_count": limit_count,
+        }).execute()
+        rows = resp.data or []
+    except Exception as e:
+        logger.warning(f"stops fuzzy lookup failed: {e}")
+        return []
+    # Transformar a formato Google Places Autocomplete prediction:
+    # {description, place_id, structured_formatting: {main_text, secondary_text}, ...}
+    predictions = []
+    for r in rows:
+        address = (r.get("address") or "").strip()
+        if not address:
+            continue
+        # description = primera línea (la "main") + segunda si existe
+        lines = address.split("\n")
+        main = lines[0].strip()
+        secondary = lines[1].strip() if len(lines) > 1 else ""
+        description = address.replace("\n", ", ")
+        predictions.append({
+            "description": description,
+            "place_id": r.get("place_id"),
+            "structured_formatting": {
+                "main_text": main,
+                "secondary_text": secondary,
+            },
+            # Custom fields para que cliente pueda usar coords directos sin Place Details
+            "_xpedit_lat": r.get("lat"),
+            "_xpedit_lng": r.get("lng"),
+            "_xpedit_distance_km": r.get("distance_km"),
+            "_xpedit_similarity": r.get("similarity"),
+        })
+    return predictions
+
+
 def _places_cache_write_sync(norm: str, bias: str, predictions: list, ttl_days: int = 30) -> bool:
     """Sync Supabase upsert — MUST be called via asyncio.to_thread (fire-and-forget).
 
@@ -7606,6 +7669,27 @@ async def places_autocomplete(
                         except Exception:
                             pass
                         return {"status": "OK", "predictions": filtered, "source": "cache_prefix"}
+
+    # STOPS FUZZY LOOKUP (22 may 2026, P1 audit): cuando exact + prefix cache MISS,
+    # buscamos en la tabla `stops` direcciones similares usando pg_trgm + haversine.
+    # Ventaja única Xpedit: drivers REPITEN direcciones de clientes recurrentes.
+    # Con 10.8k direcciones distintas en BD, hit rate fuzzy esperado significativo
+    # para queries recurrentes. Solo si query tiene >=4 chars (evita fuzzy con
+    # input muy corto que matcheraría TODO).
+    if cache_mode == "on" and cache_eligible and len(norm_query) >= 4:
+        try:
+            fuzzy_predictions = await asyncio.to_thread(
+                _stops_fuzzy_lookup_sync, input, lat, lng,
+            )
+        except Exception as e:
+            logger.warning(f"stops fuzzy lookup raised in to_thread: {e}")
+            fuzzy_predictions = []
+        if fuzzy_predictions:
+            logger.info(
+                f"places_cache_event=stops_fuzzy_hit query={norm_query[:30]} "
+                f"matches={len(fuzzy_predictions)} top_sim={fuzzy_predictions[0].get('_xpedit_similarity', 0):.2f}"
+            )
+            return {"status": "OK", "predictions": fuzzy_predictions, "source": "stops_fuzzy"}
 
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")

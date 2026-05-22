@@ -365,6 +365,61 @@ class TestCompositeStreetPrefixLookup:
         assert "32" in d["predictions"][0]["description"]
 
 
+class TestStopsFuzzyLookup:
+    """REGRESSION GUARD (22 may 2026 P1 audit): cuando cache exact + prefix MISS,
+    backend busca en stops table con pg_trgm fuzzy + haversine distance.
+    Hit virtual sin gastar Google para direcciones ya visitadas por flota.
+    Ventaja específica Xpedit: drivers REPITEN clientes."""
+
+    def test_stops_fuzzy_lookup_returns_empty_for_short_query(self):
+        """Query <3 chars devuelve [] sin tocar Supabase (skip RPC)."""
+        from main import _stops_fuzzy_lookup_sync
+        assert _stops_fuzzy_lookup_sync("ab", 36.78, -6.35) == []
+        assert _stops_fuzzy_lookup_sync("", 36.78, -6.35) == []
+        assert _stops_fuzzy_lookup_sync(None, 36.78, -6.35) == []
+
+    def test_stops_fuzzy_lookup_transforms_rpc_rows_to_google_format(self):
+        """Output debe ser compatible con formato Google Places Autocomplete prediction."""
+        from main import _stops_fuzzy_lookup_sync
+        mock_rpc_resp = MagicMock(data=[
+            {
+                "address": "Calle Ancha\nSanlúcar de Barrameda, Cádiz, 11540",
+                "lat": 36.78, "lng": -6.35,
+                "place_id": "ChIJxyz123",
+                "similarity": 0.85, "distance_km": 0.5,
+            },
+            {
+                "address": "Calle Ancha 10",
+                "lat": 36.79, "lng": -6.36,
+                "place_id": None,  # caso real: stops sin place_id
+                "similarity": 0.72, "distance_km": 1.2,
+            },
+        ])
+        with patch("main.supabase.rpc", return_value=MagicMock(execute=MagicMock(return_value=mock_rpc_resp))):
+            result = _stops_fuzzy_lookup_sync("calle ancha", 36.78, -6.35)
+        assert len(result) == 2
+        # Format Google Autocomplete:
+        assert "description" in result[0]
+        assert "structured_formatting" in result[0]
+        assert result[0]["structured_formatting"]["main_text"] == "Calle Ancha"
+        assert result[0]["structured_formatting"]["secondary_text"] == "Sanlúcar de Barrameda, Cádiz, 11540"
+        assert result[0]["place_id"] == "ChIJxyz123"
+        # Custom fields para que cliente use coords directos:
+        assert result[0]["_xpedit_lat"] == 36.78
+        assert result[0]["_xpedit_lng"] == -6.35
+        assert result[0]["_xpedit_similarity"] == 0.85
+        # Sin place_id (stops sin geocoding completo) debe seguir funcionando
+        assert result[1]["place_id"] is None
+        assert result[1]["_xpedit_lat"] == 36.79
+
+    def test_stops_fuzzy_lookup_swallows_errors(self):
+        """Si RPC falla, devuelve [] sin propagar excepción (fallback Google)."""
+        from main import _stops_fuzzy_lookup_sync
+        with patch("main.supabase.rpc", side_effect=Exception("Supabase down")):
+            result = _stops_fuzzy_lookup_sync("calle ancha", 36.78, -6.35)
+        assert result == []
+
+
 class TestAdminCachePlacesStatsEndpoint:
     """REGRESSION GUARD (22 may 2026 commits d180646 + bb3a68a):
     /admin/cache/places-stats devuelve stats agregados del cache + pagina
