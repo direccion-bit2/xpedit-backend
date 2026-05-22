@@ -9102,8 +9102,16 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
         )
         cache_mode = (flag_row.data[0]["value"] if flag_row.data else "off") or "off"
 
-        # Stats agregadas (pricing autocomplete legacy: $2.83 por 1000 = $0.00283 por call)
-        price_per_call = 0.00283
+        # Pricing real: cada cache HIT evita 1 autocomplete + 1 Place Details
+        # (sesión Google completa). Autocomplete Legacy $0.00283 + Details $0.017
+        # = $0.02 ahorrado por HIT real. Si solo autocomplete = $0.00283.
+        # Nota Miguel 22 may 17:35: hits totales INFLA porque incluye el +1
+        # inicial de cada entry creada (NO es uso real, es la creación). El
+        # "ahorro real" es SUM(hits - 1) descontando esa creación.
+        PRICE_AUTOCOMPLETE = 0.00283
+        PRICE_DETAILS = 0.017
+        PRICE_PER_HIT_REAL = PRICE_AUTOCOMPLETE + PRICE_DETAILS  # $0.02 / hit real
+        price_per_call = PRICE_AUTOCOMPLETE  # back-compat para campos legacy
         now_iso = datetime.now(timezone.utc)
         seven_days_ago_iso = (now_iso - timedelta(days=7)).isoformat()
 
@@ -9131,10 +9139,28 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
 
         total_entries = len(rows)
         total_hits = sum(int(r.get("hits") or 0) for r in rows)
+        # AHORRO REAL: cada entry empieza con hits=1 (CREACIÓN, no es ahorro).
+        # El ahorro real son los USOS posteriores: max(hits-1, 0) por entry.
+        # Negative entries (hits=0) no aportan; entries solo-creadas (hits=1)
+        # aportan 0 al ahorro real.
+        real_hits_total = sum(max(int(r.get("hits") or 0) - 1, 0) for r in rows)
+        entries_reused = sum(1 for r in rows if int(r.get("hits") or 0) >= 2)
+        entries_only_created = sum(1 for r in rows if int(r.get("hits") or 0) == 1)
         active_entries = sum(1 for r in rows if r.get("expires_at") and datetime.fromisoformat(r["expires_at"].replace("Z", "+00:00")) > now_iso)
         seven_days_ago = now_iso - timedelta(days=7)
         entries_7d = sum(1 for r in rows if r.get("created_at") and datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")) >= seven_days_ago)
+        # hits_7d INFLADO (back-compat) = sum hits de entries usadas en últimos 7d
         hits_7d = sum(int(r.get("hits") or 0) for r in rows if r.get("last_used_at") and datetime.fromisoformat(r["last_used_at"].replace("Z", "+00:00")) >= seven_days_ago)
+        # real_hits_7d = SUM(hits-1) solo entries activas últimos 7d.
+        # Aproximación: si la entry fue usada en últimos 7d Y hits>=2, su hits-1
+        # son TODOS los usos post-creación (no podemos saber cuándo ocurrieron
+        # sin tabla de eventos, pero como están vivas y reusadas, son del periodo).
+        real_hits_7d = sum(
+            max(int(r.get("hits") or 0) - 1, 0)
+            for r in rows
+            if r.get("last_used_at")
+            and datetime.fromisoformat(r["last_used_at"].replace("Z", "+00:00")) >= seven_days_ago
+        )
 
         # Top 10 queries por hits (segunda query, ordenada)
         top_q = (
@@ -9163,12 +9189,27 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
             "cache_mode": cache_mode,  # off | shadow | on
             "total_entries": total_entries,
             "active_entries": active_entries,
-            "total_hits": total_hits,
+            "total_hits": total_hits,  # INFLADO (back-compat) — incluye hits=1 iniciales
             "entries_added_7d": entries_7d,
-            "hits_7d": hits_7d,
+            "hits_7d": hits_7d,  # INFLADO (back-compat)
+            # Métricas legacy (mantenidas para no romper UI antigua)
             "savings_total_usd": round(total_hits * price_per_call, 4),
             "savings_7d_usd": round(hits_7d * price_per_call, 4),
             "price_per_call_usd": price_per_call,
+            # NUEVAS métricas HONESTAS (22 may 17:40 — feedback Miguel):
+            # "real_hits" = SUM(max(hits-1, 0)) — descuenta el +1 inicial de cada
+            # entry (creación, no es ahorro). "entries_reused" = entries con hits>=2
+            # (las que REALMENTE aportan ahorro). "entries_only_created" = hits=1
+            # (no han ahorrado nada todavía). Coste evitado real $0.02/hit
+            # (autocomplete + place details, sesión Google completa evitada).
+            "real_hits_total": real_hits_total,
+            "real_hits_7d": real_hits_7d,
+            "real_savings_total_usd": round(real_hits_total * PRICE_PER_HIT_REAL, 4),
+            "real_savings_7d_usd": round(real_hits_7d * PRICE_PER_HIT_REAL, 4),
+            "entries_reused": entries_reused,
+            "entries_only_created": entries_only_created,
+            "reuse_rate_pct": round(100 * entries_reused / total_entries, 1) if total_entries else 0,
+            "price_per_real_hit_usd": PRICE_PER_HIT_REAL,
             "top_queries": top_q.data or [],
             # Métricas in-memory (desde último deploy):
             "realtime": {
