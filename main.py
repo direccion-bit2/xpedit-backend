@@ -7659,19 +7659,35 @@ def _stops_fuzzy_lookup_sync(
 
 
 def _places_cache_write_sync(norm: str, bias: str, predictions: list, ttl_days: int = 30) -> bool:
-    """Sync Supabase upsert — MUST be called via asyncio.to_thread (fire-and-forget).
+    """Sync Supabase write — MUST be called via asyncio.to_thread (fire-and-forget).
 
     ttl_days: 30 default. Para negative cache (predictions=[]), pasar 1.
+
+    NOTA audit 22 may 2026: el upsert original ponía `hits=1` en conflict,
+    reseteando contadores acumulados de entradas populares (race con otro
+    request paralelo o refresh por TTL expirado). El TTL escalonado dependía
+    de hits reales → entradas con 50 hits podían no llegar a milestone 10/30/100.
+    Fix: INSERT con `ignore_duplicates=True`; si hay conflict (data vacía),
+    UPDATE separado que refresca predictions/expires/last_used SIN tocar hits.
     """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    expires_iso = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
     try:
-        supabase.table("places_autocomplete_cache").upsert({
+        ins = supabase.table("places_autocomplete_cache").upsert({
             "query_normalized": norm,
             "bias_geohash5": bias,
             "predictions": predictions,
             "hits": 1,
-            "last_used_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat(),
-        }, on_conflict="query_normalized,bias_geohash5").execute()
+            "last_used_at": now_iso,
+            "expires_at": expires_iso,
+        }, on_conflict="query_normalized,bias_geohash5", ignore_duplicates=True).execute()
+        # Si insert no escribió (conflicto): refresca predictions sin tocar hits.
+        if not (ins.data or []):
+            supabase.table("places_autocomplete_cache").update({
+                "predictions": predictions,
+                "last_used_at": now_iso,
+                "expires_at": expires_iso,
+            }).eq("query_normalized", norm).eq("bias_geohash5", bias).execute()
         return True
     except Exception as e:
         logger.warning(f"places cache write failed (non-fatal): {e}")
@@ -7762,6 +7778,8 @@ async def places_autocomplete(
     lng: Optional[float] = None,
     country: Optional[str] = None,
     sessiontoken: Optional[str] = None,
+    origin_lat: Optional[float] = None,
+    origin_lng: Optional[float] = None,
     user=Depends(get_current_user),
 ):
     """Proxy de Google Places Autocomplete. Solo Google, sin Nominatim.
@@ -7773,6 +7791,11 @@ async def places_autocomplete(
     `country` (ISO-3166-1 alpha-2, p.ej. 'AR'): restringe resultados al país.
     Sin esta restricción Google asume España por defecto y un driver argentino
     buscando "Calle Ancha" recibe direcciones de Madrid antes que las suyas.
+
+    `origin_lat`/`origin_lng` (opcional, F1.13 bias dinámico): si la app envía
+    el punto de referencia del driver (última stop o ubicación actual), Google
+    añade `distance_meters` a cada prediction. La app re-ordena por distancia
+    real evitando matches lejanos. Sin esto el re-orden es no-op (audit 22 may).
     """
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
 
@@ -7915,6 +7938,9 @@ async def places_autocomplete(
     if lat and lng:
         params["location"] = f"{lat},{lng}"
         params["radius"] = "30000"
+    # F1.13: origin para distance_meters → re-orden cliente por proximidad real.
+    if origin_lat is not None and origin_lng is not None:
+        params["origin"] = f"{origin_lat},{origin_lng}"
     cc = (country or "").strip().lower()
     if len(cc) == 2 and cc.isalpha():
         # Safety net: si GPS del driver claramente NO está en `country`
@@ -9293,13 +9319,17 @@ async def _backfill_compute_missing_in_app(days_lookback: int, min_appearances: 
     Lista en cache existentes (set de query_normalized) + lista de stops paginadas
     + group by Python. Más lento pero independiente de RPCs custom."""
     # 1. Set de queries ya cacheadas
+    # NOTA: capturamos `offset` por valor en la lambda (off=offset) para evitar
+    # closure-by-reference — sin esto, la lambda lee el offset cuando el thread
+    # arranca, no cuando se construye, y puede leer una página equivocada o
+    # bucle infinito bajo carga (audit 22 may 2026).
     cached_q: set[str] = set()
     offset = 0
     while True:
         chunk = await asyncio.to_thread(
-            lambda: supabase.table("places_autocomplete_cache")
+            lambda off=offset: supabase.table("places_autocomplete_cache")
             .select("query_normalized")
-            .range(offset, offset + 999)
+            .range(off, off + 999)
             .execute()
         )
         if not chunk.data:
@@ -9317,14 +9347,14 @@ async def _backfill_compute_missing_in_app(days_lookback: int, min_appearances: 
     offset = 0
     while True:
         chunk = await asyncio.to_thread(
-            lambda: supabase.table("stops")
+            lambda off=offset: supabase.table("stops")
             .select("address,lat,lng")
             .gte("created_at", cutoff)
             .is_("deleted_at", "null")
             .not_.is_("lat", "null")
             .not_.is_("lng", "null")
             .not_.is_("address", "null")
-            .range(offset, offset + 999)
+            .range(off, off + 999)
             .execute()
         )
         if not chunk.data:
