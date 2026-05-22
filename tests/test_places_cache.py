@@ -234,6 +234,89 @@ class TestAcCacheKeyGranularity:
         assert norm == "calle ancha"
 
 
+class TestCompositeStreetPrefixLookup:
+    """REGRESSION GUARD (22 may 2026): cuando cache exact MISS pero la query
+    tiene número final (ej 'calle bolsa 32'), backend busca el prefix de calle
+    ('calle bolsa') y filtra predictions por el número. Hit virtual sin gastar
+    Google. Si alguien quita esta lógica, los tests fallan."""
+
+    def test_extract_street_prefix_strips_final_number(self):
+        from main import _extract_street_prefix
+        assert _extract_street_prefix("calle bolsa 32") == "calle bolsa"
+
+    def test_extract_street_prefix_handles_comma(self):
+        from main import _extract_street_prefix
+        assert _extract_street_prefix("calle de la cepa, 16") == "calle de la cepa"
+
+    def test_extract_street_prefix_keeps_street_number_strips_portal(self):
+        """En direcciones LATAM tipo 'carrera 39c, 84a-07' el primer número
+        forma parte del nombre de calle, solo se quita el portal del final."""
+        from main import _extract_street_prefix
+        assert _extract_street_prefix("carrera 39c, 84a-07") == "carrera 39c"
+
+    def test_extract_street_prefix_returns_none_when_no_number(self):
+        from main import _extract_street_prefix
+        assert _extract_street_prefix("pago zahora") is None
+
+    def test_extract_street_prefix_returns_none_when_prefix_too_short(self):
+        from main import _extract_street_prefix
+        # "cl 67" → prefix sería "cl" (<5 chars) → None
+        assert _extract_street_prefix("cl 67") is None
+
+    def test_filter_predictions_matches_number_as_token(self):
+        from main import _filter_predictions_containing_number
+        preds = [
+            {"description": "Calle Bolsa, 32, Madrid"},
+            {"description": "Calle Bolsa, 45, Madrid"},
+            {"description": "Calle Bolsa, 320, Madrid"},  # 320 contiene "32" pero NO como token
+        ]
+        result = _filter_predictions_containing_number(preds, "32")
+        assert len(result) == 1
+        assert result[0]["description"] == "Calle Bolsa, 32, Madrid"
+
+    def test_filter_predictions_returns_empty_when_no_match(self):
+        from main import _filter_predictions_containing_number
+        preds = [{"description": "Calle Bolsa, 32, Madrid"}]
+        assert _filter_predictions_containing_number(preds, "99") == []
+
+    @pytest.mark.asyncio
+    async def test_composite_prefix_hit_avoids_google_call(self, client):
+        """Cache exact MISS + prefix HIT con número filtrado → devuelve cache, NO llama Google."""
+        prefix_cache_row = {
+            "predictions": [
+                {"description": "Calle Bolsa, 15, Sevilla"},
+                {"description": "Calle Bolsa, 32, Sevilla"},
+                {"description": "Calle Bolsa, 67, Sevilla"},
+            ],
+            "hits": 5,
+        }
+
+        def lookup_side_effect(norm, bias):
+            # Exact query MISS
+            if norm == "calle bolsa 32":
+                return None
+            # Prefix HIT
+            if norm == "calle bolsa":
+                return prefix_cache_row
+            return None
+
+        mock_http = AsyncMock()
+        # Si llegara a Google, falla el test
+        mock_http.get.side_effect = AssertionError("Google should NOT be called when prefix hit")
+
+        with patch("main._get_places_cache_mode", AsyncMock(return_value="on")), \
+             patch("main._places_cache_lookup_sync", side_effect=lookup_side_effect), \
+             patch("main.httpx.AsyncClient", return_value=mock_http):
+            response = await client.get("/places/autocomplete?input=calle%20bolsa%2032&lat=37.39&lng=-5.99")
+        assert response.status_code == 200
+        d = response.json()
+        assert d["status"] == "OK"
+        assert d.get("source") == "cache_prefix"
+        # Solo debe devolver la prediction con "32", no las otras
+        assert len(d["predictions"]) == 1
+        assert "32" in d["predictions"][0]["description"]
+
+
 class TestAdminCachePlacesStatsEndpoint:
     """REGRESSION GUARD (22 may 2026 commits d180646 + bb3a68a):
     /admin/cache/places-stats devuelve stats agregados del cache + pagina

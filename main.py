@@ -7215,6 +7215,46 @@ _places_api_last_alert: Optional[datetime] = None
 _places_api_last_check: Optional[datetime] = None
 
 
+_STREET_PREFIX_RE = re.compile(r"^(.+?)\s*,?\s+[#]?[\d][\w\-/]*\s*$")
+_TRAILING_NUMBER_RE = re.compile(r"[\d][\w\-/]*$")
+
+
+def _extract_street_prefix(query: str) -> Optional[str]:
+    """Quita el último número (portal) para lookup secundario de cache.
+
+    Ej: 'calle bolsa 32' → 'calle bolsa'
+        'calle de la cepa, 16' → 'calle de la cepa'
+        'carrera 39c, 84a-07' → 'carrera 39c' (mantiene primer número que es parte calle)
+        'pago zahora' → None (no hay número final)
+
+    Devuelve None si no hay número final o el prefix sería <5 chars."""
+    q = (query or "").strip()
+    if not q:
+        return None
+    m = _STREET_PREFIX_RE.match(q)
+    if not m:
+        return None
+    prefix = m.group(1).strip().rstrip(",").strip()
+    if len(prefix) < 5 or prefix.lower() == q.lower():
+        return None
+    return prefix
+
+
+def _filter_predictions_containing_number(predictions: list, number: str) -> list:
+    """Filtra predictions cuyo description contenga el `number` como token completo.
+
+    Ej: predictions = ['Calle Bolsa, 32, Madrid', 'Calle Bolsa, 45, Madrid']
+        number='32' → devuelve solo la primera.
+        number='99' → devuelve [] (ningún match)."""
+    if not number or not predictions:
+        return []
+    try:
+        rx = re.compile(rf"\b{re.escape(number)}\b", re.IGNORECASE)
+    except re.error:
+        return []
+    return [p for p in predictions if isinstance(p, dict) and rx.search(p.get("description", ""))]
+
+
 def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tuple[str, str]:
     """Normalize query + bias for cache lookup.
 
@@ -7411,6 +7451,42 @@ async def places_autocomplete(
         except Exception:
             pass
         return {"status": "OK", "predictions": cache_row["predictions"], "source": "cache"}
+
+    # COMPOSITE LOOKUP (22 may 2026): si la query exacta MISS y contiene número
+    # al final (ej 'calle bolsa 32'), busca el prefix de calle ('calle bolsa').
+    # Si el prefix ESTÁ cacheado, filtra sus predictions para encontrar el número
+    # exacto. Hit virtual sin llamar Google. Sube hit rate ~50-70% para zonas
+    # con calles recurrentes en distintos portales (cliente entrega en 5 portales
+    # de la misma calle = 1 entrada cache cubre los 5).
+    if cache_mode == "on" and cache_eligible and not cache_row:
+        street_prefix = _extract_street_prefix(input)
+        if street_prefix:
+            try:
+                norm_prefix, prefix_bias = _ac_cache_key(street_prefix, lat, lng)
+                prefix_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_prefix, prefix_bias)
+            except Exception as e:
+                logger.warning(f"places prefix lookup failed: {e}")
+                prefix_row = None
+            if prefix_row and prefix_row.get("predictions"):
+                # Extraer número final original para filtrar predictions
+                num_match = _TRAILING_NUMBER_RE.search(input.strip())
+                if num_match:
+                    number = num_match.group(0)
+                    filtered = _filter_predictions_containing_number(prefix_row["predictions"], number)
+                    if filtered:
+                        logger.info(
+                            f"places_cache_event=prefix_hit query={norm_query[:30]} "
+                            f"prefix={street_prefix[:30]} number={number} matches={len(filtered)}"
+                        )
+                        # Bump prefix entry (sirvió para evitar Google)
+                        try:
+                            asyncio.create_task(asyncio.to_thread(
+                                _places_cache_bump_sync, norm_prefix, prefix_bias,
+                                prefix_row.get("hits") or 0,
+                            ))
+                        except Exception:
+                            pass
+                        return {"status": "OK", "predictions": filtered, "source": "cache_prefix"}
 
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
