@@ -9033,17 +9033,32 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
             "stops_created_last_24h": stops_24h,
             "eur_24h_neto": round(eur_24h_neto, 2),
         },
-        "free_tier": {
-            "monthly_credit_usd": FREE_TIER_USD,
-            "monthly_credit_eur": round(FREE_TIER_USD * USD_TO_EUR, 2),
-            "consumed_usd": round(month_consumed_usd, 2),
+        # 23 may 2026: free_tier $200/mes RETIRADO — modelo obsoleto desde
+        # marzo 2025. Google ahora aplica free tier POR SKU (Essentials 10k,
+        # Pro 5k, Enterprise 1k calls/mes/SKU). El cálculo viejo daba falsa
+        # tranquilidad ("aún tienes 41% libre") cuando en realidad ya
+        # pagábamos cada call extra sobre cada SKU individual.
+        # Sustituido por métrica útil: € hoy real + proyección fin mes +
+        # alerta umbral diario. Reemplaza la pregunta "¿agotaré crédito?"
+        # (sin sentido hoy) por "¿bill se está disparando?".
+        "month_actual": {
             "consumed_eur": round(month_consumed_usd * USD_TO_EUR, 2),
-            "pct_consumed": round(pct_consumed, 1),
             "day_of_month": day_of_month,
             "days_in_month": days_in_month,
-            "eta_exhaustion_day": min(days_until_free_tier_exhausted, 99),
-            "will_exhaust_this_month": days_until_free_tier_exhausted <= days_in_month,
-            "daily_avg_usd": round(daily_avg_usd, 3),
+            "daily_avg_eur": round(daily_avg_usd * USD_TO_EUR, 2),
+            "projected_month_eur": round(daily_avg_usd * days_in_month * USD_TO_EUR, 2),
+        },
+        "daily_alert": {
+            # Umbral suave: media 30d × 1.5. Si día actual supera → 🟡
+            # Umbral duro: media 30d × 2.0. Si supera → 🔴
+            "soft_threshold_eur": round(daily_avg_usd * 1.5 * USD_TO_EUR, 2),
+            "hard_threshold_eur": round(daily_avg_usd * 2.0 * USD_TO_EUR, 2),
+            "today_actual_eur": round(eur_24h_neto, 2),
+            "level": (
+                "red" if eur_24h_neto > (daily_avg_usd * 2.0 * USD_TO_EUR)
+                else "amber" if eur_24h_neto > (daily_avg_usd * 1.5 * USD_TO_EUR)
+                else "green"
+            ),
         },
         "weekly": {
             "current_week_eur": round(current_week_usd * USD_TO_EUR, 2),
