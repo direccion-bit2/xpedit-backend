@@ -8937,13 +8937,35 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
         except Exception:
             return 0
 
-    paying, active_drivers, stops_today = await asyncio.gather(
-        _paying_count(), _active_drivers_today(), _stops_created_today()
+    async def _stops_created_last_24h():
+        # 23 may 2026: para calcular cost_per_stop usamos misma ventana
+        # que `eur_24h_neto` (últimas 24h reales). Antes dividíamos por
+        # `stops_today` (día calendario CEST) → ratio inflado en weekend
+        # cuando hay pocos stops pero coste arrastra ayer. Miguel detectó
+        # €0.57/stop sábado mañana = artefacto del mismatch de ventanas.
+        try:
+            since = (now - timedelta(hours=24)).isoformat()
+            r = await asyncio.to_thread(
+                lambda: supabase.table("stops")
+                .select("id", count="exact")
+                .gte("created_at", since)
+                .is_("deleted_at", "null")
+                .limit(1)
+                .execute()
+            )
+            cnt = getattr(r, "count", None)
+            return int(cnt or 0)
+        except Exception:
+            return 0
+
+    paying, active_drivers, stops_today, stops_24h = await asyncio.gather(
+        _paying_count(), _active_drivers_today(), _stops_created_today(), _stops_created_last_24h()
     )
 
     cost_per_paying = (eur_24h_neto / paying) if paying else 0
     cost_per_driver = (eur_24h_neto / active_drivers) if active_drivers else 0
-    cost_per_stop = (eur_24h_neto / stops_today) if stops_today else 0
+    # Misma ventana 24h para numerador y denominador (antes mezclaba)
+    cost_per_stop = (eur_24h_neto / stops_24h) if stops_24h else 0
 
     # Comparativa semanal: ISO weeks current vs previous
     try:
@@ -8985,6 +9007,7 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
             "paying_count": paying,
             "active_drivers_today": active_drivers,
             "stops_created_today": stops_today,
+            "stops_created_last_24h": stops_24h,
             "eur_24h_neto": round(eur_24h_neto, 2),
         },
         "free_tier": {
