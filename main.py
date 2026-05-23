@@ -8421,7 +8421,10 @@ def _api_source_user_persist_sync(endpoint: str, date_iso: str, source: str, use
     """UPSERT incremental (endpoint, date, source, user_id) → +1 count en
     api_source_driver_daily. La columna se llama `user_id` desde 23 may 2026
     (antes mal-nombrada driver_id pese a recibir siempre auth.users.id).
-    Si la tabla aún no existe falla en silencio sin romper el counter agregado."""
+    Si la tabla aún no existe falla en silencio sin romper el counter agregado.
+    Observability (23 may 17:55 CEST — task #281 lesson): captura UPSERT con
+    0 rows como warning Sentry; excepciones reales como capture_exception.
+    Antes solo había logger.info → Railway logs se rotan y nadie se entera."""
     try:
         existing = (
             supabase.table("api_source_driver_daily")
@@ -8431,20 +8434,29 @@ def _api_source_user_persist_sync(endpoint: str, date_iso: str, source: str, use
             .limit(1).execute()
         )
         current = (existing.data or [{}])[0].get("count", 0) or 0
-        supabase.table("api_source_driver_daily").upsert({
+        upserted = supabase.table("api_source_driver_daily").upsert({
             "endpoint": endpoint, "date": date_iso, "source": source,
             "user_id": user_id, "count": current + 1,
             "last_updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="endpoint,date,source,user_id").execute()
+        if not upserted.data or len(upserted.data) == 0:
+            sentry_sdk.capture_message(
+                f"api_source_driver UPSERT returned 0 rows endpoint={endpoint} source={source} user_id={user_id}",
+                level="warning",
+            )
     except Exception as e:
         logger.info(f"api_source_driver_daily upsert failed (table may not exist yet): {e}")
+        sentry_sdk.capture_exception(e)
 
 
 def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
     """UPSERT incremental (endpoint, date, source) → +1 count en api_source_daily.
     Fallback a routes_v2_source_daily para places_directions (compat tabla vieja)
     si la tabla nueva aún no existe.
-    Idempotente, race-safe por unique constraint Postgres."""
+    Idempotente, race-safe por unique constraint Postgres.
+    Observability (23 may 17:55 CEST — task #281 lesson): si UPSERT devuelve
+    0 rows reportamos a Sentry. Antes los fallos de persistencia se comían
+    silenciosamente y solo veíamos el undercount al comparar in-memory vs BD."""
     try:
         existing = (
             supabase.table("api_source_daily")
@@ -8453,11 +8465,18 @@ def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
             .limit(1).execute()
         )
         current = (existing.data or [{}])[0].get("count", 0) or 0
-        supabase.table("api_source_daily").upsert({
+        upserted = supabase.table("api_source_daily").upsert({
             "endpoint": endpoint, "date": date_iso, "source": source,
             "count": current + 1,
             "last_updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="endpoint,date,source").execute()
+        # Sanity: si UPSERT no devolvió ninguna row es señal de regresión
+        # (RLS, schema drift, conexión muerta). Reporta a Sentry sin romper.
+        if not upserted.data or len(upserted.data) == 0:
+            sentry_sdk.capture_message(
+                f"api_source UPSERT returned 0 rows endpoint={endpoint} source={source}",
+                level="warning",
+            )
     except Exception as e:
         # Fallback: tabla nueva no existe aún → para places_directions usar
         # tabla legacy. Otros endpoints simplemente no persisten esta vez.
@@ -8477,8 +8496,10 @@ def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
                 }, on_conflict="date,source").execute()
             except Exception as e2:
                 logger.warning(f"api_source persist fallback failed: {e2}")
+                sentry_sdk.capture_exception(e2)
         else:
             logger.warning(f"api_source persist failed for {endpoint}: {e}")
+            sentry_sdk.capture_exception(e)
 
 
 # ====================================================================
