@@ -8335,6 +8335,23 @@ _ROUTES_V2_FIELD_MASK = (
 )
 
 
+# Counter in-memory: cuenta calls Routes V2 por origen (header X-Triggered-By).
+# Se resetea en cada cold-start del backend (aceptable — solo es métrica viva).
+# Expuesto en GET /admin/routes/calls-by-source. Permite identificar funciones
+# del cliente que disparan más calls de lo necesario (ej. el bug reconciles
+# AppState active del 19-22 may que generó €600/mes extras).
+_routes_v2_source_counters: dict[str, int] = {}
+_routes_v2_counters_started_at: float = time.time()
+
+
+def _bump_routes_v2_source(source: str) -> None:
+    """Incrementa counter del origen de una call a /places/directions.
+    Origen viene del header X-Triggered-By que el cliente RN debe enviar.
+    Si falta, se cuenta como 'unknown' para detectar callers sin label."""
+    key = (source or "unknown").strip().lower()[:48]
+    _routes_v2_source_counters[key] = _routes_v2_source_counters.get(key, 0) + 1
+
+
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
@@ -8342,6 +8359,7 @@ async def places_directions(
     waypoints: Optional[str] = None,
     avoid: Optional[str] = None,
     heading: Optional[float] = None,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user)
 ):
     """Calcula la ruta entre origin/destination con waypoints opcionales.
@@ -8353,7 +8371,12 @@ async def places_directions(
 
     Si `heading` (0-360) viene, inserta un waypoint ~50 m delante del coche
     en esa dirección. Así el rerouting no propone giros bruscos hacia atrás.
+
+    El header X-Triggered-By identifica la función cliente que disparó la call
+    (optimize, start-nav, recalc, load-route, cold-start, etc) para que el
+    admin pueda detectar fugas (ver /admin/routes/calls-by-source).
     """
+    _bump_routes_v2_source(x_triggered_by)
     intermediates: list[dict] = []
     if heading is not None and "," in origin:
         try:
@@ -9276,6 +9299,59 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail=f"cache stats failed: {e}")
+
+
+@app.get("/admin/routes/calls-by-source", tags=["admin", "costs"], summary="Desglose calls Routes V2 por origen (X-Triggered-By)")
+async def admin_routes_calls_by_source(user=Depends(require_admin)):
+    """Desglose de calls al endpoint /places/directions (Routes V2 Pro) por
+    función cliente que las disparó (header X-Triggered-By).
+
+    Util para detectar fugas de llamadas: si 'reconcile-on-resume' tiene
+    miles de calls, hay un bug. Si 'cold-start' supera a 'optimize', algo
+    se re-fetcha innecesariamente.
+
+    Origenes esperados (app RN debe enviar uno de):
+    - optimize          → driver pulsa "Optimizar ruta"
+    - start-nav         → driver pulsa "Ir" a un stop
+    - recalc            → desvío off-route durante navegación
+    - load-route        → driver abre una ruta de "Mis rutas"
+    - cold-start        → loadSavedState tras abrir app fresca
+    - resume            → loadSavedState tras volver de background
+    - invert            → driver invierte orden de la ruta
+    - auto-effect       → useEffect [stops/location] tras optimize
+    - unknown           → caller sin header (regresión a investigar)
+
+    Counter es in-memory, se resetea en cada cold-start backend. Tiempo
+    de vida visible en `uptime_minutes`. Para análisis histórico, exportar
+    snapshot periódico a otra tabla (no implementado aún).
+    """
+    uptime_min = round((time.time() - _routes_v2_counters_started_at) / 60, 1)
+    total = sum(_routes_v2_source_counters.values())
+    # Ordenar de mayor a menor para que el sospechoso salte primero
+    sorted_sources = sorted(
+        _routes_v2_source_counters.items(),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    # Coste estimado por call (Routes V2 Pro = $0.01, blended con Essentials ~$0.008)
+    PRICE_PER_CALL_EUR = 0.0073  # blended Pro+Essentials × 0.92 USD→EUR
+    by_source = [
+        {
+            "source": src,
+            "calls": cnt,
+            "pct": round(100 * cnt / total, 1) if total else 0,
+            "eur_estimated": round(cnt * PRICE_PER_CALL_EUR, 2),
+        }
+        for src, cnt in sorted_sources
+    ]
+    return {
+        "ok": True,
+        "uptime_minutes": uptime_min,
+        "total_calls_since_deploy": total,
+        "eur_total_since_deploy": round(total * PRICE_PER_CALL_EUR, 2),
+        "by_source": by_source,
+        "note": "Counter in-memory. Se resetea en cada cold-start del backend.",
+    }
 
 
 @app.post("/admin/cache/backfill-missing", tags=["admin", "costs"], summary="Backfill cache con queries faltantes")
