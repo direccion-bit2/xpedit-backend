@@ -152,11 +152,19 @@ class TestUnknownCallsDayThreshold:
 class TestDriverEurDayThreshold:
     def test_driver_red_fires(self):
         _setup_counters_under_threshold()
-        # 1500 calls × 0.0073 = €10.95 > €10 red
-        rows = [{"driver_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "endpoint": "places_directions", "count": 1500}]
+        # 1500 calls × 0.0073 = €10.95 > €10 red. La columna se llama user_id
+        # desde 23 may 2026 (antes mal-nombrada driver_id pese a contener
+        # auth.users.id). El email resuelve nombre vía JOIN drivers.user_id.
+        rows = [{"user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "endpoint": "places_directions", "count": 1500}]
         def table_dispatch(name):
             if name == "api_source_driver_daily":
                 return _FixedResultChain(rows)
+            if name == "drivers":
+                # JOIN devuelve el driver real con su id, email, name
+                return _FixedResultChain([{
+                    "id": "drv-real-uuid", "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "email": "victor@example.com", "name": "Victor Tique",
+                }])
             return _FixedResultChain([])
         mock_sb = MagicMock()
         mock_sb.table = MagicMock(side_effect=table_dispatch)
@@ -168,7 +176,9 @@ class TestDriverEurDayThreshold:
         driver_fired = [f for f in result["fired"] if "driver_eur_" in f.get("metric", "")]
         assert len(driver_fired) == 1
         assert driver_fired[0]["level"] == "red"
-        assert driver_fired[0]["driver_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert driver_fired[0]["user_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert driver_fired[0]["driver_id"] == "drv-real-uuid"
+        assert driver_fired[0]["label"] == "Victor Tique"
 
 
 # =============== Anti-spam ===============

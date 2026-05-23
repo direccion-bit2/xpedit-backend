@@ -1634,7 +1634,7 @@ async def geocode(
     Header X-Triggered-By identifica el origen (ocr-label, csv-import, msi-batch,
     map-snap, etc) para tracking en /admin/api-sources.
     """
-    _bump_api_source("geocode", x_triggered_by, user.get("id") if user else None)
+    _bump_api_source("geocode", x_triggered_by, user_id=user.get("id") if user else None)
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=503, detail="Geocoding service not configured")
 
@@ -8156,7 +8156,7 @@ async def places_details(
 
     Header X-Triggered-By identifica el origen (depot-modal, address-search,
     stop-detail, msi-edit, etc) para tracking en /admin/api-sources."""
-    _bump_api_source("places_details", x_triggered_by, user.get("id") if user else None)
+    _bump_api_source("places_details", x_triggered_by, user_id=user.get("id") if user else None)
     # Field mask 21 may 2026: quitado `opening_hours` (Miguel + auditoría agentes 21 may 00:24).
     # `opening_hours` dispara el SKU "Place Details Advanced" ($17/1000) en vez de
     # "Basic" ($0 con session token) — 3,4× más caro. Auditoría confirmó que el
@@ -8384,12 +8384,14 @@ _routes_v2_source_counters = _api_source_counters.setdefault("places_directions"
 _routes_v2_counters_started_at = _api_counters_started_at
 
 
-def _bump_api_source(endpoint: str, source: str, driver_id: Optional[str] = None) -> None:
+def _bump_api_source(endpoint: str, source: str, user_id: Optional[str] = None) -> None:
     """Incrementa counter del origen de una call API. `endpoint` debe ser el
     slug corto del endpoint (sin /, sin guiones, sin parámetros), p.ej.
     'places_directions', 'places_details', 'geocode'. `source` viene del
-    header X-Triggered-By. `driver_id` opcional para tracking top spenders
-    (alertas, detección bug en cliente específico). Fire-and-forget persist."""
+    header X-Triggered-By. `user_id` opcional = auth.users.id (NO drivers.id)
+    para tracking top spenders. La tabla `api_source_driver_daily` se une con
+    drivers via drivers.user_id en las queries de alertas (ver
+    [[feedback_auth_user_id_vs_driver_id]] — error común histórico)."""
     endpoint_key = (endpoint or "unknown").strip().lower()[:48]
     source_key = (source or "unknown").strip().lower()[:48]
     bucket = _api_source_counters.setdefault(endpoint_key, {})
@@ -8399,41 +8401,41 @@ def _bump_api_source(endpoint: str, source: str, driver_id: Optional[str] = None
         asyncio.create_task(asyncio.to_thread(
             _api_source_persist_sync, endpoint_key, today_iso, source_key,
         ))
-        # Driver-aware persist (alertas top spender, 23 may 2026). Solo si
-        # tenemos driver_id válido — auth puede no llegar en algunos paths
-        # legítimos (ej. CORS preflight). UUID validation evita corrupción.
-        if driver_id and isinstance(driver_id, str) and len(driver_id) == 36:
+        # User-aware persist (alertas top spender). Solo si tenemos user_id
+        # válido — auth puede no llegar en algunos paths legítimos (CORS
+        # preflight). UUID validation evita corrupción.
+        if user_id and isinstance(user_id, str) and len(user_id) == 36:
             asyncio.create_task(asyncio.to_thread(
-                _api_source_driver_persist_sync, endpoint_key, today_iso, source_key, driver_id,
+                _api_source_user_persist_sync, endpoint_key, today_iso, source_key, user_id,
             ))
     except Exception:
         pass  # nunca romper el endpoint por la métrica
 
 
-def _bump_routes_v2_source(source: str, driver_id: Optional[str] = None) -> None:
+def _bump_routes_v2_source(source: str, user_id: Optional[str] = None) -> None:
     """Compat alias para llamadores existentes (/places/directions)."""
-    _bump_api_source("places_directions", source, driver_id)
+    _bump_api_source("places_directions", source, user_id)
 
 
-def _api_source_driver_persist_sync(endpoint: str, date_iso: str, source: str, driver_id: str) -> None:
-    """UPSERT incremental (endpoint, date, source, driver_id) → +1 count.
-    Tabla creada 23 may 2026 para soportar alertas top spender (driver
-    individual que concentra >€5/día de gasto Google). Si la tabla aún no
-    existe (deploy parcial), falla en silencio sin romper el counter agregado."""
+def _api_source_user_persist_sync(endpoint: str, date_iso: str, source: str, user_id: str) -> None:
+    """UPSERT incremental (endpoint, date, source, user_id) → +1 count en
+    api_source_driver_daily. La columna se llama `user_id` desde 23 may 2026
+    (antes mal-nombrada driver_id pese a recibir siempre auth.users.id).
+    Si la tabla aún no existe falla en silencio sin romper el counter agregado."""
     try:
         existing = (
             supabase.table("api_source_driver_daily")
             .select("count")
             .eq("endpoint", endpoint).eq("date", date_iso)
-            .eq("source", source).eq("driver_id", driver_id)
+            .eq("source", source).eq("user_id", user_id)
             .limit(1).execute()
         )
         current = (existing.data or [{}])[0].get("count", 0) or 0
         supabase.table("api_source_driver_daily").upsert({
             "endpoint": endpoint, "date": date_iso, "source": source,
-            "driver_id": driver_id, "count": current + 1,
+            "user_id": user_id, "count": current + 1,
             "last_updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="endpoint,date,source,driver_id").execute()
+        }, on_conflict="endpoint,date,source,user_id").execute()
     except Exception as e:
         logger.info(f"api_source_driver_daily upsert failed (table may not exist yet): {e}")
 
@@ -8643,36 +8645,56 @@ def check_cost_alerts() -> dict:
             _fire_cost_alert(metric_key, level, title, body, payload)
             fired.append(payload | {"level": level})
 
-        # 4) Driver individual €/día (api_source_driver_daily)
+        # 4) User individual €/día (api_source_driver_daily.user_id = auth.users.id).
+        # Para los emails resolvemos driver.email/name vía JOIN, así Miguel
+        # ve "Victor Tique 9,30€" en vez de un UUID opaco.
         rows = (
             supabase.table("api_source_driver_daily")
-            .select("driver_id, endpoint, count")
+            .select("user_id, endpoint, count")
             .eq("date", today_iso)
             .execute()
         ).data or []
-        per_driver_eur: dict = {}
+        per_user_eur: dict = {}
         for r in rows:
-            driver_id = r.get("driver_id")
-            if not driver_id:
+            user_id = r.get("user_id")
+            if not user_id:
                 continue
             endpoint_key = r.get("endpoint", "")
             price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint_key, 0.005)
-            per_driver_eur[driver_id] = per_driver_eur.get(driver_id, 0.0) + int(r.get("count") or 0) * price
+            per_user_eur[user_id] = per_user_eur.get(user_id, 0.0) + int(r.get("count") or 0) * price
         th = _COST_ALERT_THRESHOLDS["driver_eur_day"]
-        for driver_id, eur in per_driver_eur.items():
+        # Resolve names para los user_id que disparen alarma (una sola query batch)
+        flagged_user_ids = [uid for uid, eur in per_user_eur.items() if eur >= th["amber"]]
+        user_to_driver: dict = {}
+        if flagged_user_ids:
+            try:
+                drs = (
+                    supabase.table("drivers")
+                    .select("id, user_id, email, name")
+                    .in_("user_id", flagged_user_ids)
+                    .execute()
+                ).data or []
+                user_to_driver = {d["user_id"]: d for d in drs if d.get("user_id")}
+            except Exception as e:
+                logger.warning(f"cost_alerts: failed to resolve driver names: {e}")
+        for user_id, eur in per_user_eur.items():
             if eur >= th["red"]:
                 level, threshold = "red", th["red"]
             elif eur >= th["amber"]:
                 level, threshold = "amber", th["amber"]
             else:
                 continue
-            metric_key = f"driver_eur_{driver_id}"
-            title = f"[Xpedit] Costs ALERT {level.upper()}: driver {driver_id[:8]} hoy {eur:.2f}€ > {threshold}€"
+            drv = user_to_driver.get(user_id)
+            label = (drv.get("name") or drv.get("email") or user_id[:8]) if drv else user_id[:8]
+            driver_id = drv.get("id") if drv else None
+            metric_key = f"driver_eur_{user_id}"
+            title = f"[Xpedit] Costs ALERT {level.upper()}: {label} hoy {eur:.2f}€ > {threshold}€"
             body = (
-                f"Driver {driver_id} acumula {eur:.2f}€ de coste Google hoy. Umbral {level} {threshold}€. "
-                f"Posible bug en cliente específico, fraude o uso anormal. Revisa /admin/users/{driver_id}."
+                f"User {label} ({user_id}) acumula {eur:.2f}€ de coste Google hoy. "
+                f"Umbral {level} {threshold}€. Posible bug en cliente específico, fraude o uso anormal. "
+                f"Revisa /admin/users/{driver_id or user_id}."
             )
-            payload = {"metric": metric_key, "value": eur, "driver_id": driver_id}
+            payload = {"metric": metric_key, "value": eur, "user_id": user_id, "driver_id": driver_id, "label": label}
             _fire_cost_alert(metric_key, level, title, body, payload)
             fired.append(payload | {"level": level})
 
@@ -8707,7 +8729,7 @@ async def places_directions(
     (optimize, start-nav, recalc, load-route, cold-start, etc) para que el
     admin pueda detectar fugas (ver /admin/routes/calls-by-source).
     """
-    _bump_routes_v2_source(x_triggered_by, user.get("id") if user else None)
+    _bump_routes_v2_source(x_triggered_by, user_id=user.get("id") if user else None)
     intermediates: list[dict] = []
     if heading is not None and "," in origin:
         try:
