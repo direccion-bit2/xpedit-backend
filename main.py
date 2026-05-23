@@ -7860,6 +7860,7 @@ async def places_autocomplete(
     sessiontoken: Optional[str] = None,
     origin_lat: Optional[float] = None,
     origin_lng: Optional[float] = None,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user),
 ):
     """Proxy de Google Places Autocomplete. Solo Google, sin Nominatim.
@@ -7876,7 +7877,17 @@ async def places_autocomplete(
     el punto de referencia del driver (última stop o ubicación actual), Google
     añade `distance_meters` a cada prediction. La app re-ordena por distancia
     real evitando matches lejanos. Sin esto el re-orden es no-op (audit 22 may).
+
+    23 may 20:20 CEST — tracking X-Triggered-By: bumpeamos cada request al
+    endpoint (incluso si cache local resuelve sin Google) porque queremos
+    saber QUIEN pide autocomplete (stop-editor, msi, etc). Diferencia
+    cache-hit vs Google real se ve por delta con Cloud Monitoring.
     """
+    _bump_api_source(
+        "places_autocomplete",
+        x_triggered_by,
+        user_id=user.get("id") if user else None,
+    )
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
 
     # Cache (21 may 2026 re-enabled): respects 5 may incident root cause by
