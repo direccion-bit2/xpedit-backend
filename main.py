@@ -1634,7 +1634,7 @@ async def geocode(
     Header X-Triggered-By identifica el origen (ocr-label, csv-import, msi-batch,
     map-snap, etc) para tracking en /admin/api-sources.
     """
-    _bump_api_source("geocode", x_triggered_by)
+    _bump_api_source("geocode", x_triggered_by, user.get("id") if user else None)
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=503, detail="Geocoding service not configured")
 
@@ -8156,7 +8156,7 @@ async def places_details(
 
     Header X-Triggered-By identifica el origen (depot-modal, address-search,
     stop-detail, msi-edit, etc) para tracking en /admin/api-sources."""
-    _bump_api_source("places_details", x_triggered_by)
+    _bump_api_source("places_details", x_triggered_by, user.get("id") if user else None)
     # Field mask 21 may 2026: quitado `opening_hours` (Miguel + auditoría agentes 21 may 00:24).
     # `opening_hours` dispara el SKU "Place Details Advanced" ($17/1000) en vez de
     # "Basic" ($0 con session token) — 3,4× más caro. Auditoría confirmó que el
@@ -8384,11 +8384,12 @@ _routes_v2_source_counters = _api_source_counters.setdefault("places_directions"
 _routes_v2_counters_started_at = _api_counters_started_at
 
 
-def _bump_api_source(endpoint: str, source: str) -> None:
+def _bump_api_source(endpoint: str, source: str, driver_id: Optional[str] = None) -> None:
     """Incrementa counter del origen de una call API. `endpoint` debe ser el
     slug corto del endpoint (sin /, sin guiones, sin parámetros), p.ej.
     'places_directions', 'places_details', 'geocode'. `source` viene del
-    header X-Triggered-By. Fire-and-forget persist a Supabase."""
+    header X-Triggered-By. `driver_id` opcional para tracking top spenders
+    (alertas, detección bug en cliente específico). Fire-and-forget persist."""
     endpoint_key = (endpoint or "unknown").strip().lower()[:48]
     source_key = (source or "unknown").strip().lower()[:48]
     bucket = _api_source_counters.setdefault(endpoint_key, {})
@@ -8398,13 +8399,43 @@ def _bump_api_source(endpoint: str, source: str) -> None:
         asyncio.create_task(asyncio.to_thread(
             _api_source_persist_sync, endpoint_key, today_iso, source_key,
         ))
+        # Driver-aware persist (alertas top spender, 23 may 2026). Solo si
+        # tenemos driver_id válido — auth puede no llegar en algunos paths
+        # legítimos (ej. CORS preflight). UUID validation evita corrupción.
+        if driver_id and isinstance(driver_id, str) and len(driver_id) == 36:
+            asyncio.create_task(asyncio.to_thread(
+                _api_source_driver_persist_sync, endpoint_key, today_iso, source_key, driver_id,
+            ))
     except Exception:
         pass  # nunca romper el endpoint por la métrica
 
 
-def _bump_routes_v2_source(source: str) -> None:
+def _bump_routes_v2_source(source: str, driver_id: Optional[str] = None) -> None:
     """Compat alias para llamadores existentes (/places/directions)."""
-    _bump_api_source("places_directions", source)
+    _bump_api_source("places_directions", source, driver_id)
+
+
+def _api_source_driver_persist_sync(endpoint: str, date_iso: str, source: str, driver_id: str) -> None:
+    """UPSERT incremental (endpoint, date, source, driver_id) → +1 count.
+    Tabla creada 23 may 2026 para soportar alertas top spender (driver
+    individual que concentra >€5/día de gasto Google). Si la tabla aún no
+    existe (deploy parcial), falla en silencio sin romper el counter agregado."""
+    try:
+        existing = (
+            supabase.table("api_source_driver_daily")
+            .select("count")
+            .eq("endpoint", endpoint).eq("date", date_iso)
+            .eq("source", source).eq("driver_id", driver_id)
+            .limit(1).execute()
+        )
+        current = (existing.data or [{}])[0].get("count", 0) or 0
+        supabase.table("api_source_driver_daily").upsert({
+            "endpoint": endpoint, "date": date_iso, "source": source,
+            "driver_id": driver_id, "count": current + 1,
+            "last_updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="endpoint,date,source,driver_id").execute()
+    except Exception as e:
+        logger.info(f"api_source_driver_daily upsert failed (table may not exist yet): {e}")
 
 
 def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
@@ -8448,6 +8479,210 @@ def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
             logger.warning(f"api_source persist failed for {endpoint}: {e}")
 
 
+# ====================================================================
+# COST ALERTS — vigilancia automática regresiones tipo bug #266 (€1.6-4k/mes leak)
+# 23 may 2026. Cron hora en punto +5min. Anti-spam 4h por alert_key.
+# Email a HEALTH_DIGEST_RECIPIENTS (mismo set que health digest existente).
+# Umbrales conservadores basados en baseline pre-fixes (€271/mes histórico).
+# ====================================================================
+
+_COST_ALERT_RECIPIENT = "direccion@taespack.com"
+_COST_ALERT_ANTISPAM_HOURS = 4
+
+# Precios EUR/call: usa la constante _PRICE_PER_CALL_EUR_BY_ENDPOINT ya
+# definida más abajo en el módulo (línea ~9759, blended Routes V2 + USD/EUR).
+# Se resuelve en runtime cuando check_cost_alerts() se invoca.
+
+# Umbrales (Miguel confirmó "OK los 4 tal cual" 23 may 14:25 CEST).
+_COST_ALERT_THRESHOLDS = {
+    "routes_v2_eur_day": {"amber": 15.0, "red": 25.0},
+    "source_calls_hour": {"amber": 30, "red": 80},
+    "unknown_calls_day": {"amber": 20, "red": 50},
+    "driver_eur_day": {"amber": 5.0, "red": 10.0},
+}
+
+
+def _cost_alert_already_sent_recently(alert_key: str) -> bool:
+    """True si el mismo alert_key se envió hace <_COST_ALERT_ANTISPAM_HOURS.
+    Evita spam cuando un umbral se mantiene disparado durante varias horas."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=_COST_ALERT_ANTISPAM_HOURS)).isoformat()
+        result = (
+            supabase.table("cost_alerts_sent")
+            .select("last_sent_at")
+            .eq("alert_key", alert_key)
+            .gte("last_sent_at", cutoff)
+            .limit(1).execute()
+        )
+        return bool(result.data)
+    except Exception as e:
+        logger.warning(f"cost_alert_already_sent check failed: {e}")
+        return False  # Fail-open: prefiero email duplicado a perder alerta real
+
+
+def _record_cost_alert_sent(alert_key: str, level: str, payload: dict) -> None:
+    """Marca el alert_key como enviado ahora. Upsert idempotente."""
+    try:
+        supabase.table("cost_alerts_sent").upsert({
+            "alert_key": alert_key,
+            "last_sent_at": datetime.now(timezone.utc).isoformat(),
+            "level": level,
+            "payload": payload,
+        }, on_conflict="alert_key").execute()
+    except Exception as e:
+        logger.warning(f"record_cost_alert_sent failed: {e}")
+
+
+def _fire_cost_alert(metric: str, level: str, title: str, body_html: str, payload: dict) -> None:
+    """Envia email + marca anti-spam. alert_key = metric:date:level."""
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    alert_key = f"{metric}:{today_iso}:{level}"
+    if _cost_alert_already_sent_recently(alert_key):
+        logger.info(f"cost_alert anti-spam skip: {alert_key}")
+        return
+    try:
+        send_alert_email(_COST_ALERT_RECIPIENT, title, body_html)
+        _record_cost_alert_sent(alert_key, level, payload)
+        logger.info(f"cost_alert sent: {alert_key}")
+    except Exception as e:
+        logger.error(f"cost_alert send failed: {e}")
+        sentry_sdk.capture_exception(e)
+
+
+def check_cost_alerts() -> dict:
+    """Cron job HH:05. 4 umbrales, ver _COST_ALERT_THRESHOLDS.
+    1. Routes V2 €/día total (suma api_source_daily places_directions)
+    2. Source individual calls/hora (cualquier endpoint, ventana 60min)
+    3. unknown calls/día (suma todos endpoints donde source='unknown')
+    4. Driver individual €/día (suma api_source_driver_daily ponderado por precio)
+    Devuelve dict con alarmas disparadas, para debugging/tests."""
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    fired: list[dict] = []
+
+    try:
+        # 1) Routes V2 €/día total
+        rows = (
+            supabase.table("api_source_daily")
+            .select("count")
+            .eq("endpoint", "places_directions").eq("date", today_iso)
+            .execute()
+        ).data or []
+        total_calls = sum(int(r.get("count") or 0) for r in rows)
+        eur_today = total_calls * _PRICE_PER_CALL_EUR_BY_ENDPOINT["places_directions"]
+        th = _COST_ALERT_THRESHOLDS["routes_v2_eur_day"]
+        if eur_today >= th["red"]:
+            level, threshold = "red", th["red"]
+        elif eur_today >= th["amber"]:
+            level, threshold = "amber", th["amber"]
+        else:
+            level, threshold = None, None
+        if level:
+            title = f"[Xpedit] Costs ALERT {level.upper()}: Routes V2 hoy {eur_today:.2f}€ > {threshold}€"
+            body = f"Total Routes V2 calls hoy: {total_calls}. Coste estimado {eur_today:.2f}€. Umbral {level} {threshold}€. Revisa /admin/costs."
+            payload = {"metric": "routes_v2_eur_day", "value": eur_today, "calls": total_calls}
+            _fire_cost_alert("routes_v2_eur_day", level, title, body, payload)
+            fired.append(payload | {"level": level})
+
+        # 2) Source individual calls/hora (últimos 60 min, in-memory counter)
+        for endpoint_key, source_map in _api_source_counters.items():
+            for source_key, count in source_map.items():
+                # Solo cuenta la última hora — usamos un proxy: tomar el delta
+                # del counter in-memory (resetea en boot Railway). Conservador:
+                # cuando uptime <1h, count ya refleja <1h de tráfico.
+                uptime_min = (time.time() - _api_counters_started_at) / 60
+                if uptime_min < 60:
+                    calls_in_hour = count  # in-memory cubre <1h
+                else:
+                    # Después de >1h uptime, no podemos extraer "última hora"
+                    # del counter in-memory acumulado. Skip — el cron diario
+                    # captura via routes_v2_eur_day total.
+                    continue
+                th = _COST_ALERT_THRESHOLDS["source_calls_hour"]
+                if calls_in_hour >= th["red"]:
+                    level, threshold = "red", th["red"]
+                elif calls_in_hour >= th["amber"]:
+                    level, threshold = "amber", th["amber"]
+                else:
+                    level, threshold = None, None
+                if level:
+                    metric_key = f"source_{endpoint_key}_{source_key}"
+                    title = f"[Xpedit] Costs ALERT {level.upper()}: {endpoint_key}/{source_key} {calls_in_hour}/h > {threshold}/h"
+                    body = (
+                        f"Endpoint {endpoint_key}, source '{source_key}' lleva {calls_in_hour} calls en menos de 1h. "
+                        f"Umbral {level} {threshold}/h. Posible regresión tipo bug #266 — revisa /admin/costs."
+                    )
+                    payload = {"metric": metric_key, "value": calls_in_hour, "endpoint": endpoint_key, "source": source_key}
+                    _fire_cost_alert(metric_key, level, title, body, payload)
+                    fired.append(payload | {"level": level})
+
+        # 3) Unknown calls/día (cualquier endpoint)
+        rows = (
+            supabase.table("api_source_daily")
+            .select("endpoint, count")
+            .eq("source", "unknown").eq("date", today_iso)
+            .execute()
+        ).data or []
+        for r in rows:
+            unknown_count = int(r.get("count") or 0)
+            endpoint_key = r.get("endpoint", "?")
+            th = _COST_ALERT_THRESHOLDS["unknown_calls_day"]
+            if unknown_count >= th["red"]:
+                level, threshold = "red", th["red"]
+            elif unknown_count >= th["amber"]:
+                level, threshold = "amber", th["amber"]
+            else:
+                continue
+            metric_key = f"unknown_{endpoint_key}"
+            title = f"[Xpedit] Costs ALERT {level.upper()}: {endpoint_key}/unknown {unknown_count}/d > {threshold}/d"
+            body = (
+                f"Endpoint {endpoint_key} acumula {unknown_count} calls hoy SIN tag X-Triggered-By. "
+                f"Umbral {level} {threshold}/d. Probable callsite nuevo sin etiquetar o app vieja sin OTA del counter."
+            )
+            payload = {"metric": metric_key, "value": unknown_count, "endpoint": endpoint_key}
+            _fire_cost_alert(metric_key, level, title, body, payload)
+            fired.append(payload | {"level": level})
+
+        # 4) Driver individual €/día (api_source_driver_daily)
+        rows = (
+            supabase.table("api_source_driver_daily")
+            .select("driver_id, endpoint, count")
+            .eq("date", today_iso)
+            .execute()
+        ).data or []
+        per_driver_eur: dict = {}
+        for r in rows:
+            driver_id = r.get("driver_id")
+            if not driver_id:
+                continue
+            endpoint_key = r.get("endpoint", "")
+            price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint_key, 0.005)
+            per_driver_eur[driver_id] = per_driver_eur.get(driver_id, 0.0) + int(r.get("count") or 0) * price
+        th = _COST_ALERT_THRESHOLDS["driver_eur_day"]
+        for driver_id, eur in per_driver_eur.items():
+            if eur >= th["red"]:
+                level, threshold = "red", th["red"]
+            elif eur >= th["amber"]:
+                level, threshold = "amber", th["amber"]
+            else:
+                continue
+            metric_key = f"driver_eur_{driver_id}"
+            title = f"[Xpedit] Costs ALERT {level.upper()}: driver {driver_id[:8]} hoy {eur:.2f}€ > {threshold}€"
+            body = (
+                f"Driver {driver_id} acumula {eur:.2f}€ de coste Google hoy. Umbral {level} {threshold}€. "
+                f"Posible bug en cliente específico, fraude o uso anormal. Revisa /admin/users/{driver_id}."
+            )
+            payload = {"metric": metric_key, "value": eur, "driver_id": driver_id}
+            _fire_cost_alert(metric_key, level, title, body, payload)
+            fired.append(payload | {"level": level})
+
+    except Exception as e:
+        logger.error(f"check_cost_alerts failed: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+
+    return {"fired": fired, "fired_count": len(fired)}
+
+
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
@@ -8472,7 +8707,7 @@ async def places_directions(
     (optimize, start-nav, recalc, load-route, cold-start, etc) para que el
     admin pueda detectar fugas (ver /admin/routes/calls-by-source).
     """
-    _bump_routes_v2_source(x_triggered_by)
+    _bump_routes_v2_source(x_triggered_by, user.get("id") if user else None)
     intermediates: list[dict] = []
     if heading is not None and "," in origin:
         try:
@@ -10325,6 +10560,14 @@ async def start_social_scheduler():
         id="daily_costs_snapshot_bootstrap", replace_existing=True,
     )
     logger.info("Daily costs snapshot: bootstrap run in 60s")
+    # Cost alerts (Miguel 23 may 2026 — task #277): chequea 4 umbrales cada
+    # hora a HH:05 (offset 5min vs hora en punto para evitar competencia con
+    # otros crons). Anti-spam 4h por alert_key. Bloquea regresiones tipo #266.
+    social_scheduler.add_job(
+        check_cost_alerts, "cron", minute=5,
+        id="cost_alerts_hourly", replace_existing=True,
+    )
+    logger.info("Cost alerts: cron HH:05 (4 thresholds, anti-spam 4h)")
     # Siempre arrancar el scheduler (tambien para backups y retention)
     if not social_scheduler.running:
         social_scheduler.start()
