@@ -7657,8 +7657,8 @@ def _stops_fuzzy_lookup_sync(
     query: str,
     lat: Optional[float],
     lng: Optional[float],
-    max_distance_km: float = 50.0,
-    similarity_threshold: float = 0.4,
+    max_distance_km: float = 15.0,
+    similarity_threshold: float = 0.65,
     limit_count: int = 5,
 ) -> list:
     """Búsqueda fuzzy en `stops` table vía RPC `find_similar_stop_addresses`.
@@ -7670,6 +7670,15 @@ def _stops_fuzzy_lookup_sync(
     Ventaja única Xpedit: drivers REPITEN direcciones (rutas reparto recurrentes).
     Con 13.9k stops válidas + 10.8k direcciones distintas en BD, el hit rate
     fuzzy esperado para queries de clientes recurrentes es alto.
+
+    23 may 2026 — tuning post-bug "Calle Real Fernando Sanlúcar → San Fernando":
+    - max_distance_km bajado 50→15 (Sanlúcar↔San Fernando = 37km, ahora NO
+      matchea aunque la similarity sea alta).
+    - similarity_threshold subido 0.4→0.65 (antes 'fernando' coincidía con
+      'San Fernando' con 0.54 — demasiado generoso para tokens cortos).
+    - Guard post-RPC: si el mejor candidato tiene dist >8km Y sim <0.80,
+      devolver vacío para que el caller (places_autocomplete) caiga a Google
+      que tiene autocomplete con bias GPS-aware mucho más preciso.
 
     Returns: list de dicts compatibles con Google Places Autocomplete response.
     """
@@ -7688,6 +7697,19 @@ def _stops_fuzzy_lookup_sync(
     except Exception as e:
         logger.warning(f"stops fuzzy lookup failed: {e}")
         return []
+    # Guard de calidad (23 may 2026): si el TOP candidato es "lejano + flojo",
+    # mejor no engañar al driver con la 1ª opción y dejar que Google responda.
+    if rows:
+        top = rows[0]
+        top_dist = float(top.get("distance_km") or 999)
+        top_sim = float(top.get("similarity") or 0)
+        # Solo dejamos pasar si: cerca (<=8km) O muy parecido (sim>=0.80)
+        if top_dist > 8.0 and top_sim < 0.80:
+            logger.info(
+                f"fuzzy guard: rejected top dist={top_dist:.1f}km sim={top_sim:.2f} "
+                f"for query={query[:30]} → fallback Google"
+            )
+            return []
     # Transformar a formato Google Places Autocomplete prediction:
     # {description, place_id, structured_formatting: {main_text, secondary_text}, ...}
     predictions = []
