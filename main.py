@@ -8347,9 +8347,50 @@ _routes_v2_counters_started_at: float = time.time()
 def _bump_routes_v2_source(source: str) -> None:
     """Incrementa counter del origen de una call a /places/directions.
     Origen viene del header X-Triggered-By que el cliente RN debe enviar.
-    Si falta, se cuenta como 'unknown' para detectar callers sin label."""
+    Si falta, se cuenta como 'unknown' para detectar callers sin label.
+
+    23 may 2026: in-memory + fire-and-forget UPSERT a Supabase
+    `routes_v2_source_daily` para sobrevivir restarts Railway (Miguel
+    detectó que cada redeploy reseteaba el contador → inútil para
+    análisis >minutos)."""
     key = (source or "unknown").strip().lower()[:48]
     _routes_v2_source_counters[key] = _routes_v2_source_counters.get(key, 0) + 1
+    # Fire-and-forget persist: no bloquea el response. Si Supabase falla,
+    # el counter in-memory sigue funcionando hasta el próximo restart.
+    try:
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        asyncio.create_task(asyncio.to_thread(
+            _routes_v2_source_persist_sync, today_iso, key,
+        ))
+    except Exception:
+        pass  # nunca romper el endpoint Routes V2 por esto
+
+
+def _routes_v2_source_persist_sync(date_iso: str, source: str) -> None:
+    """UPSERT incremental (date, source) → +1 count. Idempotente, race-safe
+    porque Postgres serializa el UPSERT por su unique constraint."""
+    try:
+        # Intento RPC atomic increment si existe; fallback a select+update
+        supabase.rpc("increment_routes_v2_source", {
+            "p_date": date_iso, "p_source": source,
+        }).execute()
+    except Exception:
+        # Fallback: select-then-upsert (no atomic pero suficiente para métrica)
+        try:
+            existing = (
+                supabase.table("routes_v2_source_daily")
+                .select("count")
+                .eq("date", date_iso).eq("source", source).limit(1)
+                .execute()
+            )
+            current = (existing.data or [{}])[0].get("count", 0) or 0
+            supabase.table("routes_v2_source_daily").upsert({
+                "date": date_iso, "source": source,
+                "count": current + 1,
+                "last_updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="date,source").execute()
+        except Exception as e:
+            logger.warning(f"routes_v2_source persist failed (non-fatal): {e}")
 
 
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
@@ -9341,31 +9382,82 @@ async def admin_routes_calls_by_source(user=Depends(require_admin)):
     snapshot periódico a otra tabla (no implementado aún).
     """
     uptime_min = round((time.time() - _routes_v2_counters_started_at) / 60, 1)
-    total = sum(_routes_v2_source_counters.values())
-    # Ordenar de mayor a menor para que el sospechoso salte primero
-    sorted_sources = sorted(
-        _routes_v2_source_counters.items(),
-        key=lambda kv: kv[1],
+    PRICE_PER_CALL_EUR = 0.0073  # blended Routes Pro+Essentials × 0.92 USD→EUR
+
+    # In-memory: contadores desde el último cold-start del backend
+    inmem_total = sum(_routes_v2_source_counters.values())
+
+    # Histórico persistido: lee últimos 7 días de routes_v2_source_daily
+    # (sobrevive restarts Railway). Para "hoy" agrega in-memory + BD
+    # — el persist es fire-and-forget, puede llegar con segundos de retraso.
+    try:
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+        history_rows = (
+            supabase.table("routes_v2_source_daily")
+            .select("date, source, count")
+            .gte("date", cutoff)
+            .execute()
+        ).data or []
+    except Exception as e:
+        logger.warning(f"routes_v2_source history fetch failed: {e}")
+        history_rows = []
+
+    # Agregado 7d por source (combina BD + in-memory de hoy)
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    from collections import defaultdict
+    agg_7d: dict = defaultdict(int)
+    today_persisted: dict = defaultdict(int)
+    for row in history_rows:
+        agg_7d[row["source"]] += int(row.get("count") or 0)
+        if row.get("date") == today_iso:
+            today_persisted[row["source"]] = int(row.get("count") or 0)
+
+    # Para hoy: max(BD_persistido, in_memory) porque el in-memory puede ir
+    # ligeramente por delante del persist fire-and-forget.
+    today_total = sum(
+        max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0))
+        for src in set(list(today_persisted.keys()) + list(_routes_v2_source_counters.keys()))
+    )
+    sorted_today = sorted(
+        set(list(today_persisted.keys()) + list(_routes_v2_source_counters.keys())),
+        key=lambda s: max(today_persisted.get(s, 0), _routes_v2_source_counters.get(s, 0)),
         reverse=True,
     )
-    # Coste estimado por call (Routes V2 Pro = $0.01, blended con Essentials ~$0.008)
-    PRICE_PER_CALL_EUR = 0.0073  # blended Pro+Essentials × 0.92 USD→EUR
-    by_source = [
+    by_source_today = [
+        {
+            "source": src,
+            "calls": max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0)),
+            "pct": round(100 * max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0)) / today_total, 1) if today_total else 0,
+            "eur_estimated": round(max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0)) * PRICE_PER_CALL_EUR, 2),
+        }
+        for src in sorted_today
+    ]
+
+    total_7d = sum(agg_7d.values())
+    by_source_7d = [
         {
             "source": src,
             "calls": cnt,
-            "pct": round(100 * cnt / total, 1) if total else 0,
+            "pct": round(100 * cnt / total_7d, 1) if total_7d else 0,
             "eur_estimated": round(cnt * PRICE_PER_CALL_EUR, 2),
         }
-        for src, cnt in sorted_sources
+        for src, cnt in sorted(agg_7d.items(), key=lambda kv: kv[1], reverse=True)
     ]
+
     return {
         "ok": True,
         "uptime_minutes": uptime_min,
-        "total_calls_since_deploy": total,
-        "eur_total_since_deploy": round(total * PRICE_PER_CALL_EUR, 2),
-        "by_source": by_source,
-        "note": "Counter in-memory. Se resetea en cada cold-start del backend.",
+        # Hoy (persistente + in-memory, sobrevive restarts)
+        "total_calls_today": today_total,
+        "eur_total_today": round(today_total * PRICE_PER_CALL_EUR, 2),
+        "by_source": by_source_today,  # mantiene nombre por compat website
+        # Últimos 7 días (solo BD, agregado histórico)
+        "total_calls_7d": total_7d,
+        "eur_total_7d": round(total_7d * PRICE_PER_CALL_EUR, 2),
+        "by_source_7d": by_source_7d,
+        # In-memory desde último cold-start (para diagnóstico)
+        "inmem_total_since_deploy": inmem_total,
+        "note": "Datos hoy = BD persistente + in-memory. Sobrevive restarts Railway. Histórico 7d en `by_source_7d`.",
     }
 
 
