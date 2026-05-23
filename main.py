@@ -8370,6 +8370,114 @@ _ROUTES_V2_FIELD_MASK = (
 )
 
 
+# === Routes V2 server-side cache (tarea #259, 23 may 2026) ===
+# Cachea respuestas idénticas TTL 10 min para evitar quemar Routes V2 con
+# calls repetidas. Caso real: Victor stuck con bundle pre-#266c hizo ~50
+# resume calls/h con coords casi idénticas. Hit esperado 30-70% según
+# escenario.
+_ROUTES_V2_CACHE_TTL_SEC = 600  # 10 min — limitado porque tráfico cambia
+_ROUTES_V2_CACHE_MAX_SIZE = 500
+_ROUTES_V2_CACHE_COORD_DECIMALS = 4  # ~11 m precision (origin GPS bucket)
+_ROUTES_V2_CACHE_HEADING_BUCKET = 30  # tolerancia ±15° (no cachear cada grado)
+_routes_v2_cache: "_OrderedDict[str, tuple[float, dict]]" = _OrderedDict()
+_routes_v2_cache_hits = 0
+_routes_v2_cache_misses = 0
+
+
+def _routes_v2_cache_enabled() -> bool:
+    """Feature flag — lee de app_config para poder apagar sin redeploy si
+    rompe algo. Default true. Conservador: cualquier error → asumir true
+    para no degradar UX."""
+    try:
+        r = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "routes_v2_cache_enabled")
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            val = (r.data[0].get("value") or "").strip().lower()
+            return val not in ("false", "0", "off", "no")
+    except Exception:
+        pass
+    return True
+
+
+def _routes_v2_round_coords(coord_str: str) -> str:
+    """'lat,lng' → redondeado a 4 dec (~11 m). GPS reads cercanos comparten key."""
+    if not coord_str or "," not in coord_str:
+        return coord_str or ""
+    try:
+        lat_str, lng_str = coord_str.split(",", 1)
+        lat = round(float(lat_str.strip()), _ROUTES_V2_CACHE_COORD_DECIMALS)
+        lng = round(float(lng_str.strip()), _ROUTES_V2_CACHE_COORD_DECIMALS)
+        return f"{lat},{lng}"
+    except (ValueError, AttributeError):
+        return coord_str
+
+
+def _routes_v2_cache_key(
+    origin: str,
+    destination: str,
+    waypoints: Optional[str],
+    avoid: Optional[str],
+    heading: Optional[float],
+) -> str:
+    o = _routes_v2_round_coords(origin)
+    d = _routes_v2_round_coords(destination)
+    # Waypoints son típicamente direcciones literales (no coords) → solo
+    # normalizar case/whitespace. Si fueran coords, también las redondeamos
+    # split-aware.
+    wps = ""
+    if waypoints:
+        parts = []
+        for wp in waypoints.split("|"):
+            wp = wp.strip()
+            if wp.startswith("via:"):
+                wp = "via:" + _routes_v2_round_coords(wp[4:])
+            else:
+                wp = _routes_v2_round_coords(wp)
+            parts.append(wp.lower())
+        wps = "|".join(parts)
+    h_bucket = ""
+    if heading is not None:
+        try:
+            b = int(round(float(heading) / _ROUTES_V2_CACHE_HEADING_BUCKET) * _ROUTES_V2_CACHE_HEADING_BUCKET) % 360
+            h_bucket = str(b)
+        except (ValueError, TypeError):
+            pass
+    raw = f"{o}|{d}|{wps}|{(avoid or '').lower()}|{h_bucket}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _routes_v2_cache_get(key: str) -> Optional[dict]:
+    global _routes_v2_cache_hits, _routes_v2_cache_misses
+    entry = _routes_v2_cache.get(key)
+    if not entry:
+        _routes_v2_cache_misses += 1
+        return None
+    ts, value = entry
+    if time.time() - ts > _ROUTES_V2_CACHE_TTL_SEC:
+        # Expirado — borrar best-effort.
+        try:
+            del _routes_v2_cache[key]
+        except KeyError:
+            pass
+        _routes_v2_cache_misses += 1
+        return None
+    _routes_v2_cache.move_to_end(key)  # LRU touch
+    _routes_v2_cache_hits += 1
+    return value
+
+
+def _routes_v2_cache_set(key: str, value: dict) -> None:
+    _routes_v2_cache[key] = (time.time(), value)
+    _routes_v2_cache.move_to_end(key)
+    while len(_routes_v2_cache) > _ROUTES_V2_CACHE_MAX_SIZE:
+        _routes_v2_cache.popitem(last=False)
+
+
 # Counter in-memory de X-Triggered-By por endpoint+source.
 # 23 may 2026: expandido a múltiples endpoints (/places/directions, /places/details,
 # /geocode) para visión 360° del gasto Google por función cliente.
@@ -8701,8 +8809,23 @@ async def places_directions(
     El header X-Triggered-By identifica la función cliente que disparó la call
     (optimize, start-nav, recalc, load-route, cold-start, etc) para que el
     admin pueda detectar fugas (ver /admin/routes/calls-by-source).
+
+    23 may 2026 (tarea #259): cache server-side TTL 10 min para evitar quemar
+    Routes V2 con calls repetidas (Victor stuck con bundle pre-#266c hace
+    ~50 resume/h con coords casi idénticas). Coords redondeadas a 4 dec
+    (~11 m) para aumentar hit rate. Cache HIT NO llama a Google → no contamina
+    counter `places_directions` (separado en `places_directions_cache/hit`).
     """
-    _bump_routes_v2_source(x_triggered_by, user_id=user.get("id") if user else None)
+    user_id = user.get("id") if user else None
+    cache_key = _routes_v2_cache_key(origin, destination, waypoints, avoid, heading)
+    cached = _routes_v2_cache_get(cache_key) if _routes_v2_cache_enabled() else None
+    if cached is not None:
+        # Cache HIT — no llamamos a Google. Bumpeamos counter separado para
+        # visibilidad de cuántas calls hemos ahorrado, NO `places_directions`
+        # porque ése es solo calls reales a Google (lo que se factura).
+        _bump_api_source("places_directions_cache", "hit", user_id=user_id)
+        return cached
+    _bump_routes_v2_source(x_triggered_by, user_id=user_id)
     intermediates: list[dict] = []
     if heading is not None and "," in origin:
         try:
@@ -8785,7 +8908,13 @@ async def places_directions(
                 if attempt == 0:
                     continue
                 raise HTTPException(status_code=502, detail=f"Routes API 5xx after retry: {last_error}")
-            return _routes_v2_to_directions_shape(resp.json())
+            shaped = _routes_v2_to_directions_shape(resp.json())
+            # Solo cacheamos responses OK con routes válidas para no servir
+            # luego un error reutilizado. Si shape se queda vacío (sin routes)
+            # tampoco cachea — esa call habría que hacerla otra vez.
+            if shaped.get("status") == "OK" and shaped.get("routes"):
+                _routes_v2_cache_set(cache_key, shaped)
+            return shaped
         except HTTPException:
             raise
         except Exception as e:
