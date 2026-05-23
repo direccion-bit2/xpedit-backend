@@ -1620,13 +1620,21 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
 
 
 @app.post("/geocode", tags=["optimize"], summary="Geocodificar dirección")
-async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
+async def geocode(
+    request: GeocodeRequest,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
+    user=Depends(get_current_user),
+):
     """Convierte una dirección de texto en coordenadas (lat/lng) usando Google Geocoding API.
 
     Maneja business names (farmacias, hoteles), direcciones con sufijos raros
     y CPs parciales mucho mejor que Nominatim. Acepta `country` ISO-2 opcional
     para sesgar resultados al país del driver.
+
+    Header X-Triggered-By identifica el origen (ocr-label, csv-import, msi-batch,
+    map-snap, etc) para tracking en /admin/api-sources.
     """
+    _bump_api_source("geocode", x_triggered_by)
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=503, detail="Geocoding service not configured")
 
@@ -8114,6 +8122,7 @@ async def places_autocomplete(
 async def places_details(
     place_id: str,
     sessiontoken: Optional[str] = None,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user),
 ):
     """Proxy de Google Places Details. Devuelve geometría, componentes de dirección y dirección formateada.
@@ -8121,7 +8130,11 @@ async def places_details(
     `sessiontoken` (opcional) cierra la sesión facturable abierta en
     /places/autocomplete: pasa el MISMO UUID que el cliente generó al abrir
     el input. Si la sesión es válida, Google factura solo este Details
-    (los autocompletes salen gratis)."""
+    (los autocompletes salen gratis).
+
+    Header X-Triggered-By identifica el origen (depot-modal, address-search,
+    stop-detail, msi-edit, etc) para tracking en /admin/api-sources."""
+    _bump_api_source("places_details", x_triggered_by)
     # Field mask 21 may 2026: quitado `opening_hours` (Miguel + auditoría agentes 21 may 00:24).
     # `opening_hours` dispara el SKU "Place Details Advanced" ($17/1000) en vez de
     # "Basic" ($0 con session token) — 3,4× más caro. Auditoría confirmó que el
@@ -8335,62 +8348,82 @@ _ROUTES_V2_FIELD_MASK = (
 )
 
 
-# Counter in-memory: cuenta calls Routes V2 por origen (header X-Triggered-By).
-# Se resetea en cada cold-start del backend (aceptable — solo es métrica viva).
-# Expuesto en GET /admin/routes/calls-by-source. Permite identificar funciones
-# del cliente que disparan más calls de lo necesario (ej. el bug reconciles
-# AppState active del 19-22 may que generó €600/mes extras).
-_routes_v2_source_counters: dict[str, int] = {}
-_routes_v2_counters_started_at: float = time.time()
+# Counter in-memory de X-Triggered-By por endpoint+source.
+# 23 may 2026: expandido a múltiples endpoints (/places/directions, /places/details,
+# /geocode) para visión 360° del gasto Google por función cliente.
+# Se resetea en cada cold-start del backend (in-memory). Persistido a Supabase
+# para sobrevivir restarts Railway.
+# Estructura: { endpoint: { source: count } }
+_api_source_counters: dict[str, dict[str, int]] = {}
+_api_counters_started_at: float = time.time()
+
+# Compat back: alias para el contador Routes V2 (otras partes del código aún lo leen)
+_routes_v2_source_counters = _api_source_counters.setdefault("places_directions", {})
+_routes_v2_counters_started_at = _api_counters_started_at
 
 
-def _bump_routes_v2_source(source: str) -> None:
-    """Incrementa counter del origen de una call a /places/directions.
-    Origen viene del header X-Triggered-By que el cliente RN debe enviar.
-    Si falta, se cuenta como 'unknown' para detectar callers sin label.
-
-    23 may 2026: in-memory + fire-and-forget UPSERT a Supabase
-    `routes_v2_source_daily` para sobrevivir restarts Railway (Miguel
-    detectó que cada redeploy reseteaba el contador → inútil para
-    análisis >minutos)."""
-    key = (source or "unknown").strip().lower()[:48]
-    _routes_v2_source_counters[key] = _routes_v2_source_counters.get(key, 0) + 1
-    # Fire-and-forget persist: no bloquea el response. Si Supabase falla,
-    # el counter in-memory sigue funcionando hasta el próximo restart.
+def _bump_api_source(endpoint: str, source: str) -> None:
+    """Incrementa counter del origen de una call API. `endpoint` debe ser el
+    slug corto del endpoint (sin /, sin guiones, sin parámetros), p.ej.
+    'places_directions', 'places_details', 'geocode'. `source` viene del
+    header X-Triggered-By. Fire-and-forget persist a Supabase."""
+    endpoint_key = (endpoint or "unknown").strip().lower()[:48]
+    source_key = (source or "unknown").strip().lower()[:48]
+    bucket = _api_source_counters.setdefault(endpoint_key, {})
+    bucket[source_key] = bucket.get(source_key, 0) + 1
     try:
         today_iso = datetime.now(timezone.utc).date().isoformat()
         asyncio.create_task(asyncio.to_thread(
-            _routes_v2_source_persist_sync, today_iso, key,
+            _api_source_persist_sync, endpoint_key, today_iso, source_key,
         ))
     except Exception:
-        pass  # nunca romper el endpoint Routes V2 por esto
+        pass  # nunca romper el endpoint por la métrica
 
 
-def _routes_v2_source_persist_sync(date_iso: str, source: str) -> None:
-    """UPSERT incremental (date, source) → +1 count. Idempotente, race-safe
-    porque Postgres serializa el UPSERT por su unique constraint."""
+def _bump_routes_v2_source(source: str) -> None:
+    """Compat alias para llamadores existentes (/places/directions)."""
+    _bump_api_source("places_directions", source)
+
+
+def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
+    """UPSERT incremental (endpoint, date, source) → +1 count en api_source_daily.
+    Fallback a routes_v2_source_daily para places_directions (compat tabla vieja)
+    si la tabla nueva aún no existe.
+    Idempotente, race-safe por unique constraint Postgres."""
     try:
-        # Intento RPC atomic increment si existe; fallback a select+update
-        supabase.rpc("increment_routes_v2_source", {
-            "p_date": date_iso, "p_source": source,
-        }).execute()
-    except Exception:
-        # Fallback: select-then-upsert (no atomic pero suficiente para métrica)
-        try:
-            existing = (
-                supabase.table("routes_v2_source_daily")
-                .select("count")
-                .eq("date", date_iso).eq("source", source).limit(1)
-                .execute()
-            )
-            current = (existing.data or [{}])[0].get("count", 0) or 0
-            supabase.table("routes_v2_source_daily").upsert({
-                "date": date_iso, "source": source,
-                "count": current + 1,
-                "last_updated_at": datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="date,source").execute()
-        except Exception as e:
-            logger.warning(f"routes_v2_source persist failed (non-fatal): {e}")
+        existing = (
+            supabase.table("api_source_daily")
+            .select("count")
+            .eq("endpoint", endpoint).eq("date", date_iso).eq("source", source)
+            .limit(1).execute()
+        )
+        current = (existing.data or [{}])[0].get("count", 0) or 0
+        supabase.table("api_source_daily").upsert({
+            "endpoint": endpoint, "date": date_iso, "source": source,
+            "count": current + 1,
+            "last_updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="endpoint,date,source").execute()
+    except Exception as e:
+        # Fallback: tabla nueva no existe aún → para places_directions usar
+        # tabla legacy. Otros endpoints simplemente no persisten esta vez.
+        if endpoint == "places_directions":
+            try:
+                existing = (
+                    supabase.table("routes_v2_source_daily")
+                    .select("count")
+                    .eq("date", date_iso).eq("source", source).limit(1)
+                    .execute()
+                )
+                current = (existing.data or [{}])[0].get("count", 0) or 0
+                supabase.table("routes_v2_source_daily").upsert({
+                    "date": date_iso, "source": source,
+                    "count": current + 1,
+                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                }, on_conflict="date,source").execute()
+            except Exception as e2:
+                logger.warning(f"api_source persist fallback failed: {e2}")
+        else:
+            logger.warning(f"api_source persist failed for {endpoint}: {e}")
 
 
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
@@ -9458,6 +9491,112 @@ async def admin_routes_calls_by_source(user=Depends(require_admin)):
         # In-memory desde último cold-start (para diagnóstico)
         "inmem_total_since_deploy": inmem_total,
         "note": "Datos hoy = BD persistente + in-memory. Sobrevive restarts Railway. Histórico 7d en `by_source_7d`.",
+    }
+
+
+# Pricing estimado por call (EUR) — usado en /admin/api-sources
+# Routes V2 Pro blend ~$0.008, Place Details Essentials $0.005, Geocoding $0.005
+_PRICE_PER_CALL_EUR_BY_ENDPOINT = {
+    "places_directions": 0.0073,   # Routes V2 Pro+Essentials blend × 0.92 USD→EUR
+    "places_details": 0.0046,      # Essentials $0.005 × 0.92 (free 10k/mes ignorado)
+    "geocode": 0.0046,             # Geocoding $0.005 × 0.92 (free 10k/mes ignorado)
+}
+
+
+@app.get("/admin/api-sources", tags=["admin", "costs"], summary="Desglose calls por endpoint+origen X-Triggered-By (TODOS los endpoints)")
+async def admin_api_sources(user=Depends(require_admin)):
+    """Desglose 360° de calls Google Maps por endpoint y origen (X-Triggered-By).
+
+    Cubre /places/directions, /places/details, /geocode. Combina counter
+    in-memory (al minuto) + persistido Supabase (sobrevive restarts).
+    Histórico 7d por endpoint para detectar drift de uso entre días.
+    """
+    uptime_min = round((time.time() - _api_counters_started_at) / 60, 1)
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    cutoff_7d = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+
+    # Lee BD api_source_daily (tabla nueva). Si falla (tabla aún no
+    # creada por Supabase MCP, devolverá [] → solo veremos in-memory).
+    persisted_rows: list[dict] = []
+    try:
+        persisted_rows = (
+            supabase.table("api_source_daily")
+            .select("endpoint, date, source, count")
+            .gte("date", cutoff_7d)
+            .execute()
+        ).data or []
+    except Exception as e:
+        logger.info(f"api_source_daily fetch failed (table may not exist yet): {e}")
+
+    # Agregados por endpoint
+    out_endpoints: list[dict] = []
+    seen_endpoints = set(_api_source_counters.keys())
+    for row in persisted_rows:
+        seen_endpoints.add(row["endpoint"])
+
+    from collections import defaultdict
+    for endpoint in sorted(seen_endpoints):
+        inmem_today = _api_source_counters.get(endpoint, {})
+        persisted_today: dict = defaultdict(int)
+        persisted_7d: dict = defaultdict(int)
+        for row in persisted_rows:
+            if row["endpoint"] != endpoint:
+                continue
+            cnt = int(row.get("count") or 0)
+            persisted_7d[row["source"]] += cnt
+            if row.get("date") == today_iso:
+                persisted_today[row["source"]] += cnt
+
+        # Hoy = max(BD persistido, in-memory) por source (in-mem puede ir delante)
+        all_sources_today = set(list(persisted_today.keys()) + list(inmem_today.keys()))
+        today_by_source = {
+            src: max(persisted_today.get(src, 0), inmem_today.get(src, 0))
+            for src in all_sources_today
+        }
+        today_total = sum(today_by_source.values())
+        price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint, 0.005)
+
+        by_source_today = [
+            {
+                "source": src,
+                "calls": cnt,
+                "pct": round(100 * cnt / today_total, 1) if today_total else 0,
+                "eur_estimated": round(cnt * price, 2),
+            }
+            for src, cnt in sorted(today_by_source.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+        total_7d = sum(persisted_7d.values())
+        by_source_7d = [
+            {
+                "source": src,
+                "calls": cnt,
+                "pct": round(100 * cnt / total_7d, 1) if total_7d else 0,
+                "eur_estimated": round(cnt * price, 2),
+            }
+            for src, cnt in sorted(persisted_7d.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+
+        out_endpoints.append({
+            "endpoint": endpoint,
+            "price_per_call_eur": price,
+            "today": {
+                "total_calls": today_total,
+                "eur_total": round(today_total * price, 2),
+                "by_source": by_source_today,
+            },
+            "last_7d": {
+                "total_calls": total_7d,
+                "eur_total": round(total_7d * price, 2),
+                "by_source": by_source_7d,
+            },
+        })
+
+    return {
+        "ok": True,
+        "uptime_minutes": uptime_min,
+        "endpoints": out_endpoints,
+        "note": "Datos hoy = BD persistente + in-memory. Histórico 7d solo BD. "
+                "Pricing estimado por blend tier; valores reales en Cloud Console.",
     }
 
 
