@@ -8418,88 +8418,40 @@ def _bump_routes_v2_source(source: str, user_id: Optional[str] = None) -> None:
 
 
 def _api_source_user_persist_sync(endpoint: str, date_iso: str, source: str, user_id: str) -> None:
-    """UPSERT incremental (endpoint, date, source, user_id) → +1 count en
-    api_source_driver_daily. La columna se llama `user_id` desde 23 may 2026
-    (antes mal-nombrada driver_id pese a recibir siempre auth.users.id).
-    Si la tabla aún no existe falla en silencio sin romper el counter agregado.
-    Observability (23 may 17:55 CEST — task #281 lesson): captura UPSERT con
-    0 rows como warning Sentry; excepciones reales como capture_exception.
-    Antes solo había logger.info → Railway logs se rotan y nadie se entera."""
+    """+1 atómico en api_source_driver_daily vía RPC `atomic_bump_api_source_user`.
+    La columna se llama `user_id` desde 23 may 2026 (antes mal-nombrada driver_id
+    pese a recibir siempre auth.users.id).
+    Bug previo (23 may 19:00 CEST): el read-then-write Python perdía counts en
+    paralelo — dos asyncio tasks leían `count=N` simultáneamente y ambas
+    escribían `N+1` cuando deberían `N+1` y `N+2`. Resultado: 53% de calls
+    sin atribuir a usuario aunque la BD agregada sí los contaba. Fix vía
+    RPC Postgres con `INSERT ... ON CONFLICT DO UPDATE SET count = count + 1`
+    (atómico server-side, sin race)."""
     try:
-        existing = (
-            supabase.table("api_source_driver_daily")
-            .select("count")
-            .eq("endpoint", endpoint).eq("date", date_iso)
-            .eq("source", source).eq("user_id", user_id)
-            .limit(1).execute()
-        )
-        current = (existing.data or [{}])[0].get("count", 0) or 0
-        upserted = supabase.table("api_source_driver_daily").upsert({
-            "endpoint": endpoint, "date": date_iso, "source": source,
-            "user_id": user_id, "count": current + 1,
-            "last_updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="endpoint,date,source,user_id").execute()
-        if not upserted.data or len(upserted.data) == 0:
-            sentry_sdk.capture_message(
-                f"api_source_driver UPSERT returned 0 rows endpoint={endpoint} source={source} user_id={user_id}",
-                level="warning",
-            )
+        supabase.rpc("atomic_bump_api_source_user", {
+            "p_endpoint": endpoint,
+            "p_date": date_iso,
+            "p_source": source,
+            "p_user_id": user_id,
+        }).execute()
     except Exception as e:
-        logger.info(f"api_source_driver_daily upsert failed (table may not exist yet): {e}")
+        logger.info(f"api_source_driver_daily bump RPC failed: {e}")
         sentry_sdk.capture_exception(e)
 
 
 def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
-    """UPSERT incremental (endpoint, date, source) → +1 count en api_source_daily.
-    Fallback a routes_v2_source_daily para places_directions (compat tabla vieja)
-    si la tabla nueva aún no existe.
-    Idempotente, race-safe por unique constraint Postgres.
-    Observability (23 may 17:55 CEST — task #281 lesson): si UPSERT devuelve
-    0 rows reportamos a Sentry. Antes los fallos de persistencia se comían
-    silenciosamente y solo veíamos el undercount al comparar in-memory vs BD."""
+    """+1 atómico en api_source_daily vía RPC `atomic_bump_api_source`.
+    Bug previo (23 may 19:00 CEST): read-then-write Python perdía counts en
+    paralelo. Fix vía RPC con `INSERT ... ON CONFLICT DO UPDATE SET count = count + 1`."""
     try:
-        existing = (
-            supabase.table("api_source_daily")
-            .select("count")
-            .eq("endpoint", endpoint).eq("date", date_iso).eq("source", source)
-            .limit(1).execute()
-        )
-        current = (existing.data or [{}])[0].get("count", 0) or 0
-        upserted = supabase.table("api_source_daily").upsert({
-            "endpoint": endpoint, "date": date_iso, "source": source,
-            "count": current + 1,
-            "last_updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="endpoint,date,source").execute()
-        # Sanity: si UPSERT no devolvió ninguna row es señal de regresión
-        # (RLS, schema drift, conexión muerta). Reporta a Sentry sin romper.
-        if not upserted.data or len(upserted.data) == 0:
-            sentry_sdk.capture_message(
-                f"api_source UPSERT returned 0 rows endpoint={endpoint} source={source}",
-                level="warning",
-            )
+        supabase.rpc("atomic_bump_api_source", {
+            "p_endpoint": endpoint,
+            "p_date": date_iso,
+            "p_source": source,
+        }).execute()
     except Exception as e:
-        # Fallback: tabla nueva no existe aún → para places_directions usar
-        # tabla legacy. Otros endpoints simplemente no persisten esta vez.
-        if endpoint == "places_directions":
-            try:
-                existing = (
-                    supabase.table("routes_v2_source_daily")
-                    .select("count")
-                    .eq("date", date_iso).eq("source", source).limit(1)
-                    .execute()
-                )
-                current = (existing.data or [{}])[0].get("count", 0) or 0
-                supabase.table("routes_v2_source_daily").upsert({
-                    "date": date_iso, "source": source,
-                    "count": current + 1,
-                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
-                }, on_conflict="date,source").execute()
-            except Exception as e2:
-                logger.warning(f"api_source persist fallback failed: {e2}")
-                sentry_sdk.capture_exception(e2)
-        else:
-            logger.warning(f"api_source persist failed for {endpoint}: {e}")
-            sentry_sdk.capture_exception(e)
+        logger.warning(f"api_source bump RPC failed for {endpoint}: {e}")
+        sentry_sdk.capture_exception(e)
 
 
 # ====================================================================
