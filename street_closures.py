@@ -61,7 +61,17 @@ class ClosureRecord:
 async def _geocode(
     client: httpx.AsyncClient, google_api_key: str, query: str
 ) -> tuple[float, float] | None:
-    """Geocode a free-form address string. Returns (lat, lng) or None."""
+    """Geocode a free-form address string. Returns (lat, lng) or None.
+    Bumpea el counter X-Triggered-By con source `closures-scraper` para que
+    la card admin/costs "Por origen 360°" muestre cuánto geocode generan los
+    scrapers (Sanlúcar etc) — antes era invisible y sumaba al gap con Cloud
+    Monitoring (23 may 2026 audit Miguel)."""
+    try:
+        # Import lazy para evitar ciclo en tests.
+        from main import _bump_api_source
+        _bump_api_source("geocode", "closures-scraper", user_id=None)
+    except Exception:
+        pass  # no romper el scraper por la métrica
     try:
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/geocode/json",

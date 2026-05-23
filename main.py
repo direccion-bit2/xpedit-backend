@@ -6200,6 +6200,13 @@ async def _msi_geocode_one(
     if bbox:
         params["bounds"] = f"{bbox['sw_lat']},{bbox['sw_lng']}|{bbox['ne_lat']},{bbox['ne_lng']}"
 
+    # Bump counter — esto es una call REAL a Google Geocoding (post-cache miss).
+    # Source distingue round 1 (sin bbox) vs round 2 (con bbox refinado).
+    _bump_api_source(
+        "geocode",
+        "msi-internal" if bbox is None else "msi-bbox",
+        user_id=None,  # MSI corre en backend, no hay user JWT en este nivel
+    )
     try:
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/geocode/json",
@@ -8194,6 +8201,8 @@ async def places_details(
 async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
     """Reverse geocode via Google to get road-aligned coordinates.
     Used when stops come from Nominatim (which can be 30-40m off from Google's road network)."""
+    # /places/snap usa Google Geocoding API (reverse) → cuenta como geocode.
+    _bump_api_source("geocode", "map-snap", user_id=user.get("id") if user else None)
     params = {
         "latlng": f"{lat},{lng}",
         "language": "es",
