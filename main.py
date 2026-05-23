@@ -8383,11 +8383,23 @@ _routes_v2_cache: "_OrderedDict[str, tuple[float, dict]]" = _OrderedDict()
 _routes_v2_cache_hits = 0
 _routes_v2_cache_misses = 0
 
+# Flag memo: evita 100ms RTT a Supabase en cada call. Refresca cada 30s
+# (auditoría code-doctor 23 may 2026 P0: si se llama Supabase en cada
+# request, con 50+ req/h por driver y N drivers saturamos el pool y
+# añadimos latencia gratis).
+_ROUTES_V2_FLAG_TTL_SEC = 30
+_routes_v2_flag_value = True
+_routes_v2_flag_fetched_at = 0.0
+
 
 def _routes_v2_cache_enabled() -> bool:
-    """Feature flag — lee de app_config para poder apagar sin redeploy si
-    rompe algo. Default true. Conservador: cualquier error → asumir true
-    para no degradar UX."""
+    """Feature flag — lee de app_config (memo 30s) para apagar sin redeploy
+    si rompe algo. Default true. Cualquier error → asumir true para no
+    degradar UX."""
+    global _routes_v2_flag_value, _routes_v2_flag_fetched_at
+    now = time.time()
+    if now - _routes_v2_flag_fetched_at < _ROUTES_V2_FLAG_TTL_SEC:
+        return _routes_v2_flag_value
     try:
         r = (
             supabase.table("app_config")
@@ -8398,10 +8410,14 @@ def _routes_v2_cache_enabled() -> bool:
         )
         if r.data:
             val = (r.data[0].get("value") or "").strip().lower()
-            return val not in ("false", "0", "off", "no")
+            _routes_v2_flag_value = val not in ("false", "0", "off", "no")
+        else:
+            _routes_v2_flag_value = True
     except Exception:
+        # Mantener último valor conocido si Supabase falla
         pass
-    return True
+    _routes_v2_flag_fetched_at = now
+    return _routes_v2_flag_value
 
 
 def _routes_v2_round_coords(coord_str: str) -> str:
@@ -8472,7 +8488,18 @@ def _routes_v2_cache_get(key: str) -> Optional[dict]:
 
 
 def _routes_v2_cache_set(key: str, value: dict) -> None:
-    _routes_v2_cache[key] = (time.time(), value)
+    # Lazy purge: cada vez que añadimos (= después de un miss → Google
+    # call), aprovecha para limpiar entradas expiradas. Sin esto el LRU
+    # eviction solo dispara al llegar a 500, pudiendo tener 499 entradas
+    # basura ocupando RAM (auditoría code-doctor 23 may P2 #9).
+    now = time.time()
+    expired = [k for k, (ts, _) in _routes_v2_cache.items() if now - ts > _ROUTES_V2_CACHE_TTL_SEC]
+    for k in expired:
+        try:
+            del _routes_v2_cache[k]
+        except KeyError:
+            pass
+    _routes_v2_cache[key] = (now, value)
     _routes_v2_cache.move_to_end(key)
     while len(_routes_v2_cache) > _ROUTES_V2_CACHE_MAX_SIZE:
         _routes_v2_cache.popitem(last=False)
@@ -8820,10 +8847,11 @@ async def places_directions(
     cache_key = _routes_v2_cache_key(origin, destination, waypoints, avoid, heading)
     cached = _routes_v2_cache_get(cache_key) if _routes_v2_cache_enabled() else None
     if cached is not None:
-        # Cache HIT — no llamamos a Google. Bumpeamos counter separado para
-        # visibilidad de cuántas calls hemos ahorrado, NO `places_directions`
-        # porque ése es solo calls reales a Google (lo que se factura).
-        _bump_api_source("places_directions_cache", "hit", user_id=user_id)
+        # Cache HIT — no llamamos a Google. Bumpeamos counter separado por
+        # source para visibilidad de QUÉ fuente cachea más (resume vs
+        # optimize vs cold-start). NO `places_directions` porque ése es solo
+        # calls reales a Google (lo que se factura).
+        _bump_api_source("places_directions_cache", x_triggered_by or "unknown", user_id=user_id)
         return cached
     _bump_routes_v2_source(x_triggered_by, user_id=user_id)
     intermediates: list[dict] = []
