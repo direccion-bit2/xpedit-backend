@@ -94,7 +94,9 @@ if SENTRY_DSN:
     except Exception as e:
         logger.warning(f"Sentry startup ping failed: {e}")
 else:
-    logger.warning("SENTRY_DSN not configured — backend errors will NOT be reported")
+    # INFO en vez de WARNING (22 may 2026): solo informativo en local dev.
+    # En prod SENTRY_DSN siempre está configurado, este branch no aplica.
+    logger.info("SENTRY_DSN not configured — backend errors will NOT be reported (expected in local dev)")
 
 import places_v1
 from emails import (
@@ -176,6 +178,48 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     SUPABASE_SERVICE_KEY
 )
+
+# Fix bug #222 (22 may 2026): forzar HTTP/1.1 en el cliente httpx que PostgREST
+# usa internamente. HTTP/2 con Supabase causa ráfagas "Server disconnected"
+# cuando el stream pool se satura (visto en LATAM concurrente). HTTP/1.1
+# reconnecta por request → no comparte pool problemático.
+#
+# IMPORTANTE (regresión 22 may 15:54): el nuevo httpx.Client DEBE preservar
+# `base_url` y `headers` del cliente original que postgrest configuró con
+# la URL/key de Supabase. Sin esto, requests con path relativo fallan con
+# "Request URL is missing an 'http://' or 'https://' protocol".
+# 20 events en 30s con drivers Bogotá afectados antes de detectarlo.
+try:
+    import httpx as _httpx_supabase
+    if hasattr(supabase, "postgrest") and hasattr(supabase.postgrest, "session"):
+        _orig_session = supabase.postgrest.session
+        _orig_base_url = getattr(_orig_session, "base_url", None)
+        _orig_headers = dict(getattr(_orig_session, "headers", {}) or {})
+        if _orig_base_url and str(_orig_base_url).startswith(("http://", "https://")):
+            _new_session = _httpx_supabase.Client(
+                base_url=_orig_base_url,
+                headers=_orig_headers,
+                http1=True,
+                http2=False,
+                timeout=30.0,
+                limits=_httpx_supabase.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=100,
+                    keepalive_expiry=30.0,
+                ),
+            )
+            try:
+                _orig_session.close()
+            except Exception:
+                pass
+            supabase.postgrest.session = _new_session
+            logger.info(f"Supabase httpx client forced to HTTP/1.1 (base_url={_orig_base_url})")
+        else:
+            logger.warning(
+                f"Skip HTTP/1.1 fix — base_url invalid or missing on original session: {_orig_base_url!r}"
+            )
+except Exception as _e:
+    logger.warning(f"Failed to force HTTP/1.1 on Supabase client (continuing with default): {_e}")
 
 # Supabase JWT secret for token verification
 _raw_jwt = os.getenv("SUPABASE_JWT_SECRET", "")
@@ -661,6 +705,84 @@ async def _bump_anyio_thread_pool():
         logger.info("anyio thread pool limiter raised to 200 (was 40)")
     except Exception as e:
         logger.warning(f"Could not raise anyio thread limiter: {e}")
+
+
+@app.on_event("startup")
+async def _startup_smoke_test():
+    """SMOKE TEST POST-DEPLOY (22 may 2026 — lessons learned bug HTTP/1.1):
+    valida en arranque que las dependencias críticas funcionan ANTES de
+    aceptar tráfico. Si falla, marca el backend como degraded en Sentry
+    pero NO crashea (Railway puede reiniciar infinitamente lo que peor).
+
+    Caso real bug ab88484: el cliente httpx Supabase quedó sin base_url tras
+    refactor → TODO el backend rompió Supabase 1h sin que nada lo detectara
+    hasta que un email Sentry llegó a Miguel. Este test lo habría cazado en
+    el primer startup post-deploy.
+
+    Validaciones:
+    1. Supabase responde a query trivial (app_config)
+    2. supabase.postgrest.session tiene base_url válido http(s)://
+    3. GOOGLE_API_KEY env var configurada (si !places no funcionaría)
+    4. JWT secret presente (auth rompería todo si falta)
+    """
+    failures: list[str] = []
+
+    # 1. Supabase real query
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("app_config").select("key").limit(1).execute()
+        )
+        if not isinstance(result.data, list):
+            failures.append(f"Supabase query returned non-list: {type(result.data)}")
+        else:
+            logger.info("smoke ✓ Supabase query OK")
+    except Exception as e:
+        failures.append(f"Supabase query failed: {type(e).__name__}: {e}")
+
+    # 2. postgrest session base_url valid
+    try:
+        session = getattr(supabase, "postgrest", None)
+        session = getattr(session, "session", None) if session else None
+        base_url = str(getattr(session, "base_url", "")) if session else ""
+        if not base_url.startswith(("http://", "https://")):
+            failures.append(f"postgrest session base_url INVALID: {base_url!r}")
+        else:
+            logger.info(f"smoke ✓ postgrest base_url OK ({base_url[:50]})")
+    except Exception as e:
+        failures.append(f"postgrest base_url check failed: {e}")
+
+    # 3. GOOGLE_API_KEY
+    if not GOOGLE_API_KEY:
+        failures.append("GOOGLE_API_KEY env var missing (places/* would not work)")
+    else:
+        logger.info("smoke ✓ GOOGLE_API_KEY set")
+
+    # 4. JWT secret
+    if not SUPABASE_JWT_SECRET:
+        failures.append("SUPABASE_JWT_SECRET env var missing (all auth would break)")
+    else:
+        logger.info("smoke ✓ SUPABASE_JWT_SECRET set")
+
+    if failures:
+        msg = f"STARTUP SMOKE TEST FAILED ({len(failures)} checks): " + " | ".join(failures)
+        logger.error(msg)
+        if SENTRY_DSN:
+            try:
+                sentry_sdk.capture_message(msg, level="fatal")
+            except Exception:
+                pass
+        # Marcamos health degraded para que Railway/admin lo vean. No
+        # hacemos sys.exit — preferimos backend degradado a backend OFF.
+        global _startup_smoke_failures
+        _startup_smoke_failures = failures
+    else:
+        logger.info(f"STARTUP SMOKE TEST PASSED ({4} checks)")
+        global _startup_smoke_ok
+        _startup_smoke_ok = True
+
+
+_startup_smoke_ok: bool = False
+_startup_smoke_failures: list[str] = []
 
 # CORS
 app.add_middleware(
@@ -1499,13 +1621,21 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
 
 
 @app.post("/geocode", tags=["optimize"], summary="Geocodificar dirección")
-async def geocode(request: GeocodeRequest, user=Depends(get_current_user)):
+async def geocode(
+    request: GeocodeRequest,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
+    user=Depends(get_current_user),
+):
     """Convierte una dirección de texto en coordenadas (lat/lng) usando Google Geocoding API.
 
     Maneja business names (farmacias, hoteles), direcciones con sufijos raros
     y CPs parciales mucho mejor que Nominatim. Acepta `country` ISO-2 opcional
     para sesgar resultados al país del driver.
+
+    Header X-Triggered-By identifica el origen (ocr-label, csv-import, msi-batch,
+    map-snap, etc) para tracking en /admin/api-sources.
     """
+    _bump_api_source("geocode", x_triggered_by, user_id=user.get("id") if user else None)
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=503, detail="Geocoding service not configured")
 
@@ -6071,6 +6201,13 @@ async def _msi_geocode_one(
     if bbox:
         params["bounds"] = f"{bbox['sw_lat']},{bbox['sw_lng']}|{bbox['ne_lat']},{bbox['ne_lng']}"
 
+    # Bump counter — esto es una call REAL a Google Geocoding (post-cache miss).
+    # Source distingue round 1 (sin bbox) vs round 2 (con bbox refinado).
+    _bump_api_source(
+        "geocode",
+        "msi-internal" if bbox is None else "msi-bbox",
+        user_id=None,  # MSI corre en backend, no hay user JWT en este nivel
+    )
     try:
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/geocode/json",
@@ -7241,22 +7378,184 @@ _places_api_last_alert: Optional[datetime] = None
 _places_api_last_check: Optional[datetime] = None
 
 
+_STREET_PREFIX_RE = re.compile(r"^(.+?)\s*,?\s+[#]?[\d][\w\-/]*\s*$")
+_TRAILING_NUMBER_RE = re.compile(r"[\d][\w\-/]*$")
+
+# Mapa de abreviaturas → forma canónica para normalización (22 may 2026):
+# Drivers escriben "c/Mayor 5" o "Av Andalucía" — esto crea cache miss vs
+# entries con "calle mayor 5" cacheadas. Expandimos antes del key lookup.
+# Soporta tanto "c/" pegado ("c/Mayor") como "c " con espacio ("c Mayor").
+_ABBREVIATIONS = {
+    r"\bc\.?/+\s*": "calle ",       # c/, c/X, c./X → calle
+    r"\bc\.\s+": "calle ",          # c. X → calle
+    r"\bcl\.?\s+": "calle ",
+    r"\bav\.?\s+": "avenida ",
+    r"\bavda\.?\s+": "avenida ",
+    r"\bavd\.?\s+": "avenida ",
+    r"\bpza\.?\s+": "plaza ",
+    r"\bplz\.?\s+": "plaza ",
+    r"\bps\.?\s+": "paseo ",
+    r"\bctra\.?\s+": "carretera ",
+    r"\bcra\.?\s+": "carrera ",     # LATAM (Colombia)
+    r"\bavd\.?a\.?\s+": "avenida ",
+}
+_ABBREV_PATTERNS = [(re.compile(pat, re.IGNORECASE), rep) for pat, rep in _ABBREVIATIONS.items()]
+_PUNCT_RE = re.compile(r"[^\w\s\-]")  # quitar puntuación excepto guión
+
+# Bajado de WARNING → INFO 22 may: estos 3 warnings spammean cada cold-start
+# en local (SENTRY_DSN ausente, VROOM/PyVRP no instalados local) y NO aportan.
+# En prod sí están configurados, por eso nunca aparecen. Mantenemos info-level
+# para tener trazabilidad en logs sin contaminar terminal del dev.
+
+# Para filter country en cache HIT — Google predictions.terms[].value contiene
+# el nombre del país (e.g. "España", "Argentina"). Mapping inverso por ISO.
+_COUNTRY_NAME_BY_ISO = {
+    "ES": "ESPAÑA",
+    "AR": "ARGENTINA",
+    "CL": "CHILE",
+    "CO": "COLOMBIA",
+    "MX": "MÉXICO",
+    "PE": "PERÚ",
+    "EC": "ECUADOR",
+    "UY": "URUGUAY",
+    "BO": "BOLIVIA",
+    "PY": "PARAGUAY",
+}
+
+
+def _extract_street_prefix(query: str) -> Optional[str]:
+    """Quita el último número (portal) para lookup secundario de cache.
+
+    Ej: 'calle bolsa 32' → 'calle bolsa'
+        'calle de la cepa, 16' → 'calle de la cepa'
+        'carrera 39c, 84a-07' → 'carrera 39c' (mantiene primer número que es parte calle)
+        'pago zahora' → None (no hay número final)
+        'calle 13 23' (LATAM) → None (prefix ya contiene número, evita falsos positivos)
+
+    Devuelve None si:
+    - no hay número final
+    - el prefix sería <5 chars
+    - el prefix ya contiene número (LATAM "calle 13 23" donde 13 es parte del nombre
+      de calle, no portal). Sin este guard, el regex \\b23\\b matchearía también
+      "Calle 23 con Carrera 13" y devolvería predictions WRONG → riesgo entrega
+      en sitio equivocado. (Guard añadido 22 may 2026 tras audit.)"""
+    q = (query or "").strip()
+    if not q:
+        return None
+    m = _STREET_PREFIX_RE.match(q)
+    if not m:
+        return None
+    prefix = m.group(1).strip().rstrip(",").strip()
+    if len(prefix) < 5 or prefix.lower() == q.lower():
+        return None
+    # Guard LATAM: si el prefix YA contiene un número, NO usar prefix lookup
+    # (evita "calle 13 23" → buscar "calle 13" → filtrar por "23" → match con
+    # "Calle 23 con Carrera 13" que es OTRA dirección).
+    if re.search(r"\d", prefix):
+        return None
+    return prefix
+
+
+def _filter_predictions_containing_number(predictions: list, number: str) -> list:
+    """Filtra predictions cuyo description contenga el `number` como token completo.
+
+    Ej: predictions = ['Calle Bolsa, 32, Madrid', 'Calle Bolsa, 45, Madrid']
+        number='32' → devuelve solo la primera.
+        number='99' → devuelve [] (ningún match)."""
+    if not number or not predictions:
+        return []
+    try:
+        rx = re.compile(rf"\b{re.escape(number)}\b", re.IGNORECASE)
+    except re.error:
+        return []
+    return [p for p in predictions if isinstance(p, dict) and rx.search(p.get("description", ""))]
+
+
+_VIA_PREFIXES_STRIP = (
+    # ordenados largo→corto para evitar matches parciales (carretera antes que carrera)
+    "carretera ", "avenida ", "carrera ", "paseo ", "plaza ", "calle ", "av ",
+)
+
+
+def _normalize_query_aggressive(query: str) -> str:
+    """Normalización agresiva para maximizar cache hit rate (22 may 2026).
+
+    Antes solo: lower + collapse spaces. Resultado: 'Calle María', 'calle maria',
+    'C/ Maria', 'calle maria,' generaban 4 entries distintas. Audit del 22 may
+    estimó 30-40% de las 1.700 entries son duplicadas por esto = ~€270/mes
+    en calls Google evitables.
+
+    Pasos:
+    1. Lower-case
+    2. Quitar acentos (NFD + strip combining marks): María → maria
+    3. Expandir abreviaturas: c/ → calle, av → avenida, ctra → carretera, etc.
+    4. Quitar puntuación (mantener guión y espacios)
+    5. Collapse whitespace múltiple
+    6. Strip prefijo tipo de vía (calle/avenida/plaza/paseo/carrera/carretera/av)
+       SI: queda ≥2 tokens después Y el siguiente token NO es número (guard LATAM
+       "calle 43" donde 43 es nombre de calle, no portal). Razón: drivers
+       inconsistentes escriben "calle X" vs "X" → 2 entries hoy → 1 entry.
+    7. Max 200 chars
+    """
+    import unicodedata
+    if not query:
+        return ""
+    q = query.lower().strip()
+    # NFD decomposes "á" → "a" + "´", encode/ignore strips the combining marks.
+    q = unicodedata.normalize("NFD", q)
+    q = q.encode("ascii", "ignore").decode("ascii")
+    # Expandir abreviaturas ANTES de quitar puntuación (algunas llevan punto: "c.").
+    for pat, rep in _ABBREV_PATTERNS:
+        q = pat.sub(rep, q)
+    # Quitar puntuación (preserve - y space)
+    q = _PUNCT_RE.sub(" ", q)
+    # Collapse whitespace + trim
+    q = " ".join(q.split())
+    # Strip prefijo tipo de vía (paso 6 — añadido 22 may 2026 audit Miguel)
+    for prefix in _VIA_PREFIXES_STRIP:
+        if q.startswith(prefix):
+            rest = q[len(prefix):].lstrip()
+            rest_tokens = rest.split()
+            # ≥2 tokens restantes Y primer token NO EMPIEZA por dígito
+            # (guard LATAM: "calle 43", "carrera 39c", "avenida 5 de mayo" donde
+            # el número o número+letra es nombre de calle, NO portal).
+            if (
+                len(rest_tokens) >= 2
+                and rest_tokens[0]  # no vacío
+                and not rest_tokens[0][0].isdigit()
+            ):
+                q = rest
+            break  # solo un prefijo
+    return q[:200]
+
+
 def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tuple[str, str]:
     """Normalize query + bias for cache lookup.
-    bias_geohash5 is rounded to 1 decimal (~11km cell) when bias is provided.
 
-    NOTA: el bias_geohash5 incluye SOLO el `lat,lng` (location bias), NO el
-    `origin` (que se usa para calcular distance_meters). Las predictions
-    devueltas por Google no cambian con origin — solo añaden el campo
-    distance_meters. Por eso podemos cachear sin segregar por origin: cualquier
-    cliente que reciba la respuesta puede re-ordenar localmente. Si en el
-    futuro Google cambiase el orden por origin, habría que añadir origin
-    al cache key."""
-    norm = " ".join((query or "").lower().strip().split())[:200]
+    Bias grid: 0.25° (~27km lat × ~21km lng).
+    Antes (22 may 2026): round(lat, 1) = 0.1° (~11km) era demasiado granular —
+    drivers en ciudades vecinas (Sanlúcar / Chipiona / Jerez / El Puerto, todas
+    a <30km) NO compartían cache y cada uno gastaba autocompletes Google
+    para las mismas calles. Hit rate empírico <10%. Subimos granularidad a
+    0.25° (~27km) → ciudades vecinas comparten cache. Hit rate esperado 40-60%.
+    Tradeoff: Google recibirá el mismo bias para zona más grande, sus
+    predictions seguirán siendo locales (Google también pondera por GPS real
+    del cliente cuando está disponible).
+
+    Query normalization (22 may 2026): se usa normalización agresiva (acentos,
+    abreviaturas, puntuación) para maximizar hit rate. Ver _normalize_query_aggressive.
+
+    NOTA: el bias incluye SOLO el `lat,lng` (location bias), NO el `origin`
+    (que se usa solo para calcular distance_meters). Las predictions devueltas
+    por Google no cambian con origin — solo añaden el campo distance_meters.
+    Por eso cacheamos sin segregar por origin: cualquier cliente puede
+    re-ordenar localmente."""
+    norm = _normalize_query_aggressive(query)
     if lat is None or lng is None:
         bias = ""
     else:
-        bias = f"{round(lat, 1)},{round(lng, 1)}"
+        # Round a múltiplos de 0.25 (~27km lat, ~21km lng en España)
+        bias = f"{round(lat * 4) / 4:.2f},{round(lng * 4) / 4:.2f}"
     return norm, bias
 
 
@@ -7269,6 +7568,62 @@ def _ac_cache_key(query: str, lat: Optional[float], lng: Optional[float]) -> tup
 _places_cache_mode_value: str = "off"
 _places_cache_mode_fetched_at: float = 0.0
 _PLACES_CACHE_MODE_TTL_SEC = 60  # re-read flag from app_config every 60s
+
+# Métricas in-memory por source (22 may 2026): contador desde último cold-start.
+# Para medir hit rate REAL distinguiendo exact / prefix / fuzzy / negative / google.
+# Reset al deploy (acepto). Devuelto en /admin/cache/places-stats.
+_places_source_counters: dict[str, int] = {
+    "hit": 0,                 # exact cache hit
+    "prefix_hit": 0,          # composite street prefix hit
+    "stops_fuzzy_hit": 0,     # pg_trgm fuzzy match en stops
+    "negative_hit": 0,        # cached ZERO_RESULTS
+    "miss_write": 0,          # Google → cached
+    "negative_write": 0,      # Google ZERO_RESULTS → cached negative
+    "shadow_would_hit": 0,    # shadow mode: cache habría hit
+    "shadow_miss": 0,         # shadow mode: cache miss
+    "skipped": 0,             # cache_mode=off o query <3 chars
+}
+_places_counters_started_at: float = time.time()
+
+
+def _bump_source_counter(source: str) -> None:
+    """Increment in-memory counter para source. Used in /admin/cache/places-stats."""
+    if source in _places_source_counters:
+        _places_source_counters[source] += 1
+
+
+# L1 in-memory cache (22 may 2026 P1): antes de Supabase lookup, mira LRU local.
+# Primera capa de defensa más rápida (~5ms vs ~500ms Supabase round-trip).
+# TTL corto (5 min) para no servir datos muy stale. maxsize 1000 entries con
+# eviction LRU (insertion order Python 3.7+ + OrderedDict.move_to_end).
+from collections import OrderedDict as _OrderedDict
+_PLACES_L1_MAX = 1000
+_PLACES_L1_TTL_SEC = 300
+_places_l1_cache: "_OrderedDict[tuple[str, str], tuple[float, dict]]" = _OrderedDict()
+
+
+def _l1_get(norm: str, bias: str) -> Optional[dict]:
+    """L1 lookup. Returns cached value if fresh, None if miss/stale."""
+    key = (norm, bias)
+    entry = _places_l1_cache.get(key)
+    if entry is None:
+        return None
+    ts, value = entry
+    if time.time() - ts > _PLACES_L1_TTL_SEC:
+        _places_l1_cache.pop(key, None)
+        return None
+    # LRU touch: move to end (most recent)
+    _places_l1_cache.move_to_end(key)
+    return value
+
+
+def _l1_put(norm: str, bias: str, value: dict) -> None:
+    """L1 store with LRU eviction when at max capacity."""
+    key = (norm, bias)
+    _places_l1_cache[key] = (time.time(), value)
+    _places_l1_cache.move_to_end(key)
+    while len(_places_l1_cache) > _PLACES_L1_MAX:
+        _places_l1_cache.popitem(last=False)  # evict oldest
 
 
 async def _get_places_cache_mode() -> str:
@@ -7345,17 +7700,121 @@ def _places_cache_lookup_sync(norm: str, bias: str) -> Optional[dict]:
         return None
 
 
-def _places_cache_write_sync(norm: str, bias: str, predictions: list) -> bool:
-    """Sync Supabase upsert — MUST be called via asyncio.to_thread (fire-and-forget)."""
+def _stops_fuzzy_lookup_sync(
+    query: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    max_distance_km: float = 15.0,
+    similarity_threshold: float = 0.65,
+    limit_count: int = 5,
+) -> list:
+    """Búsqueda fuzzy en `stops` table vía RPC `find_similar_stop_addresses`.
+
+    Devuelve lista de predictions formato Google-compatible (con `description`,
+    `place_id`, `lat`, `lng`, `_source`). Usado por places_autocomplete como
+    último lookup local antes de pegar a Google. CERO coste Google si hit.
+
+    Ventaja única Xpedit: drivers REPITEN direcciones (rutas reparto recurrentes).
+    Con 13.9k stops válidas + 10.8k direcciones distintas en BD, el hit rate
+    fuzzy esperado para queries de clientes recurrentes es alto.
+
+    23 may 2026 — tuning post-bug "Calle Real Fernando Sanlúcar → San Fernando":
+    - max_distance_km bajado 50→15 (Sanlúcar↔San Fernando = 37km, ahora NO
+      matchea aunque la similarity sea alta).
+    - similarity_threshold subido 0.4→0.65 (antes 'fernando' coincidía con
+      'San Fernando' con 0.54 — demasiado generoso para tokens cortos).
+    - Guard post-RPC: si el mejor candidato tiene dist >8km Y sim <0.80,
+      devolver vacío para que el caller (places_autocomplete) caiga a Google
+      que tiene autocomplete con bias GPS-aware mucho más preciso.
+
+    Returns: list de dicts compatibles con Google Places Autocomplete response.
+    """
+    if not query or len(query) < 3:
+        return []
     try:
-        supabase.table("places_autocomplete_cache").upsert({
+        resp = supabase.rpc("find_similar_stop_addresses", {
+            "q": query,
+            "lat_in": lat,
+            "lng_in": lng,
+            "max_distance_km": max_distance_km,
+            "similarity_threshold": similarity_threshold,
+            "limit_count": limit_count,
+        }).execute()
+        rows = resp.data or []
+    except Exception as e:
+        logger.warning(f"stops fuzzy lookup failed: {e}")
+        return []
+    # Guard de calidad (23 may 2026): si el TOP candidato es "lejano + flojo",
+    # mejor no engañar al driver con la 1ª opción y dejar que Google responda.
+    if rows:
+        top = rows[0]
+        top_dist = float(top.get("distance_km") or 999)
+        top_sim = float(top.get("similarity") or 0)
+        # Solo dejamos pasar si: cerca (<=8km) O muy parecido (sim>=0.80)
+        if top_dist > 8.0 and top_sim < 0.80:
+            logger.info(
+                f"fuzzy guard: rejected top dist={top_dist:.1f}km sim={top_sim:.2f} "
+                f"for query={query[:30]} → fallback Google"
+            )
+            return []
+    # Transformar a formato Google Places Autocomplete prediction:
+    # {description, place_id, structured_formatting: {main_text, secondary_text}, ...}
+    predictions = []
+    for r in rows:
+        address = (r.get("address") or "").strip()
+        if not address:
+            continue
+        # description = primera línea (la "main") + segunda si existe
+        lines = address.split("\n")
+        main = lines[0].strip()
+        secondary = lines[1].strip() if len(lines) > 1 else ""
+        description = address.replace("\n", ", ")
+        predictions.append({
+            "description": description,
+            "place_id": r.get("place_id"),
+            "structured_formatting": {
+                "main_text": main,
+                "secondary_text": secondary,
+            },
+            # Custom fields para que cliente pueda usar coords directos sin Place Details
+            "_xpedit_lat": r.get("lat"),
+            "_xpedit_lng": r.get("lng"),
+            "_xpedit_distance_km": r.get("distance_km"),
+            "_xpedit_similarity": r.get("similarity"),
+        })
+    return predictions
+
+
+def _places_cache_write_sync(norm: str, bias: str, predictions: list, ttl_days: int = 30) -> bool:
+    """Sync Supabase write — MUST be called via asyncio.to_thread (fire-and-forget).
+
+    ttl_days: 30 default. Para negative cache (predictions=[]), pasar 1.
+
+    NOTA audit 22 may 2026: el upsert original ponía `hits=1` en conflict,
+    reseteando contadores acumulados de entradas populares (race con otro
+    request paralelo o refresh por TTL expirado). El TTL escalonado dependía
+    de hits reales → entradas con 50 hits podían no llegar a milestone 10/30/100.
+    Fix: INSERT con `ignore_duplicates=True`; si hay conflict (data vacía),
+    UPDATE separado que refresca predictions/expires/last_used SIN tocar hits.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    expires_iso = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+    try:
+        ins = supabase.table("places_autocomplete_cache").upsert({
             "query_normalized": norm,
             "bias_geohash5": bias,
             "predictions": predictions,
             "hits": 1,
-            "last_used_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
-        }, on_conflict="query_normalized,bias_geohash5").execute()
+            "last_used_at": now_iso,
+            "expires_at": expires_iso,
+        }, on_conflict="query_normalized,bias_geohash5", ignore_duplicates=True).execute()
+        # Si insert no escribió (conflicto): refresca predictions sin tocar hits.
+        if not (ins.data or []):
+            supabase.table("places_autocomplete_cache").update({
+                "predictions": predictions,
+                "last_used_at": now_iso,
+                "expires_at": expires_iso,
+            }).eq("query_normalized", norm).eq("bias_geohash5", bias).execute()
         return True
     except Exception as e:
         logger.warning(f"places cache write failed (non-fatal): {e}")
@@ -7363,12 +7822,29 @@ def _places_cache_write_sync(norm: str, bias: str, predictions: list) -> bool:
 
 
 def _places_cache_bump_sync(norm: str, bias: str, current_hits: int) -> None:
-    """Sync bump of hits + last_used_at on cache hit (fire-and-forget)."""
+    """Sync bump of hits + last_used_at on cache hit (fire-and-forget).
+
+    TTL escalonado (22 may 2026 P1): direcciones populares (>=10 hits)
+    extienden expires_at +90d, >=30 hits extienden +180d. Razón: la
+    geografía no cambia, una calle que se ha pedido 50 veces seguro
+    sigue existiendo el próximo mes. Reduce re-llamadas Google al
+    expirar el TTL base 30d para hits populares (ahorro pasivo).
+    """
+    new_hits = current_hits + 1
+    update_payload: dict = {
+        "hits": new_hits,
+        "last_used_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Extend TTL based on popularity (only on milestone hits to avoid Update spam)
+    if new_hits in (10, 30, 100):
+        days = 180 if new_hits >= 30 else 90
+        update_payload["expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(days=days)
+        ).isoformat()
     try:
-        supabase.table("places_autocomplete_cache").update({
-            "hits": current_hits + 1,
-            "last_used_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("query_normalized", norm).eq("bias_geohash5", bias).execute()
+        supabase.table("places_autocomplete_cache").update(update_payload).eq(
+            "query_normalized", norm
+        ).eq("bias_geohash5", bias).execute()
     except Exception:
         pass  # bump failure is silent — does not break user request
 
@@ -7431,6 +7907,7 @@ async def places_autocomplete(
     sessiontoken: Optional[str] = None,
     origin_lat: Optional[float] = None,
     origin_lng: Optional[float] = None,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user),
 ):
     """Proxy de Google Places Autocomplete. Solo Google, sin Nominatim.
@@ -7442,7 +7919,22 @@ async def places_autocomplete(
     `country` (ISO-3166-1 alpha-2, p.ej. 'AR'): restringe resultados al país.
     Sin esta restricción Google asume España por defecto y un driver argentino
     buscando "Calle Ancha" recibe direcciones de Madrid antes que las suyas.
+
+    `origin_lat`/`origin_lng` (opcional, F1.13 bias dinámico): si la app envía
+    el punto de referencia del driver (última stop o ubicación actual), Google
+    añade `distance_meters` a cada prediction. La app re-ordena por distancia
+    real evitando matches lejanos. Sin esto el re-orden es no-op (audit 22 may).
+
+    23 may 20:20 CEST — tracking X-Triggered-By: bumpeamos cada request al
+    endpoint (incluso si cache local resuelve sin Google) porque queremos
+    saber QUIEN pide autocomplete (stop-editor, msi, etc). Diferencia
+    cache-hit vs Google real se ve por delta con Cloud Monitoring.
     """
+    _bump_api_source(
+        "places_autocomplete",
+        x_triggered_by,
+        user_id=user.get("id") if user else None,
+    )
     global _places_api_healthy, _places_api_last_alert, _places_api_last_check
 
     # Cache (21 may 2026 re-enabled): respects 5 may incident root cause by
@@ -7452,24 +7944,125 @@ async def places_autocomplete(
     cache_mode = await _get_places_cache_mode()
     norm_query, bias_key = _ac_cache_key(input, lat, lng)
     cache_eligible = cache_mode in ("on", "shadow") and norm_query and len(norm_query) >= 3
+    if not cache_eligible:
+        _bump_source_counter("skipped")
     cache_row = None
     if cache_eligible:
-        try:
-            cache_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_query, bias_key)
-        except Exception as e:
-            logger.warning(f"places cache lookup raised in to_thread: {e}")
-            cache_row = None
+        # L1 in-memory lookup primero (~5ms vs ~500ms Supabase)
+        cache_row = _l1_get(norm_query, bias_key)
+        if cache_row is None:
+            try:
+                cache_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_query, bias_key)
+            except Exception as e:
+                logger.warning(f"places cache lookup raised in to_thread: {e}")
+                cache_row = None
+            # Solo cachea en L1 si vino de Supabase con datos (no None)
+            if cache_row is not None:
+                _l1_put(norm_query, bias_key, cache_row)
 
-    if cache_mode == "on" and cache_row and cache_row.get("predictions"):
+    if cache_mode == "on" and cache_row and cache_row.get("predictions") is not None:
         # HIT — return cache, skip Google entirely. Fire-and-forget bump.
-        logger.info(f"places_cache_event=hit query={norm_query[:30]} bias={bias_key}")
+        cached_predictions = cache_row["predictions"]
+
+        # Negative cache (22 may 2026): si predictions == [], significa que la
+        # query no devolvió resultados (Google ZERO_RESULTS). Devolvemos vacío
+        # sin llamar Google (evita driver con typo recurrente quemando $$).
+        if not cached_predictions:
+            _bump_source_counter("negative_hit")
+            logger.info(f"places_cache_event=negative_hit query={norm_query[:30]} bias={bias_key}")
+            return {"status": "ZERO_RESULTS", "predictions": [], "source": "cache_negative"}
+
+        # Country filter en HIT (22 may 2026 fix B3 audit): driver Sanlúcar pidió
+        # 'avenida andalucía', cache HIT con entry de otro driver Sevilla → devolvía
+        # Sevilla. Filtramos por country flag si llega + verificamos GPS coherente.
+        cc = (country or "").strip().upper()
+        if cc and len(cc) == 2 and cc.isalpha():
+            gps_iso = _country_iso_from_coords(lat, lng)
+            # Si GPS contradice el flag, NO aplicamos filter (safety net mismo que línea 7580)
+            if not gps_iso or gps_iso == cc:
+                filtered = [
+                    p for p in cached_predictions
+                    if isinstance(p, dict) and (
+                        not p.get("terms") or
+                        any(
+                            (t.get("value", "").upper() in {cc, _COUNTRY_NAME_BY_ISO.get(cc, "")})
+                            for t in p.get("terms", [])
+                        )
+                    )
+                ]
+                # Si el filter elimina TODO, mejor devolver el original cached que ir a Google.
+                # En la práctica las predictions Google con country flag siempre llevan el país.
+                if filtered:
+                    cached_predictions = filtered
+
+        _bump_source_counter("hit")
+        logger.info(f"places_cache_event=hit query={norm_query[:30]} bias={bias_key} country={cc or '-'}")
         try:
             asyncio.create_task(asyncio.to_thread(
                 _places_cache_bump_sync, norm_query, bias_key, cache_row.get("hits") or 0,
             ))
         except Exception:
             pass
-        return {"status": "OK", "predictions": cache_row["predictions"], "source": "cache"}
+        return {"status": "OK", "predictions": cached_predictions, "source": "cache"}
+
+    # COMPOSITE LOOKUP (22 may 2026): si la query exacta MISS y contiene número
+    # al final (ej 'calle bolsa 32'), busca el prefix de calle ('calle bolsa').
+    # Si el prefix ESTÁ cacheado, filtra sus predictions para encontrar el número
+    # exacto. Hit virtual sin llamar Google. Sube hit rate ~50-70% para zonas
+    # con calles recurrentes en distintos portales (cliente entrega en 5 portales
+    # de la misma calle = 1 entrada cache cubre los 5).
+    if cache_mode == "on" and cache_eligible and not cache_row:
+        street_prefix = _extract_street_prefix(input)
+        if street_prefix:
+            try:
+                norm_prefix, prefix_bias = _ac_cache_key(street_prefix, lat, lng)
+                prefix_row = await asyncio.to_thread(_places_cache_lookup_sync, norm_prefix, prefix_bias)
+            except Exception as e:
+                logger.warning(f"places prefix lookup failed: {e}")
+                prefix_row = None
+            if prefix_row and prefix_row.get("predictions"):
+                # Extraer número final original para filtrar predictions
+                num_match = _TRAILING_NUMBER_RE.search(input.strip())
+                if num_match:
+                    number = num_match.group(0)
+                    filtered = _filter_predictions_containing_number(prefix_row["predictions"], number)
+                    if filtered:
+                        _bump_source_counter("prefix_hit")
+                        logger.info(
+                            f"places_cache_event=prefix_hit query={norm_query[:30]} "
+                            f"prefix={street_prefix[:30]} number={number} matches={len(filtered)}"
+                        )
+                        # Bump prefix entry (sirvió para evitar Google)
+                        try:
+                            asyncio.create_task(asyncio.to_thread(
+                                _places_cache_bump_sync, norm_prefix, prefix_bias,
+                                prefix_row.get("hits") or 0,
+                            ))
+                        except Exception:
+                            pass
+                        return {"status": "OK", "predictions": filtered, "source": "cache_prefix"}
+
+    # STOPS FUZZY LOOKUP (22 may 2026, P1 audit): cuando exact + prefix cache MISS,
+    # buscamos en la tabla `stops` direcciones similares usando pg_trgm + haversine.
+    # Ventaja única Xpedit: drivers REPITEN direcciones de clientes recurrentes.
+    # Con 10.8k direcciones distintas en BD, hit rate fuzzy esperado significativo
+    # para queries recurrentes. Solo si query tiene >=4 chars (evita fuzzy con
+    # input muy corto que matcheraría TODO).
+    if cache_mode == "on" and cache_eligible and len(norm_query) >= 4:
+        try:
+            fuzzy_predictions = await asyncio.to_thread(
+                _stops_fuzzy_lookup_sync, input, lat, lng,
+            )
+        except Exception as e:
+            logger.warning(f"stops fuzzy lookup raised in to_thread: {e}")
+            fuzzy_predictions = []
+        if fuzzy_predictions:
+            _bump_source_counter("stops_fuzzy_hit")
+            logger.info(
+                f"places_cache_event=stops_fuzzy_hit query={norm_query[:30]} "
+                f"matches={len(fuzzy_predictions)} top_sim={fuzzy_predictions[0].get('_xpedit_similarity', 0):.2f}"
+            )
+            return {"status": "OK", "predictions": fuzzy_predictions, "source": "stops_fuzzy"}
 
     if not GOOGLE_API_KEY:
         logger.error("GOOGLE_API_KEY missing — cannot serve /places/autocomplete")
@@ -7532,6 +8125,9 @@ async def places_autocomplete(
     if lat and lng:
         params["location"] = f"{lat},{lng}"
         params["radius"] = "30000"
+    # F1.13: origin para distance_meters → re-orden cliente por proximidad real.
+    if origin_lat is not None and origin_lng is not None:
+        params["origin"] = f"{origin_lat},{origin_lng}"
     cc = (country or "").strip().lower()
     if len(cc) == 2 and cc.isalpha():
         # Safety net: si GPS del driver claramente NO está en `country`
@@ -7585,18 +8181,34 @@ async def places_autocomplete(
                 if not _places_api_healthy:
                     logger.info("Google Places API recovered")
                     _places_api_healthy = True
-                # Cache write (fire-and-forget) — only on OK + non-empty predictions.
-                # Shadow mode logs theoretical hit rate without affecting response.
+                # Cache write (fire-and-forget). Para OK con predictions, cachea
+                # las predictions normales (TTL 30d). Para ZERO_RESULTS, cachea
+                # negativo (predictions=[]) con TTL 1d para evitar typos recurrentes.
+                # Tanto shadow como on escriben — la diferencia es que shadow NO lee.
                 if cache_eligible and status == "OK" and data.get("predictions"):
                     if cache_mode == "shadow" and cache_row:
+                        _bump_source_counter("shadow_would_hit")
                         logger.info(f"places_cache_event=shadow_would_hit query={norm_query[:30]} bias={bias_key}")
                     elif cache_mode == "shadow":
+                        _bump_source_counter("shadow_miss")
                         logger.info(f"places_cache_event=shadow_miss query={norm_query[:30]} bias={bias_key}")
                     else:
+                        _bump_source_counter("miss_write")
                         logger.info(f"places_cache_event=miss_write query={norm_query[:30]} bias={bias_key}")
                     try:
                         asyncio.create_task(asyncio.to_thread(
                             _places_cache_write_sync, norm_query, bias_key, data["predictions"],
+                        ))
+                    except Exception:
+                        pass
+                elif cache_eligible and status == "ZERO_RESULTS" and cache_mode != "shadow":
+                    # Negative cache TTL 24h (vs 30d normal). Direcciones típicamente
+                    # NO desaparecen pero typos pueden corregirse, queremos re-validar antes.
+                    _bump_source_counter("negative_write")
+                    logger.info(f"places_cache_event=negative_write query={norm_query[:30]} bias={bias_key}")
+                    try:
+                        asyncio.create_task(asyncio.to_thread(
+                            _places_cache_write_sync, norm_query, bias_key, [], 1,
                         ))
                     except Exception:
                         pass
@@ -7646,6 +8258,7 @@ async def places_autocomplete(
 async def places_details(
     place_id: str,
     sessiontoken: Optional[str] = None,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user),
 ):
     """Proxy de Google Places Details. Devuelve geometría, componentes de dirección y dirección formateada.
@@ -7653,7 +8266,13 @@ async def places_details(
     `sessiontoken` (opcional) cierra la sesión facturable abierta en
     /places/autocomplete: pasa el MISMO UUID que el cliente generó al abrir
     el input. Si la sesión es válida, Google factura solo este Details
-    (los autocompletes salen gratis)."""
+    (los autocompletes salen gratis).
+
+    Header X-Triggered-By identifica el origen (depot-modal, address-search,
+    stop-detail, msi-edit, etc) para tracking en /admin/api-sources."""
+    # Bumper se ejecuta SIEMPRE — independiente de v1/Legacy — para que el
+    # counter por origen no se rompa al flipear app_config.places_api_version.
+    _bump_api_source("places_details", x_triggered_by, user_id=user.get("id") if user else None)
     # Flag-driven branch (21 may 2026): si app_config.places_api_version='v1',
     # se llama Places API New con field mask Essentials ($5/1000) en vez de
     # Legacy Place Details Basic ($17/1000). Mapper devuelve formato Legacy.
@@ -7698,6 +8317,8 @@ async def places_details(
 async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
     """Reverse geocode via Google to get road-aligned coordinates.
     Used when stops come from Nominatim (which can be 30-40m off from Google's road network)."""
+    # /places/snap usa Google Geocoding API (reverse) → cuenta como geocode.
+    _bump_api_source("geocode", "map-snap", user_id=user.get("id") if user else None)
     params = {
         "latlng": f"{lat},{lng}",
         "language": "es",
@@ -7885,6 +8506,449 @@ _ROUTES_V2_FIELD_MASK = (
 )
 
 
+# === Routes V2 server-side cache (tarea #259, 23 may 2026) ===
+# Cachea respuestas idénticas TTL 10 min para evitar quemar Routes V2 con
+# calls repetidas. Caso real: Victor stuck con bundle pre-#266c hizo ~50
+# resume calls/h con coords casi idénticas. Hit esperado 30-70% según
+# escenario.
+_ROUTES_V2_CACHE_TTL_SEC = 600  # 10 min — limitado porque tráfico cambia
+_ROUTES_V2_CACHE_MAX_SIZE = 500
+_ROUTES_V2_CACHE_COORD_DECIMALS = 4  # ~11 m precision (origin GPS bucket)
+_ROUTES_V2_CACHE_HEADING_BUCKET = 30  # tolerancia ±15° (no cachear cada grado)
+_routes_v2_cache: "_OrderedDict[str, tuple[float, dict]]" = _OrderedDict()
+_routes_v2_cache_hits = 0
+_routes_v2_cache_misses = 0
+
+# Flag memo: evita 100ms RTT a Supabase en cada call. Refresca cada 30s
+# (auditoría code-doctor 23 may 2026 P0: si se llama Supabase en cada
+# request, con 50+ req/h por driver y N drivers saturamos el pool y
+# añadimos latencia gratis).
+_ROUTES_V2_FLAG_TTL_SEC = 30
+_routes_v2_flag_value = True
+_routes_v2_flag_fetched_at = 0.0
+
+
+def _routes_v2_cache_enabled() -> bool:
+    """Feature flag — lee de app_config (memo 30s) para apagar sin redeploy
+    si rompe algo. Default true. Cualquier error → asumir true para no
+    degradar UX."""
+    global _routes_v2_flag_value, _routes_v2_flag_fetched_at
+    now = time.time()
+    if now - _routes_v2_flag_fetched_at < _ROUTES_V2_FLAG_TTL_SEC:
+        return _routes_v2_flag_value
+    try:
+        r = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "routes_v2_cache_enabled")
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            val = (r.data[0].get("value") or "").strip().lower()
+            _routes_v2_flag_value = val not in ("false", "0", "off", "no")
+        else:
+            _routes_v2_flag_value = True
+    except Exception:
+        # Mantener último valor conocido si Supabase falla
+        pass
+    _routes_v2_flag_fetched_at = now
+    return _routes_v2_flag_value
+
+
+def _routes_v2_round_coords(coord_str: str) -> str:
+    """'lat,lng' → redondeado a 4 dec (~11 m). GPS reads cercanos comparten key."""
+    if not coord_str or "," not in coord_str:
+        return coord_str or ""
+    try:
+        lat_str, lng_str = coord_str.split(",", 1)
+        lat = round(float(lat_str.strip()), _ROUTES_V2_CACHE_COORD_DECIMALS)
+        lng = round(float(lng_str.strip()), _ROUTES_V2_CACHE_COORD_DECIMALS)
+        return f"{lat},{lng}"
+    except (ValueError, AttributeError):
+        return coord_str
+
+
+def _routes_v2_cache_key(
+    origin: str,
+    destination: str,
+    waypoints: Optional[str],
+    avoid: Optional[str],
+    heading: Optional[float],
+) -> str:
+    o = _routes_v2_round_coords(origin)
+    d = _routes_v2_round_coords(destination)
+    # Waypoints son típicamente direcciones literales (no coords) → solo
+    # normalizar case/whitespace. Si fueran coords, también las redondeamos
+    # split-aware.
+    wps = ""
+    if waypoints:
+        parts = []
+        for wp in waypoints.split("|"):
+            wp = wp.strip()
+            if wp.startswith("via:"):
+                wp = "via:" + _routes_v2_round_coords(wp[4:])
+            else:
+                wp = _routes_v2_round_coords(wp)
+            parts.append(wp.lower())
+        wps = "|".join(parts)
+    h_bucket = ""
+    if heading is not None:
+        try:
+            b = int(round(float(heading) / _ROUTES_V2_CACHE_HEADING_BUCKET) * _ROUTES_V2_CACHE_HEADING_BUCKET) % 360
+            h_bucket = str(b)
+        except (ValueError, TypeError):
+            pass
+    raw = f"{o}|{d}|{wps}|{(avoid or '').lower()}|{h_bucket}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _routes_v2_cache_get(key: str) -> Optional[dict]:
+    global _routes_v2_cache_hits, _routes_v2_cache_misses
+    entry = _routes_v2_cache.get(key)
+    if not entry:
+        _routes_v2_cache_misses += 1
+        return None
+    ts, value = entry
+    if time.time() - ts > _ROUTES_V2_CACHE_TTL_SEC:
+        # Expirado — borrar best-effort.
+        try:
+            del _routes_v2_cache[key]
+        except KeyError:
+            pass
+        _routes_v2_cache_misses += 1
+        return None
+    _routes_v2_cache.move_to_end(key)  # LRU touch
+    _routes_v2_cache_hits += 1
+    return value
+
+
+def _routes_v2_cache_set(key: str, value: dict) -> None:
+    # Lazy purge: cada vez que añadimos (= después de un miss → Google
+    # call), aprovecha para limpiar entradas expiradas. Sin esto el LRU
+    # eviction solo dispara al llegar a 500, pudiendo tener 499 entradas
+    # basura ocupando RAM (auditoría code-doctor 23 may P2 #9).
+    now = time.time()
+    expired = [k for k, (ts, _) in _routes_v2_cache.items() if now - ts > _ROUTES_V2_CACHE_TTL_SEC]
+    for k in expired:
+        try:
+            del _routes_v2_cache[k]
+        except KeyError:
+            pass
+    _routes_v2_cache[key] = (now, value)
+    _routes_v2_cache.move_to_end(key)
+    while len(_routes_v2_cache) > _ROUTES_V2_CACHE_MAX_SIZE:
+        _routes_v2_cache.popitem(last=False)
+
+
+# Counter in-memory de X-Triggered-By por endpoint+source.
+# 23 may 2026: expandido a múltiples endpoints (/places/directions, /places/details,
+# /geocode) para visión 360° del gasto Google por función cliente.
+# Se resetea en cada cold-start del backend (in-memory). Persistido a Supabase
+# para sobrevivir restarts Railway.
+# Estructura: { endpoint: { source: count } }
+_api_source_counters: dict[str, dict[str, int]] = {}
+_api_counters_started_at: float = time.time()
+
+# Compat back: alias para el contador Routes V2 (otras partes del código aún lo leen)
+_routes_v2_source_counters = _api_source_counters.setdefault("places_directions", {})
+_routes_v2_counters_started_at = _api_counters_started_at
+
+
+def _bump_api_source(endpoint: str, source: str, user_id: Optional[str] = None) -> None:
+    """Incrementa counter del origen de una call API. `endpoint` debe ser el
+    slug corto del endpoint (sin /, sin guiones, sin parámetros), p.ej.
+    'places_directions', 'places_details', 'geocode'. `source` viene del
+    header X-Triggered-By. `user_id` opcional = auth.users.id (NO drivers.id)
+    para tracking top spenders. La tabla `api_source_driver_daily` se une con
+    drivers via drivers.user_id en las queries de alertas (ver
+    [[feedback_auth_user_id_vs_driver_id]] — error común histórico)."""
+    endpoint_key = (endpoint or "unknown").strip().lower()[:48]
+    source_key = (source or "unknown").strip().lower()[:48]
+    bucket = _api_source_counters.setdefault(endpoint_key, {})
+    bucket[source_key] = bucket.get(source_key, 0) + 1
+    try:
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        asyncio.create_task(asyncio.to_thread(
+            _api_source_persist_sync, endpoint_key, today_iso, source_key,
+        ))
+        # User-aware persist (alertas top spender). Solo si tenemos user_id
+        # válido — auth puede no llegar en algunos paths legítimos (CORS
+        # preflight). UUID validation evita corrupción.
+        if user_id and isinstance(user_id, str) and len(user_id) == 36:
+            asyncio.create_task(asyncio.to_thread(
+                _api_source_user_persist_sync, endpoint_key, today_iso, source_key, user_id,
+            ))
+    except Exception:
+        pass  # nunca romper el endpoint por la métrica
+
+
+def _bump_routes_v2_source(source: str, user_id: Optional[str] = None) -> None:
+    """Compat alias para llamadores existentes (/places/directions)."""
+    _bump_api_source("places_directions", source, user_id)
+
+
+def _api_source_user_persist_sync(endpoint: str, date_iso: str, source: str, user_id: str) -> None:
+    """+1 atómico en api_source_driver_daily vía RPC `atomic_bump_api_source_user`.
+    La columna se llama `user_id` desde 23 may 2026 (antes mal-nombrada driver_id
+    pese a recibir siempre auth.users.id).
+    Bug previo (23 may 19:00 CEST): el read-then-write Python perdía counts en
+    paralelo — dos asyncio tasks leían `count=N` simultáneamente y ambas
+    escribían `N+1` cuando deberían `N+1` y `N+2`. Resultado: 53% de calls
+    sin atribuir a usuario aunque la BD agregada sí los contaba. Fix vía
+    RPC Postgres con `INSERT ... ON CONFLICT DO UPDATE SET count = count + 1`
+    (atómico server-side, sin race)."""
+    try:
+        supabase.rpc("atomic_bump_api_source_user", {
+            "p_endpoint": endpoint,
+            "p_date": date_iso,
+            "p_source": source,
+            "p_user_id": user_id,
+        }).execute()
+    except Exception as e:
+        logger.info(f"api_source_driver_daily bump RPC failed: {e}")
+        sentry_sdk.capture_exception(e)
+
+
+def _api_source_persist_sync(endpoint: str, date_iso: str, source: str) -> None:
+    """+1 atómico en api_source_daily vía RPC `atomic_bump_api_source`.
+    Bug previo (23 may 19:00 CEST): read-then-write Python perdía counts en
+    paralelo. Fix vía RPC con `INSERT ... ON CONFLICT DO UPDATE SET count = count + 1`."""
+    try:
+        supabase.rpc("atomic_bump_api_source", {
+            "p_endpoint": endpoint,
+            "p_date": date_iso,
+            "p_source": source,
+        }).execute()
+    except Exception as e:
+        logger.warning(f"api_source bump RPC failed for {endpoint}: {e}")
+        sentry_sdk.capture_exception(e)
+
+
+# ====================================================================
+# COST ALERTS — vigilancia automática regresiones tipo bug #266 (€1.6-4k/mes leak)
+# 23 may 2026. Cron hora en punto +5min. Anti-spam 4h por alert_key.
+# Email a HEALTH_DIGEST_RECIPIENTS (mismo set que health digest existente).
+# Umbrales conservadores basados en baseline pre-fixes (€271/mes histórico).
+# ====================================================================
+
+_COST_ALERT_RECIPIENT = "direccion@taespack.com"
+_COST_ALERT_ANTISPAM_HOURS = 4
+
+# Precios EUR/call: usa la constante _PRICE_PER_CALL_EUR_BY_ENDPOINT ya
+# definida más abajo en el módulo (línea ~9759, blended Routes V2 + USD/EUR).
+# Se resuelve en runtime cuando check_cost_alerts() se invoca.
+
+# Umbrales (Miguel confirmó "OK los 4 tal cual" 23 may 14:25 CEST).
+_COST_ALERT_THRESHOLDS = {
+    "routes_v2_eur_day": {"amber": 15.0, "red": 25.0},
+    "source_calls_hour": {"amber": 30, "red": 80},
+    "unknown_calls_day": {"amber": 20, "red": 50},
+    "driver_eur_day": {"amber": 5.0, "red": 10.0},
+}
+
+
+def _cost_alert_already_sent_recently(alert_key: str) -> bool:
+    """True si el mismo alert_key se envió hace <_COST_ALERT_ANTISPAM_HOURS.
+    Evita spam cuando un umbral se mantiene disparado durante varias horas."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=_COST_ALERT_ANTISPAM_HOURS)).isoformat()
+        result = (
+            supabase.table("cost_alerts_sent")
+            .select("last_sent_at")
+            .eq("alert_key", alert_key)
+            .gte("last_sent_at", cutoff)
+            .limit(1).execute()
+        )
+        return bool(result.data)
+    except Exception as e:
+        logger.warning(f"cost_alert_already_sent check failed: {e}")
+        return False  # Fail-open: prefiero email duplicado a perder alerta real
+
+
+def _record_cost_alert_sent(alert_key: str, level: str, payload: dict) -> None:
+    """Marca el alert_key como enviado ahora. Upsert idempotente."""
+    try:
+        supabase.table("cost_alerts_sent").upsert({
+            "alert_key": alert_key,
+            "last_sent_at": datetime.now(timezone.utc).isoformat(),
+            "level": level,
+            "payload": payload,
+        }, on_conflict="alert_key").execute()
+    except Exception as e:
+        logger.warning(f"record_cost_alert_sent failed: {e}")
+
+
+def _fire_cost_alert(metric: str, level: str, title: str, body_html: str, payload: dict) -> None:
+    """Envia email + marca anti-spam. alert_key = metric:date:level."""
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    alert_key = f"{metric}:{today_iso}:{level}"
+    if _cost_alert_already_sent_recently(alert_key):
+        logger.info(f"cost_alert anti-spam skip: {alert_key}")
+        return
+    try:
+        send_alert_email(_COST_ALERT_RECIPIENT, title, body_html)
+        _record_cost_alert_sent(alert_key, level, payload)
+        logger.info(f"cost_alert sent: {alert_key}")
+    except Exception as e:
+        logger.error(f"cost_alert send failed: {e}")
+        sentry_sdk.capture_exception(e)
+
+
+def check_cost_alerts() -> dict:
+    """Cron job HH:05. 4 umbrales, ver _COST_ALERT_THRESHOLDS.
+    1. Routes V2 €/día total (suma api_source_daily places_directions)
+    2. Source individual calls/hora (cualquier endpoint, ventana 60min)
+    3. unknown calls/día (suma todos endpoints donde source='unknown')
+    4. Driver individual €/día (suma api_source_driver_daily ponderado por precio)
+    Devuelve dict con alarmas disparadas, para debugging/tests."""
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    fired: list[dict] = []
+
+    try:
+        # 1) Routes V2 €/día total
+        rows = (
+            supabase.table("api_source_daily")
+            .select("count")
+            .eq("endpoint", "places_directions").eq("date", today_iso)
+            .execute()
+        ).data or []
+        total_calls = sum(int(r.get("count") or 0) for r in rows)
+        eur_today = total_calls * _PRICE_PER_CALL_EUR_BY_ENDPOINT["places_directions"]
+        th = _COST_ALERT_THRESHOLDS["routes_v2_eur_day"]
+        if eur_today >= th["red"]:
+            level, threshold = "red", th["red"]
+        elif eur_today >= th["amber"]:
+            level, threshold = "amber", th["amber"]
+        else:
+            level, threshold = None, None
+        if level:
+            title = f"[Xpedit] Costs ALERT {level.upper()}: Routes V2 hoy {eur_today:.2f}€ > {threshold}€"
+            body = f"Total Routes V2 calls hoy: {total_calls}. Coste estimado {eur_today:.2f}€. Umbral {level} {threshold}€. Revisa /admin/costs."
+            payload = {"metric": "routes_v2_eur_day", "value": eur_today, "calls": total_calls}
+            _fire_cost_alert("routes_v2_eur_day", level, title, body, payload)
+            fired.append(payload | {"level": level})
+
+        # 2) Source individual calls/hora (últimos 60 min, in-memory counter)
+        for endpoint_key, source_map in _api_source_counters.items():
+            for source_key, count in source_map.items():
+                # Solo cuenta la última hora — usamos un proxy: tomar el delta
+                # del counter in-memory (resetea en boot Railway). Conservador:
+                # cuando uptime <1h, count ya refleja <1h de tráfico.
+                uptime_min = (time.time() - _api_counters_started_at) / 60
+                if uptime_min < 60:
+                    calls_in_hour = count  # in-memory cubre <1h
+                else:
+                    # Después de >1h uptime, no podemos extraer "última hora"
+                    # del counter in-memory acumulado. Skip — el cron diario
+                    # captura via routes_v2_eur_day total.
+                    continue
+                th = _COST_ALERT_THRESHOLDS["source_calls_hour"]
+                if calls_in_hour >= th["red"]:
+                    level, threshold = "red", th["red"]
+                elif calls_in_hour >= th["amber"]:
+                    level, threshold = "amber", th["amber"]
+                else:
+                    level, threshold = None, None
+                if level:
+                    metric_key = f"source_{endpoint_key}_{source_key}"
+                    title = f"[Xpedit] Costs ALERT {level.upper()}: {endpoint_key}/{source_key} {calls_in_hour}/h > {threshold}/h"
+                    body = (
+                        f"Endpoint {endpoint_key}, source '{source_key}' lleva {calls_in_hour} calls en menos de 1h. "
+                        f"Umbral {level} {threshold}/h. Posible regresión tipo bug #266 — revisa /admin/costs."
+                    )
+                    payload = {"metric": metric_key, "value": calls_in_hour, "endpoint": endpoint_key, "source": source_key}
+                    _fire_cost_alert(metric_key, level, title, body, payload)
+                    fired.append(payload | {"level": level})
+
+        # 3) Unknown calls/día (cualquier endpoint)
+        rows = (
+            supabase.table("api_source_daily")
+            .select("endpoint, count")
+            .eq("source", "unknown").eq("date", today_iso)
+            .execute()
+        ).data or []
+        for r in rows:
+            unknown_count = int(r.get("count") or 0)
+            endpoint_key = r.get("endpoint", "?")
+            th = _COST_ALERT_THRESHOLDS["unknown_calls_day"]
+            if unknown_count >= th["red"]:
+                level, threshold = "red", th["red"]
+            elif unknown_count >= th["amber"]:
+                level, threshold = "amber", th["amber"]
+            else:
+                continue
+            metric_key = f"unknown_{endpoint_key}"
+            title = f"[Xpedit] Costs ALERT {level.upper()}: {endpoint_key}/unknown {unknown_count}/d > {threshold}/d"
+            body = (
+                f"Endpoint {endpoint_key} acumula {unknown_count} calls hoy SIN tag X-Triggered-By. "
+                f"Umbral {level} {threshold}/d. Probable callsite nuevo sin etiquetar o app vieja sin OTA del counter."
+            )
+            payload = {"metric": metric_key, "value": unknown_count, "endpoint": endpoint_key}
+            _fire_cost_alert(metric_key, level, title, body, payload)
+            fired.append(payload | {"level": level})
+
+        # 4) User individual €/día (api_source_driver_daily.user_id = auth.users.id).
+        # Para los emails resolvemos driver.email/name vía JOIN, así Miguel
+        # ve "Victor Tique 9,30€" en vez de un UUID opaco.
+        rows = (
+            supabase.table("api_source_driver_daily")
+            .select("user_id, endpoint, count")
+            .eq("date", today_iso)
+            .execute()
+        ).data or []
+        per_user_eur: dict = {}
+        for r in rows:
+            user_id = r.get("user_id")
+            if not user_id:
+                continue
+            endpoint_key = r.get("endpoint", "")
+            price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint_key, 0.005)
+            per_user_eur[user_id] = per_user_eur.get(user_id, 0.0) + int(r.get("count") or 0) * price
+        th = _COST_ALERT_THRESHOLDS["driver_eur_day"]
+        # Resolve names para los user_id que disparen alarma (una sola query batch)
+        flagged_user_ids = [uid for uid, eur in per_user_eur.items() if eur >= th["amber"]]
+        user_to_driver: dict = {}
+        if flagged_user_ids:
+            try:
+                drs = (
+                    supabase.table("drivers")
+                    .select("id, user_id, email, name")
+                    .in_("user_id", flagged_user_ids)
+                    .execute()
+                ).data or []
+                user_to_driver = {d["user_id"]: d for d in drs if d.get("user_id")}
+            except Exception as e:
+                logger.warning(f"cost_alerts: failed to resolve driver names: {e}")
+        for user_id, eur in per_user_eur.items():
+            if eur >= th["red"]:
+                level, threshold = "red", th["red"]
+            elif eur >= th["amber"]:
+                level, threshold = "amber", th["amber"]
+            else:
+                continue
+            drv = user_to_driver.get(user_id)
+            label = (drv.get("name") or drv.get("email") or user_id[:8]) if drv else user_id[:8]
+            driver_id = drv.get("id") if drv else None
+            metric_key = f"driver_eur_{user_id}"
+            title = f"[Xpedit] Costs ALERT {level.upper()}: {label} hoy {eur:.2f}€ > {threshold}€"
+            body = (
+                f"User {label} ({user_id}) acumula {eur:.2f}€ de coste Google hoy. "
+                f"Umbral {level} {threshold}€. Posible bug en cliente específico, fraude o uso anormal. "
+                f"Revisa /admin/users/{driver_id or user_id}."
+            )
+            payload = {"metric": metric_key, "value": eur, "user_id": user_id, "driver_id": driver_id, "label": label}
+            _fire_cost_alert(metric_key, level, title, body, payload)
+            fired.append(payload | {"level": level})
+
+    except Exception as e:
+        logger.error(f"check_cost_alerts failed: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+
+    return {"fired": fired, "fired_count": len(fired)}
+
+
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
     origin: str,
@@ -7892,6 +8956,7 @@ async def places_directions(
     waypoints: Optional[str] = None,
     avoid: Optional[str] = None,
     heading: Optional[float] = None,
+    x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user)
 ):
     """Calcula la ruta entre origin/destination con waypoints opcionales.
@@ -7903,7 +8968,28 @@ async def places_directions(
 
     Si `heading` (0-360) viene, inserta un waypoint ~50 m delante del coche
     en esa dirección. Así el rerouting no propone giros bruscos hacia atrás.
+
+    El header X-Triggered-By identifica la función cliente que disparó la call
+    (optimize, start-nav, recalc, load-route, cold-start, etc) para que el
+    admin pueda detectar fugas (ver /admin/routes/calls-by-source).
+
+    23 may 2026 (tarea #259): cache server-side TTL 10 min para evitar quemar
+    Routes V2 con calls repetidas (Victor stuck con bundle pre-#266c hace
+    ~50 resume/h con coords casi idénticas). Coords redondeadas a 4 dec
+    (~11 m) para aumentar hit rate. Cache HIT NO llama a Google → no contamina
+    counter `places_directions` (separado en `places_directions_cache/hit`).
     """
+    user_id = user.get("id") if user else None
+    cache_key = _routes_v2_cache_key(origin, destination, waypoints, avoid, heading)
+    cached = _routes_v2_cache_get(cache_key) if _routes_v2_cache_enabled() else None
+    if cached is not None:
+        # Cache HIT — no llamamos a Google. Bumpeamos counter separado por
+        # source para visibilidad de QUÉ fuente cachea más (resume vs
+        # optimize vs cold-start). NO `places_directions` porque ése es solo
+        # calls reales a Google (lo que se factura).
+        _bump_api_source("places_directions_cache", x_triggered_by or "unknown", user_id=user_id)
+        return cached
+    _bump_routes_v2_source(x_triggered_by, user_id=user_id)
     intermediates: list[dict] = []
     if heading is not None and "," in origin:
         try:
@@ -7986,7 +9072,13 @@ async def places_directions(
                 if attempt == 0:
                     continue
                 raise HTTPException(status_code=502, detail=f"Routes API 5xx after retry: {last_error}")
-            return _routes_v2_to_directions_shape(resp.json())
+            shaped = _routes_v2_to_directions_shape(resp.json())
+            # Solo cacheamos responses OK con routes válidas para no servir
+            # luego un error reutilizado. Si shape se queda vacío (sin routes)
+            # tampoco cachea — esa call habría que hacerla otra vez.
+            if shaped.get("status") == "OK" and shaped.get("routes"):
+                _routes_v2_cache_set(cache_key, shaped)
+            return shaped
         except HTTPException:
             raise
         except Exception as e:
@@ -8372,6 +9464,229 @@ async def admin_costs_live(
     }
 
 
+@app.get("/admin/costs/sustainability", tags=["admin", "costs"], summary="Unit economics: €/paying, €/driver activo, €/stop, free tier ETA")
+async def admin_costs_sustainability(user=Depends(require_admin)):
+    """KPIs de sostenibilidad de costes API (22 may 2026 audit dashboard).
+
+    Devuelve:
+    - cost_per_paying_daily_eur: € totales 24h / paying real → unit economics
+    - cost_per_active_driver_daily_eur: € 24h / drivers con actividad hoy
+    - cost_per_stop_eur: € 24h / stops creadas hoy
+    - free_tier: % consumido del crédito $200/mes Google Maps + ETA día agotamiento
+    - weekly_comparison: total esta semana vs anterior + % delta
+    """
+    USD_TO_EUR = 0.92
+    FREE_TIER_USD = 200.0
+
+    now = datetime.now(timezone.utc)
+    today_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Coste 24h NETO (post free tier)
+    costs_24h = await _gather_live_costs(
+        (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        today_iso,
+    )
+    eur_24h_neto = float(costs_24h.get("_total_cost_usd") or 0) * USD_TO_EUR
+
+    # Coste mes (consumido del free tier — Google Maps gross only)
+    # Suma de daily_api_metrics desde día 1 del mes para servicios que cuentan
+    # contra free tier (Maps Platform: Places, Routes, Geocoding, Snap, etc.)
+    try:
+        month_rows = (
+            supabase.table("daily_api_metrics")
+            .select("date,service,est_cost_usd")
+            .gte("date", month_start.date().isoformat())
+            .execute()
+        ).data or []
+    except Exception:
+        month_rows = []
+
+    # Free tier aplica solo a APIs Google Maps (no Vertex, no Resend, etc.)
+    GMAPS_SERVICES = {"places", "routes", "geocoding", "snap", "directions", "distance_matrix"}
+    month_consumed_usd = sum(
+        float(r.get("est_cost_usd") or 0)
+        for r in month_rows
+        if (r.get("service") or "").lower() in GMAPS_SERVICES
+    )
+    days_in_month = (now.replace(month=now.month % 12 + 1, day=1) - timedelta(days=1)).day if now.month < 12 else 31
+    day_of_month = now.day
+    days_elapsed = max(day_of_month, 1)
+    daily_avg_usd = month_consumed_usd / days_elapsed if days_elapsed else 0
+    days_until_free_tier_exhausted = (
+        int((FREE_TIER_USD - month_consumed_usd) / daily_avg_usd) + day_of_month
+        if daily_avg_usd > 0 else 999
+    )
+    pct_consumed = (month_consumed_usd / FREE_TIER_USD * 100) if FREE_TIER_USD else 0
+
+    # Paying count + activos + stops creadas hoy (todo en paralelo con asyncio.to_thread)
+    async def _paying_count():
+        # NOTA: usamos .in_() con lista explícita (no .not_.is_(...,'null') + head=True
+        # porque en postgrest-py head=True no siempre devuelve count fiable).
+        # Source canónico paying = subscription_source IN ('stripe','revenuecat').
+        try:
+            r = await asyncio.to_thread(
+                lambda: supabase.table("drivers")
+                .select("id", count="exact")
+                .in_("subscription_source", ["stripe", "revenuecat"])
+                .limit(1)
+                .execute()
+            )
+            cnt = getattr(r, "count", None)
+            if cnt is None:
+                cnt = len(r.data or [])
+            return int(cnt or 0)
+        except Exception:
+            return 0
+
+    async def _active_drivers_today():
+        try:
+            # CEST midnight
+            cest_offset = 2
+            today_cest_start = (now - timedelta(hours=cest_offset)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(hours=cest_offset)
+            r = await asyncio.to_thread(
+                lambda: supabase.table("location_history")
+                .select("driver_id")
+                .gte("recorded_at", today_cest_start.isoformat())
+                .limit(10000)
+                .execute()
+            )
+            return len({row["driver_id"] for row in (r.data or []) if row.get("driver_id")})
+        except Exception:
+            return 0
+
+    async def _stops_created_today():
+        # CEST midnight, no UTC — usuario quiere "hoy" en su zona horaria.
+        # NOTA: sin head=True por el mismo motivo que _paying_count.
+        try:
+            cest_offset = 2
+            today_cest_start = (now - timedelta(hours=cest_offset)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(hours=cest_offset)
+            r = await asyncio.to_thread(
+                lambda: supabase.table("stops")
+                .select("id", count="exact")
+                .gte("created_at", today_cest_start.isoformat())
+                .is_("deleted_at", "null")
+                .limit(1)
+                .execute()
+            )
+            cnt = getattr(r, "count", None)
+            return int(cnt or 0)
+        except Exception:
+            return 0
+
+    async def _stops_created_last_24h():
+        # 23 may 2026: para calcular cost_per_stop usamos misma ventana
+        # que `eur_24h_neto` (últimas 24h reales). Antes dividíamos por
+        # `stops_today` (día calendario CEST) → ratio inflado en weekend
+        # cuando hay pocos stops pero coste arrastra ayer. Miguel detectó
+        # €0.57/stop sábado mañana = artefacto del mismatch de ventanas.
+        try:
+            since = (now - timedelta(hours=24)).isoformat()
+            r = await asyncio.to_thread(
+                lambda: supabase.table("stops")
+                .select("id", count="exact")
+                .gte("created_at", since)
+                .is_("deleted_at", "null")
+                .limit(1)
+                .execute()
+            )
+            cnt = getattr(r, "count", None)
+            return int(cnt or 0)
+        except Exception:
+            return 0
+
+    paying, active_drivers, stops_today, stops_24h = await asyncio.gather(
+        _paying_count(), _active_drivers_today(), _stops_created_today(), _stops_created_last_24h()
+    )
+
+    cost_per_paying = (eur_24h_neto / paying) if paying else 0
+    cost_per_driver = (eur_24h_neto / active_drivers) if active_drivers else 0
+    # Misma ventana 24h para numerador y denominador (antes mezclaba)
+    cost_per_stop = (eur_24h_neto / stops_24h) if stops_24h else 0
+
+    # Comparativa semanal: ISO weeks current vs previous
+    try:
+        cutoff_2w = (now - timedelta(days=14)).date().isoformat()
+        history = (
+            supabase.table("daily_api_metrics")
+            .select("date,est_cost_usd")
+            .gte("date", cutoff_2w)
+            .execute()
+        ).data or []
+        # Agrupar por semana ISO
+        from collections import defaultdict
+        by_week: dict = defaultdict(float)
+        for row in history:
+            d = datetime.fromisoformat(row["date"]).date() if isinstance(row["date"], str) else row["date"]
+            iso_year, iso_week, _ = d.isocalendar()
+            by_week[(iso_year, iso_week)] += float(row.get("est_cost_usd") or 0)
+        current_y, current_w, _ = now.date().isocalendar()
+        prev_date = (now - timedelta(days=7)).date()
+        prev_y, prev_w, _ = prev_date.isocalendar()
+        current_week_usd = by_week.get((current_y, current_w), 0)
+        prev_week_usd = by_week.get((prev_y, prev_w), 0)
+        delta_pct = (
+            (current_week_usd - prev_week_usd) / prev_week_usd * 100
+            if prev_week_usd > 0 else 0
+        )
+    except Exception:
+        current_week_usd = 0
+        prev_week_usd = 0
+        delta_pct = 0
+
+    return {
+        "ok": True,
+        "fetched_at": now.isoformat(),
+        "kpis": {
+            "cost_per_paying_daily_eur": round(cost_per_paying, 4),
+            "cost_per_active_driver_daily_eur": round(cost_per_driver, 4),
+            "cost_per_stop_eur": round(cost_per_stop, 5),
+            "paying_count": paying,
+            "active_drivers_today": active_drivers,
+            "stops_created_today": stops_today,
+            "stops_created_last_24h": stops_24h,
+            "eur_24h_neto": round(eur_24h_neto, 2),
+        },
+        # 23 may 2026: free_tier $200/mes RETIRADO — modelo obsoleto desde
+        # marzo 2025. Google ahora aplica free tier POR SKU (Essentials 10k,
+        # Pro 5k, Enterprise 1k calls/mes/SKU). El cálculo viejo daba falsa
+        # tranquilidad ("aún tienes 41% libre") cuando en realidad ya
+        # pagábamos cada call extra sobre cada SKU individual.
+        # Sustituido por métrica útil: € hoy real + proyección fin mes +
+        # alerta umbral diario. Reemplaza la pregunta "¿agotaré crédito?"
+        # (sin sentido hoy) por "¿bill se está disparando?".
+        "month_actual": {
+            "consumed_eur": round(month_consumed_usd * USD_TO_EUR, 2),
+            "day_of_month": day_of_month,
+            "days_in_month": days_in_month,
+            "daily_avg_eur": round(daily_avg_usd * USD_TO_EUR, 2),
+            "projected_month_eur": round(daily_avg_usd * days_in_month * USD_TO_EUR, 2),
+        },
+        "daily_alert": {
+            # Umbral suave: media 30d × 1.5. Si día actual supera → 🟡
+            # Umbral duro: media 30d × 2.0. Si supera → 🔴
+            "soft_threshold_eur": round(daily_avg_usd * 1.5 * USD_TO_EUR, 2),
+            "hard_threshold_eur": round(daily_avg_usd * 2.0 * USD_TO_EUR, 2),
+            "today_actual_eur": round(eur_24h_neto, 2),
+            "level": (
+                "red" if eur_24h_neto > (daily_avg_usd * 2.0 * USD_TO_EUR)
+                else "amber" if eur_24h_neto > (daily_avg_usd * 1.5 * USD_TO_EUR)
+                else "green"
+            ),
+        },
+        "weekly": {
+            "current_week_eur": round(current_week_usd * USD_TO_EUR, 2),
+            "prev_week_eur": round(prev_week_usd * USD_TO_EUR, 2),
+            "delta_pct": round(delta_pct, 1),
+        },
+    }
+
+
 @app.get("/admin/costs/history", tags=["admin", "costs"], summary="Histórico snapshots diarios (daily_api_metrics)")
 async def admin_costs_history(
     days: int = 30,
@@ -8394,6 +9709,665 @@ async def admin_costs_history(
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail=f"history failed: {e}")
+
+
+@app.get("/admin/diag/smoke", tags=["admin", "diag"], summary="Smoke test on-demand: Supabase + Google + JWT + httpx config")
+async def admin_diag_smoke(user=Depends(require_admin)):
+    """Healthcheck profundo on-demand para validar que el backend tiene todas
+    sus dependencias OK.
+
+    Añadido 22 may 2026 tras incidente 1h con bug httpx HTTP/1.1 que rompió
+    TODO Supabase silenciosamente (50+ events, ventana 14:42→15:55 CEST).
+    El startup hook _startup_smoke_test corre solo al boot — este endpoint
+    deja al admin verificarlo MANUAL después de cualquier deploy/cambio.
+
+    Returns 200 con detalles si todo OK, 500 si alguna check falla."""
+    checks: dict = {}
+
+    # 1. Supabase real query
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("app_config").select("key").limit(1).execute()
+        )
+        checks["supabase_query"] = {"ok": isinstance(result.data, list), "rows": len(result.data or [])}
+    except Exception as e:
+        checks["supabase_query"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 2. postgrest session base_url
+    try:
+        session = supabase.postgrest.session
+        base_url = str(session.base_url)
+        checks["postgrest_base_url"] = {
+            "ok": base_url.startswith(("http://", "https://")),
+            "value": base_url,
+        }
+    except Exception as e:
+        checks["postgrest_base_url"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 3. Env vars críticas
+    checks["env"] = {
+        "GOOGLE_API_KEY": bool(GOOGLE_API_KEY),
+        "SUPABASE_JWT_SECRET": bool(SUPABASE_JWT_SECRET),
+        "SUPABASE_URL": bool(os.getenv("SUPABASE_URL")),
+        "SUPABASE_SERVICE_KEY": bool(SUPABASE_SERVICE_KEY),
+    }
+    checks["env"]["ok"] = all(v for k, v in checks["env"].items() if k != "ok")
+
+    # 4. Google Places ping (HEAD a la API endpoint, no real query)
+    try:
+        client = google_maps_client()
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+            params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
+            timeout=5.0,
+        )
+        gdata = resp.json() if resp.status_code == 200 else {}
+        # Google devuelve status OK o REQUEST_DENIED (key invalida)
+        checks["google_places"] = {
+            "ok": gdata.get("status") in ("OK", "ZERO_RESULTS"),
+            "google_status": gdata.get("status"),
+        }
+    except Exception as e:
+        checks["google_places"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 5. Startup smoke result (referencia histórica)
+    checks["startup_smoke"] = {
+        "passed": _startup_smoke_ok,
+        "failures_at_boot": _startup_smoke_failures,
+    }
+
+    # Veredicto global
+    all_ok = (
+        checks["supabase_query"].get("ok", False)
+        and checks["postgrest_base_url"].get("ok", False)
+        and checks["env"].get("ok", False)
+        and checks["google_places"].get("ok", False)
+    )
+    from fastapi.responses import JSONResponse as _DiagJSONResponse
+    status_code = 200 if all_ok else 500
+    return _DiagJSONResponse(
+        status_code=status_code,
+        content={"ok": all_ok, "checks": checks, "timestamp": datetime.now(timezone.utc).isoformat()},
+    )
+
+
+@app.get("/admin/cache/places-stats", tags=["admin", "costs"], summary="Stats cache Places Autocomplete")
+async def admin_cache_places_stats(user=Depends(require_admin)):
+    """Devuelve estado del cache `places_autocomplete_cache`: tamaño, hits, hit
+    rate estimado y ahorro USD. Útil para decidir cuándo activar cache mode
+    de off → shadow → on."""
+    try:
+        # Read flag actual del cache
+        flag_row = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "places_cache_mode")
+            .limit(1)
+            .execute()
+        )
+        cache_mode = (flag_row.data[0]["value"] if flag_row.data else "off") or "off"
+
+        # Pricing real: cada cache HIT evita 1 autocomplete + 1 Place Details
+        # (sesión Google completa). Autocomplete Legacy $0.00283 + Details $0.017
+        # = $0.02 ahorrado por HIT real. Si solo autocomplete = $0.00283.
+        # Nota Miguel 22 may 17:35: hits totales INFLA porque incluye el +1
+        # inicial de cada entry creada (NO es uso real, es la creación). El
+        # "ahorro real" es SUM(hits - 1) descontando esa creación.
+        PRICE_AUTOCOMPLETE = 0.00283
+        PRICE_DETAILS = 0.017
+        PRICE_PER_HIT_REAL = PRICE_AUTOCOMPLETE + PRICE_DETAILS  # $0.02 / hit real
+        price_per_call = PRICE_AUTOCOMPLETE  # back-compat para campos legacy
+        now_iso = datetime.now(timezone.utc)
+        seven_days_ago_iso = (now_iso - timedelta(days=7)).isoformat()
+
+        # PAGINACIÓN: PostgREST Supabase Cloud cap a 1000 rows por request
+        # (feedback_supabase_pagination_cap). Cache tiene >1000 entries tras
+        # backfill (22 may, 1.6k+ queries) → iteramos páginas hasta agotar.
+        rows = []
+        page = 0
+        page_size = 1000
+        while True:
+            chunk = (
+                supabase.table("places_autocomplete_cache")
+                .select("hits, created_at, last_used_at, expires_at")
+                .range(page * page_size, (page + 1) * page_size - 1)
+                .execute()
+            )
+            if not chunk.data:
+                break
+            rows.extend(chunk.data)
+            if len(chunk.data) < page_size:
+                break
+            page += 1
+            if page > 20:  # safety cap 20k entries (no debería pasar nunca)
+                break
+
+        total_entries = len(rows)
+        total_hits = sum(int(r.get("hits") or 0) for r in rows)
+        # AHORRO REAL: cada entry empieza con hits=1 (CREACIÓN, no es ahorro).
+        # El ahorro real son los USOS posteriores: max(hits-1, 0) por entry.
+        # Negative entries (hits=0) no aportan; entries solo-creadas (hits=1)
+        # aportan 0 al ahorro real.
+        real_hits_total = sum(max(int(r.get("hits") or 0) - 1, 0) for r in rows)
+        entries_reused = sum(1 for r in rows if int(r.get("hits") or 0) >= 2)
+        entries_only_created = sum(1 for r in rows if int(r.get("hits") or 0) == 1)
+        active_entries = sum(1 for r in rows if r.get("expires_at") and datetime.fromisoformat(r["expires_at"].replace("Z", "+00:00")) > now_iso)
+        seven_days_ago = now_iso - timedelta(days=7)
+        entries_7d = sum(1 for r in rows if r.get("created_at") and datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")) >= seven_days_ago)
+        # hits_7d INFLADO (back-compat) = sum hits de entries usadas en últimos 7d
+        hits_7d = sum(int(r.get("hits") or 0) for r in rows if r.get("last_used_at") and datetime.fromisoformat(r["last_used_at"].replace("Z", "+00:00")) >= seven_days_ago)
+        # real_hits_7d = SUM(hits-1) solo entries activas últimos 7d.
+        # Aproximación: si la entry fue usada en últimos 7d Y hits>=2, su hits-1
+        # son TODOS los usos post-creación (no podemos saber cuándo ocurrieron
+        # sin tabla de eventos, pero como están vivas y reusadas, son del periodo).
+        real_hits_7d = sum(
+            max(int(r.get("hits") or 0) - 1, 0)
+            for r in rows
+            if r.get("last_used_at")
+            and datetime.fromisoformat(r["last_used_at"].replace("Z", "+00:00")) >= seven_days_ago
+        )
+
+        # Top 10 queries por hits (segunda query, ordenada)
+        top_q = (
+            supabase.table("places_autocomplete_cache")
+            .select("query_normalized, hits, bias_geohash5, last_used_at")
+            .order("hits", desc=True)
+            .limit(10)
+            .execute()
+        )
+
+        # Métricas in-memory por source (desde último cold-start del backend)
+        counters_uptime_min = round((time.time() - _places_counters_started_at) / 60, 1)
+        total_lookups = sum(_places_source_counters.values()) or 1  # avoid div by 0
+        free_hits = (
+            _places_source_counters["hit"]
+            + _places_source_counters["prefix_hit"]
+            + _places_source_counters["stops_fuzzy_hit"]
+            + _places_source_counters["negative_hit"]
+        )
+        hit_rate_pct = round(free_hits / total_lookups * 100, 1)
+        # Real-time savings (since last cold-start)
+        rt_savings_usd = round(free_hits * price_per_call, 4)
+
+        return {
+            "ok": True,
+            "cache_mode": cache_mode,  # off | shadow | on
+            "total_entries": total_entries,
+            "active_entries": active_entries,
+            "total_hits": total_hits,  # INFLADO (back-compat) — incluye hits=1 iniciales
+            "entries_added_7d": entries_7d,
+            "hits_7d": hits_7d,  # INFLADO (back-compat)
+            # Métricas legacy (mantenidas para no romper UI antigua)
+            "savings_total_usd": round(total_hits * price_per_call, 4),
+            "savings_7d_usd": round(hits_7d * price_per_call, 4),
+            "price_per_call_usd": price_per_call,
+            # NUEVAS métricas HONESTAS (22 may 17:40 — feedback Miguel):
+            # "real_hits" = SUM(max(hits-1, 0)) — descuenta el +1 inicial de cada
+            # entry (creación, no es ahorro). "entries_reused" = entries con hits>=2
+            # (las que REALMENTE aportan ahorro). "entries_only_created" = hits=1
+            # (no han ahorrado nada todavía). Coste evitado real $0.02/hit
+            # (autocomplete + place details, sesión Google completa evitada).
+            "real_hits_total": real_hits_total,
+            "real_hits_7d": real_hits_7d,
+            "real_savings_total_usd": round(real_hits_total * PRICE_PER_HIT_REAL, 4),
+            "real_savings_7d_usd": round(real_hits_7d * PRICE_PER_HIT_REAL, 4),
+            "entries_reused": entries_reused,
+            "entries_only_created": entries_only_created,
+            "reuse_rate_pct": round(100 * entries_reused / total_entries, 1) if total_entries else 0,
+            "price_per_real_hit_usd": PRICE_PER_HIT_REAL,
+            "top_queries": top_q.data or [],
+            # Métricas in-memory (desde último deploy):
+            "realtime": {
+                "uptime_minutes": counters_uptime_min,
+                "total_lookups": total_lookups - (1 if total_lookups == 1 and free_hits == 0 else 0),
+                "by_source": dict(_places_source_counters),
+                "hit_rate_pct": hit_rate_pct,
+                "savings_usd_since_deploy": rt_savings_usd,
+                "l1_in_memory_entries": len(_places_l1_cache),
+                "l1_max": _PLACES_L1_MAX,
+                "l1_ttl_seconds": _PLACES_L1_TTL_SEC,
+            },
+        }
+    except Exception as e:
+        logger.exception("admin_cache_places_stats failed")
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail=f"cache stats failed: {e}")
+
+
+@app.get("/admin/routes/calls-by-source", tags=["admin", "costs"], summary="Desglose calls Routes V2 por origen (X-Triggered-By)")
+async def admin_routes_calls_by_source(user=Depends(require_admin)):
+    """Desglose de calls al endpoint /places/directions (Routes V2 Pro) por
+    función cliente que las disparó (header X-Triggered-By).
+
+    Util para detectar fugas de llamadas: si 'reconcile-on-resume' tiene
+    miles de calls, hay un bug. Si 'cold-start' supera a 'optimize', algo
+    se re-fetcha innecesariamente.
+
+    Origenes esperados (app RN debe enviar uno de):
+    - optimize          → driver pulsa "Optimizar ruta"
+    - start-nav         → driver pulsa "Ir" a un stop
+    - recalc            → desvío off-route durante navegación
+    - load-route        → driver abre una ruta de "Mis rutas"
+    - cold-start        → loadSavedState tras abrir app fresca
+    - resume            → loadSavedState tras volver de background
+    - invert            → driver invierte orden de la ruta
+    - auto-effect       → useEffect [stops/location] tras optimize
+    - unknown           → caller sin header (regresión a investigar)
+
+    Counter es in-memory, se resetea en cada cold-start backend. Tiempo
+    de vida visible en `uptime_minutes`. Para análisis histórico, exportar
+    snapshot periódico a otra tabla (no implementado aún).
+    """
+    uptime_min = round((time.time() - _routes_v2_counters_started_at) / 60, 1)
+    PRICE_PER_CALL_EUR = 0.0073  # blended Routes Pro+Essentials × 0.92 USD→EUR
+
+    # In-memory: contadores desde el último cold-start del backend
+    inmem_total = sum(_routes_v2_source_counters.values())
+
+    # Histórico persistido: lee últimos 7 días de routes_v2_source_daily
+    # (sobrevive restarts Railway). Para "hoy" agrega in-memory + BD
+    # — el persist es fire-and-forget, puede llegar con segundos de retraso.
+    try:
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+        history_rows = (
+            supabase.table("routes_v2_source_daily")
+            .select("date, source, count")
+            .gte("date", cutoff)
+            .execute()
+        ).data or []
+    except Exception as e:
+        logger.warning(f"routes_v2_source history fetch failed: {e}")
+        history_rows = []
+
+    # Agregado 7d por source (combina BD + in-memory de hoy)
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    from collections import defaultdict
+    agg_7d: dict = defaultdict(int)
+    today_persisted: dict = defaultdict(int)
+    for row in history_rows:
+        agg_7d[row["source"]] += int(row.get("count") or 0)
+        if row.get("date") == today_iso:
+            today_persisted[row["source"]] = int(row.get("count") or 0)
+
+    # Para hoy: max(BD_persistido, in_memory) porque el in-memory puede ir
+    # ligeramente por delante del persist fire-and-forget.
+    today_total = sum(
+        max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0))
+        for src in set(list(today_persisted.keys()) + list(_routes_v2_source_counters.keys()))
+    )
+    sorted_today = sorted(
+        set(list(today_persisted.keys()) + list(_routes_v2_source_counters.keys())),
+        key=lambda s: max(today_persisted.get(s, 0), _routes_v2_source_counters.get(s, 0)),
+        reverse=True,
+    )
+    by_source_today = [
+        {
+            "source": src,
+            "calls": max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0)),
+            "pct": round(100 * max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0)) / today_total, 1) if today_total else 0,
+            "eur_estimated": round(max(today_persisted.get(src, 0), _routes_v2_source_counters.get(src, 0)) * PRICE_PER_CALL_EUR, 2),
+        }
+        for src in sorted_today
+    ]
+
+    total_7d = sum(agg_7d.values())
+    by_source_7d = [
+        {
+            "source": src,
+            "calls": cnt,
+            "pct": round(100 * cnt / total_7d, 1) if total_7d else 0,
+            "eur_estimated": round(cnt * PRICE_PER_CALL_EUR, 2),
+        }
+        for src, cnt in sorted(agg_7d.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
+    return {
+        "ok": True,
+        "uptime_minutes": uptime_min,
+        # Hoy (persistente + in-memory, sobrevive restarts)
+        "total_calls_today": today_total,
+        "eur_total_today": round(today_total * PRICE_PER_CALL_EUR, 2),
+        "by_source": by_source_today,  # mantiene nombre por compat website
+        # Últimos 7 días (solo BD, agregado histórico)
+        "total_calls_7d": total_7d,
+        "eur_total_7d": round(total_7d * PRICE_PER_CALL_EUR, 2),
+        "by_source_7d": by_source_7d,
+        # In-memory desde último cold-start (para diagnóstico)
+        "inmem_total_since_deploy": inmem_total,
+        "note": "Datos hoy = BD persistente + in-memory. Sobrevive restarts Railway. Histórico 7d en `by_source_7d`.",
+    }
+
+
+# Pricing estimado por call (EUR) — usado en /admin/api-sources
+# Routes V2 Pro blend ~$0.008, Place Details Essentials $0.005, Geocoding $0.005
+_PRICE_PER_CALL_EUR_BY_ENDPOINT = {
+    "places_directions": 0.0073,   # Routes V2 Pro+Essentials blend × 0.92 USD→EUR
+    "places_details": 0.0046,      # Essentials $0.005 × 0.92 (free 10k/mes ignorado)
+    "geocode": 0.0046,             # Geocoding $0.005 × 0.92 (free 10k/mes ignorado)
+}
+
+
+@app.get("/admin/api-sources", tags=["admin", "costs"], summary="Desglose calls por endpoint+origen X-Triggered-By (TODOS los endpoints)")
+async def admin_api_sources(user=Depends(require_admin)):
+    """Desglose 360° de calls Google Maps por endpoint y origen (X-Triggered-By).
+
+    Cubre /places/directions, /places/details, /geocode. Combina counter
+    in-memory (al minuto) + persistido Supabase (sobrevive restarts).
+    Histórico 7d por endpoint para detectar drift de uso entre días.
+    """
+    uptime_min = round((time.time() - _api_counters_started_at) / 60, 1)
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    cutoff_7d = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+
+    # Lee BD api_source_daily (tabla nueva). Si falla (tabla aún no
+    # creada por Supabase MCP, devolverá [] → solo veremos in-memory).
+    persisted_rows: list[dict] = []
+    try:
+        persisted_rows = (
+            supabase.table("api_source_daily")
+            .select("endpoint, date, source, count")
+            .gte("date", cutoff_7d)
+            .execute()
+        ).data or []
+    except Exception as e:
+        logger.info(f"api_source_daily fetch failed (table may not exist yet): {e}")
+
+    # Agregados por endpoint
+    out_endpoints: list[dict] = []
+    seen_endpoints = set(_api_source_counters.keys())
+    for row in persisted_rows:
+        seen_endpoints.add(row["endpoint"])
+
+    from collections import defaultdict
+    for endpoint in sorted(seen_endpoints):
+        inmem_today = _api_source_counters.get(endpoint, {})
+        persisted_today: dict = defaultdict(int)
+        persisted_7d: dict = defaultdict(int)
+        for row in persisted_rows:
+            if row["endpoint"] != endpoint:
+                continue
+            cnt = int(row.get("count") or 0)
+            persisted_7d[row["source"]] += cnt
+            if row.get("date") == today_iso:
+                persisted_today[row["source"]] += cnt
+
+        # Hoy = max(BD persistido, in-memory) por source (in-mem puede ir delante)
+        all_sources_today = set(list(persisted_today.keys()) + list(inmem_today.keys()))
+        today_by_source = {
+            src: max(persisted_today.get(src, 0), inmem_today.get(src, 0))
+            for src in all_sources_today
+        }
+        today_total = sum(today_by_source.values())
+        price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint, 0.005)
+
+        by_source_today = [
+            {
+                "source": src,
+                "calls": cnt,
+                "pct": round(100 * cnt / today_total, 1) if today_total else 0,
+                "eur_estimated": round(cnt * price, 2),
+            }
+            for src, cnt in sorted(today_by_source.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+        total_7d = sum(persisted_7d.values())
+        by_source_7d = [
+            {
+                "source": src,
+                "calls": cnt,
+                "pct": round(100 * cnt / total_7d, 1) if total_7d else 0,
+                "eur_estimated": round(cnt * price, 2),
+            }
+            for src, cnt in sorted(persisted_7d.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+
+        out_endpoints.append({
+            "endpoint": endpoint,
+            "price_per_call_eur": price,
+            "today": {
+                "total_calls": today_total,
+                "eur_total": round(today_total * price, 2),
+                "by_source": by_source_today,
+            },
+            "last_7d": {
+                "total_calls": total_7d,
+                "eur_total": round(total_7d * price, 2),
+                "by_source": by_source_7d,
+            },
+        })
+
+    return {
+        "ok": True,
+        "uptime_minutes": uptime_min,
+        "endpoints": out_endpoints,
+        "note": "Datos hoy = BD persistente + in-memory. Histórico 7d solo BD. "
+                "Pricing estimado por blend tier; valores reales en Cloud Console.",
+    }
+
+
+@app.post("/admin/cache/backfill-missing", tags=["admin", "costs"], summary="Backfill cache con queries faltantes")
+async def admin_cache_backfill_missing(
+    min_appearances: int = 2,
+    days_lookback: int = 90,
+    limit: int = 1000,
+    user=Depends(require_admin),
+):
+    """Backfill places_autocomplete_cache con queries en stops que aún NO están cacheadas.
+
+    Diseñado para ejecutar puntualmente (después de purgar cache o tras descubrir
+    direcciones nuevas no cubiertas). Bypass del rate limit /places/* del user
+    (llama Google directamente con backend GOOGLE_API_KEY).
+
+    Inserta con hits=0 para no inflar el contador de hits reales de drivers
+    (contrast: _places_cache_write_sync usa hits=1 porque sirvió una llamada).
+
+    Params:
+        min_appearances: solo cachear queries que aparezcan ≥N veces en stops (default 2)
+        days_lookback: ventana stops a considerar (default 90 días)
+        limit: máximo de queries a procesar en una llamada (default 1000, hard cap 2000)
+
+    Returns:
+        {processed, ok, fail, duration_seconds, sample_failures[:5]}
+    """
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+
+    limit = min(limit, 2000)  # safety cap
+    import time as _time
+    start_ts = _time.monotonic()
+
+    # 1. Identificar queries faltantes via SQL agregada
+    sql = """
+    WITH should_be_cached AS (
+      SELECT
+        LOWER(TRIM(REGEXP_REPLACE(SPLIT_PART(address, E'\\n', 1), '\\s+', ' ', 'g'))) AS q,
+        AVG(lat)::float AS lat,
+        AVG(lng)::float AS lng,
+        COUNT(*) AS n
+      FROM stops
+      WHERE created_at >= NOW() - (%s::text || ' days')::interval
+        AND deleted_at IS NULL
+        AND lat IS NOT NULL AND lng IS NOT NULL
+        AND address IS NOT NULL AND LENGTH(address) > 8
+      GROUP BY 1 HAVING COUNT(*) >= %s
+    )
+    SELECT q, lat, lng, n
+    FROM should_be_cached s
+    WHERE NOT EXISTS (SELECT 1 FROM places_autocomplete_cache c WHERE c.query_normalized = s.q)
+      AND LENGTH(TRIM(q)) >= 5
+      AND NOT (s.lat BETWEEN 34.0 AND 35.0 AND s.lng BETWEEN -16.0 AND -15.0)
+    ORDER BY n DESC
+    LIMIT %s;
+    """
+    try:
+        missing_resp = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "exec_sql_select",
+                {"q": sql, "params": [days_lookback, min_appearances, limit]},
+            ).execute()
+        )
+        missing = missing_resp.data or []
+    except Exception:
+        # Fallback: la RPC exec_sql_select puede no existir. Usar query directa.
+        # Limitación: SQL via supabase-py requiere RPC o construir via PostgREST.
+        # Hacemos la agregación en Python paginando stops.
+        logger.info("admin_cache_backfill: falling back to in-app aggregation")
+        missing = await _backfill_compute_missing_in_app(days_lookback, min_appearances, limit)
+
+    if not missing:
+        return {"processed": 0, "ok": 0, "fail": 0, "duration_seconds": 0, "message": "no missing queries found"}
+
+    # 2. Para cada faltante, llamar Google Places Autocomplete directo
+    client = google_maps_client()
+    ok = fail = 0
+    sample_failures: list[str] = []
+
+    async def _backfill_one(q: str, lat: float, lng: float) -> bool:
+        params = {
+            "input": q,
+            "key": GOOGLE_API_KEY,
+            "language": "es",
+            "location": f"{lat},{lng}",
+            "radius": "20000",  # bias 20km
+        }
+        try:
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                params=params,
+                timeout=15.0,
+            )
+            data = resp.json()
+            if data.get("status") not in ("OK", "ZERO_RESULTS"):
+                return False
+            if data.get("status") == "OK" and data.get("predictions"):
+                norm, bias = _ac_cache_key(q, lat, lng)
+                # INSERT con hits=0 (NO incrementar artificial — solo escribir bytes).
+                # last_used_at tiene constraint NOT NULL en BD → usamos NOW() pero
+                # el flag REAL anti-inflación es hits=0: el bump real de drivers
+                # incrementa hits → cualquier query con hits>0 = uso real driver,
+                # hits=0 = solo backfill (cuenta correcta sin contar las inserciones).
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    await asyncio.to_thread(
+                        lambda: supabase.table("places_autocomplete_cache").upsert({
+                            "query_normalized": norm,
+                            "bias_geohash5": bias,
+                            "predictions": data["predictions"],
+                            "hits": 0,
+                            "last_used_at": now_iso,
+                            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+                        }, on_conflict="query_normalized,bias_geohash5").execute()
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(f"backfill cache write failed: {e}")
+                    return False
+            return True  # ZERO_RESULTS también "OK" (no es fallo, no hay nada que cachear)
+        except Exception as e:
+            logger.warning(f"backfill Google call failed for {q[:30]}: {e}")
+            return False
+
+    # Procesar en chunks de 20 concurrentes (margen QPS Google = 50)
+    chunk_size = 20
+    for i in range(0, len(missing), chunk_size):
+        chunk = missing[i:i + chunk_size]
+        results = await asyncio.gather(
+            *[_backfill_one(m["q"], m["lat"], m["lng"]) for m in chunk],
+            return_exceptions=True,
+        )
+        for m, r in zip(chunk, results):
+            if r is True:
+                ok += 1
+            else:
+                fail += 1
+                if len(sample_failures) < 5:
+                    sample_failures.append(m["q"][:60])
+
+    duration = _time.monotonic() - start_ts
+    logger.info(f"admin_cache_backfill_missing done: ok={ok} fail={fail} in {duration:.1f}s")
+    return {
+        "processed": len(missing),
+        "ok": ok,
+        "fail": fail,
+        "duration_seconds": round(duration, 1),
+        "sample_failures": sample_failures,
+    }
+
+
+async def _backfill_compute_missing_in_app(days_lookback: int, min_appearances: int, limit: int) -> list[dict]:
+    """Fallback Python si exec_sql_select RPC no existe.
+
+    Lista en cache existentes (set de query_normalized) + lista de stops paginadas
+    + group by Python. Más lento pero independiente de RPCs custom."""
+    # 1. Set de queries ya cacheadas
+    # NOTA: capturamos `offset` por valor en la lambda (off=offset) para evitar
+    # closure-by-reference — sin esto, la lambda lee el offset cuando el thread
+    # arranca, no cuando se construye, y puede leer una página equivocada o
+    # bucle infinito bajo carga (audit 22 may 2026).
+    cached_q: set[str] = set()
+    offset = 0
+    while True:
+        chunk = await asyncio.to_thread(
+            lambda off=offset: supabase.table("places_autocomplete_cache")
+            .select("query_normalized")
+            .range(off, off + 999)
+            .execute()
+        )
+        if not chunk.data:
+            break
+        for r in chunk.data:
+            cached_q.add(r["query_normalized"])
+        if len(chunk.data) < 1000:
+            break
+        offset += 1000
+
+    # 2. Stops paginadas + group by en Python
+    from collections import defaultdict
+    agg: dict[str, list] = defaultdict(lambda: [0.0, 0.0, 0])  # q → [lat_sum, lng_sum, n]
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_lookback)).isoformat()
+    offset = 0
+    while True:
+        chunk = await asyncio.to_thread(
+            lambda off=offset: supabase.table("stops")
+            .select("address,lat,lng")
+            .gte("created_at", cutoff)
+            .is_("deleted_at", "null")
+            .not_.is_("lat", "null")
+            .not_.is_("lng", "null")
+            .not_.is_("address", "null")
+            .range(off, off + 999)
+            .execute()
+        )
+        if not chunk.data:
+            break
+        for row in chunk.data:
+            addr = (row.get("address") or "").strip()
+            lat = row.get("lat"); lng = row.get("lng")
+            if not addr or lat is None or lng is None or len(addr) < 9:
+                continue
+            q = " ".join(addr.split("\n")[0].lower().strip().split())[:200]
+            if not q or len(q) < 5:
+                continue
+            # Excluir demo Madrid sintético
+            if 34.0 < lat < 35.0 and -16.0 < lng < -15.0:
+                continue
+            agg[q][0] += float(lat)
+            agg[q][1] += float(lng)
+            agg[q][2] += 1
+        if len(chunk.data) < 1000:
+            break
+        offset += 1000
+
+    # 3. Filtrar faltantes + ordenar por n DESC + limit
+    missing = []
+    for q, (lat_sum, lng_sum, n) in agg.items():
+        if n < min_appearances:
+            continue
+        if q in cached_q:
+            continue
+        missing.append({"q": q, "lat": lat_sum / n, "lng": lng_sum / n, "n": n})
+    missing.sort(key=lambda x: -x["n"])
+    return missing[:limit]
 
 
 async def run_daily_costs_snapshot():
@@ -8863,6 +10837,25 @@ async def start_social_scheduler():
         id="daily_costs_snapshot", replace_existing=True,
     )
     logger.info("Daily costs snapshot: cron 09:17 UTC")
+    # Bootstrap único 22 may 2026: ejecutar snapshot 60s tras startup para
+    # backfill inmediato (tabla daily_api_metrics estaba vacía por bug TypeError
+    # ya corregido). on_conflict del upsert hace idempotente esta ejecución
+    # extra. Tras primer snapshot, el cron diario continúa normal.
+    from datetime import timedelta as _td
+    social_scheduler.add_job(
+        run_daily_costs_snapshot, "date",
+        run_date=datetime.now(timezone.utc) + _td(seconds=60),
+        id="daily_costs_snapshot_bootstrap", replace_existing=True,
+    )
+    logger.info("Daily costs snapshot: bootstrap run in 60s")
+    # Cost alerts (Miguel 23 may 2026 — task #277): chequea 4 umbrales cada
+    # hora a HH:05 (offset 5min vs hora en punto para evitar competencia con
+    # otros crons). Anti-spam 4h por alert_key. Bloquea regresiones tipo #266.
+    social_scheduler.add_job(
+        check_cost_alerts, "cron", minute=5,
+        id="cost_alerts_hourly", replace_existing=True,
+    )
+    logger.info("Cost alerts: cron HH:05 (4 thresholds, anti-spam 4h)")
     # Siempre arrancar el scheduler (tambien para backups y retention)
     if not social_scheduler.running:
         social_scheduler.start()
@@ -10895,7 +12888,12 @@ async def start_monitoring_jobs():
         id="trial_feedback_emails",
         replace_existing=True,
     )
-    # Daily health digest (08:00 Europe/Madrid — detect silent regressions)
+    # Daily health digest (08:00 Europe/Madrid — detect silent regressions).
+    # coalesce=True + max_instances=1 + misfire_grace_time=300: si tras un
+    # deploy el job se registra varias veces o se solapan disparos (incidente
+    # 22 may 2026: llegaron 2 emails 06:00:05 y 06:00:07 con datos opuestos
+    # porque el primero leyó snapshots aún no calculados), APScheduler
+    # descarta los disparos extra automáticamente.
     social_scheduler.add_job(
         send_daily_health_digest_job,
         "cron",
@@ -10904,6 +12902,9 @@ async def start_monitoring_jobs():
         timezone=ZoneInfo("Europe/Madrid"),
         id="daily_health_digest",
         replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
     )
     # Reactivation push 5h follow-up (hourly at :15 → email if user did not open the app after push)
     social_scheduler.add_job(

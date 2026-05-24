@@ -239,6 +239,34 @@ def clear_msi_geocode_cache():
 
 
 @pytest.fixture(autouse=True)
+def disable_routes_v2_cache(monkeypatch):
+    """Routes V2 server-side cache OFF por default en tests (Miguel 23 may 2026).
+    Sin esto, dos tests que pidan las mismas coords se contaminan: el segundo
+    recibe cache hit y nunca llega al mock httpx → asserts sobre captured
+    headers / status_code fallan. Tests que prueban cache lo activan con
+    su propio monkeypatch local."""
+    import main
+    monkeypatch.setattr(main, "_routes_v2_cache_enabled", lambda: False)
+    main._routes_v2_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_google_maps_client_singleton():
+    """Resetea el singleton `_google_maps_client` antes de cada test.
+    Sin esto, el httpx.AsyncClient cached queda atado al event loop del
+    test anterior → cuando el loop se cierra y otro test arranca, el
+    primer attempt lanza "Event loop is closed" y el retry crea un NUEVO
+    cliente que escapa al `patch("main.httpx.AsyncClient", ...)` → hace
+    request real a Google con fake key → REQUEST_DENIED → test asserts
+    'OK' pero recibe 'ZERO_RESULTS'. Caso 23 may 2026: 5 tests de
+    test_places_cache.py fallaban según orden de ejecución."""
+    import main
+    main._google_maps_client = None
+    yield
+    main._google_maps_client = None
+
+
+@pytest.fixture(autouse=True)
 def _default_ocr_tier(monkeypatch):
     """All OCR endpoints (`/ocr/label`, `/ocr/screenshots-batch`) now look up
     the caller's tier to enforce a per-driver daily image quota. Existing
