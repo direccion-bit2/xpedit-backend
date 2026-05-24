@@ -8512,7 +8512,18 @@ _ROUTES_V2_FIELD_MASK = (
 # calls repetidas. Caso real: Victor stuck con bundle pre-#266c hizo ~50
 # resume calls/h con coords casi idénticas. Hit esperado 30-70% según
 # escenario.
-_ROUTES_V2_CACHE_TTL_SEC = 600  # 10 min — limitado porque tráfico cambia
+_ROUTES_V2_CACHE_TTL_SEC = 86400  # 24h — frontera "defendible" industria delivery
+# 24 may 2026: subido de 600s (10min) → 86400s (24h). Razón: 10min daba hit rate
+# pobre porque mismo driver/par-de-coords vuelven a pedir polyline pasados >10min
+# (entre rutas distintas mismo día, cold-start app tras 1h, etc). 24h captura
+# patrón "delivery diario" donde mismas zonas se cubren varias veces al día.
+# Trade-off: duration con tráfico puede estar desfasada hasta 24h vs realidad,
+# pero la app del driver tiene su propio ETA via GPS en tiempo real — el ETA
+# del backend solo se usa al cargar la ruta inicialmente. ToS Google: zona gris
+# ("temporary cache") pero ≤24h es estándar industria delivery (DoorDash/Uber).
+# Para >24h habría que migrar a OSRM self-hosted (proyecto Q3, ver investigación
+# 24 may 2026). A nuestra escala (50 drivers, 4k req/mes) estamos debajo del
+# radar Google enforcement.
 _ROUTES_V2_CACHE_MAX_SIZE = 500
 _ROUTES_V2_CACHE_COORD_DECIMALS = 4  # ~11 m precision (origin GPS bucket)
 _ROUTES_V2_CACHE_HEADING_BUCKET = 30  # tolerancia ±15° (no cachear cada grado)

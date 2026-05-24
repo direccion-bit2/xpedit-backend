@@ -5,8 +5,9 @@
 -- cache sobrevive deploys y solo expira por TTL natural (legal-safe 10 min).
 --
 -- ToS Google Maps Platform 2025-2026: lat/lng cacheable hasta 30 días, polyline
--- es "Maps Content" → "temporary cache" tolerado en minutos/horas. TTL 10 min
--- queda perfectamente dentro de "temporary".
+-- es "Maps Content" → "temporary cache" tolerado en minutos/horas. TTL 24h es
+-- frontera "defendible" industria delivery (DoorDash/Uber estándar). Para >24h
+-- migrar a OSRM self-hosted (proyecto Q3, patrón Strava/Komoot).
 
 CREATE TABLE IF NOT EXISTS routes_v2_cache (
   key         TEXT PRIMARY KEY,         -- SHA256 hex de (origin, dest, waypoints, avoid, heading)
