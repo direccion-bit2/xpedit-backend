@@ -7590,6 +7590,7 @@ def _bump_source_counter(source: str) -> None:
 # TTL corto (5 min) para no servir datos muy stale. maxsize 1000 entries con
 # eviction LRU (insertion order Python 3.7+ + OrderedDict.move_to_end).
 from collections import OrderedDict as _OrderedDict
+
 _PLACES_L1_MAX = 1000
 _PLACES_L1_TTL_SEC = 300
 _places_l1_cache: "_OrderedDict[tuple[str, str], tuple[float, dict]]" = _OrderedDict()
@@ -8400,8 +8401,9 @@ _ROUTES_V2_CACHE_MAX_SIZE = 500
 _ROUTES_V2_CACHE_COORD_DECIMALS = 4  # ~11 m precision (origin GPS bucket)
 _ROUTES_V2_CACHE_HEADING_BUCKET = 30  # tolerancia ±15° (no cachear cada grado)
 _routes_v2_cache: "_OrderedDict[str, tuple[float, dict]]" = _OrderedDict()
-_routes_v2_cache_hits = 0
+_routes_v2_cache_hits = 0  # L1 hits (process memory)
 _routes_v2_cache_misses = 0
+_routes_v2_cache_l2_hits = 0  # L2 hits (Supabase routes_v2_cache table)
 
 # Flag memo: evita 100ms RTT a Supabase en cada call. Refresca cada 30s
 # (auditoría code-doctor 23 may 2026 P0: si se llama Supabase en cada
@@ -8487,31 +8489,24 @@ def _routes_v2_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _routes_v2_cache_get(key: str) -> Optional[dict]:
-    global _routes_v2_cache_hits, _routes_v2_cache_misses
+def _routes_v2_cache_l1_get(key: str) -> Optional[dict]:
+    """L1 lookup (in-memory). Devuelve value si HIT no expirado, None en otros casos."""
     entry = _routes_v2_cache.get(key)
     if not entry:
-        _routes_v2_cache_misses += 1
         return None
     ts, value = entry
     if time.time() - ts > _ROUTES_V2_CACHE_TTL_SEC:
-        # Expirado — borrar best-effort.
         try:
             del _routes_v2_cache[key]
         except KeyError:
             pass
-        _routes_v2_cache_misses += 1
         return None
     _routes_v2_cache.move_to_end(key)  # LRU touch
-    _routes_v2_cache_hits += 1
     return value
 
 
-def _routes_v2_cache_set(key: str, value: dict) -> None:
-    # Lazy purge: cada vez que añadimos (= después de un miss → Google
-    # call), aprovecha para limpiar entradas expiradas. Sin esto el LRU
-    # eviction solo dispara al llegar a 500, pudiendo tener 499 entradas
-    # basura ocupando RAM (auditoría code-doctor 23 may P2 #9).
+def _routes_v2_cache_l1_set(key: str, value: dict) -> None:
+    """L1 write con lazy purge expirados + LRU eviction al límite."""
     now = time.time()
     expired = [k for k, (ts, _) in _routes_v2_cache.items() if now - ts > _ROUTES_V2_CACHE_TTL_SEC]
     for k in expired:
@@ -8523,6 +8518,95 @@ def _routes_v2_cache_set(key: str, value: dict) -> None:
     _routes_v2_cache.move_to_end(key)
     while len(_routes_v2_cache) > _ROUTES_V2_CACHE_MAX_SIZE:
         _routes_v2_cache.popitem(last=False)
+
+
+def _routes_v2_cache_l2_get_sync(key: str) -> Optional[dict]:
+    """L2 lookup (Supabase routes_v2_cache). Sync — llamado desde asyncio.to_thread.
+    Devuelve value JSONB si HIT no expirado, None en otros casos.
+    Incrementa hits + last_hit_at fire-and-forget (no bloquea respuesta)."""
+    try:
+        r = (
+            supabase.table("routes_v2_cache")
+            .select("value, expires_at")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        if not r.data:
+            return None
+        row = r.data[0]
+        # expires_at viene ISO; compara naive UTC para evitar dependencia tz
+        from dateutil.parser import isoparse  # type: ignore
+        expires_at = isoparse(row["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            return None  # cron purgará la fila; no la borramos aquí (race-safe)
+        return row.get("value")
+    except Exception as e:
+        logger.info(f"routes_v2_cache L2 read failed: {e}")
+        return None
+
+
+def _routes_v2_cache_l2_set_sync(key: str, value: dict) -> None:
+    """L2 write upsert. Sync — llamado desde asyncio.to_thread fire-and-forget.
+    Fallo NO rompe la respuesta (L1 ya tiene el valor)."""
+    try:
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=_ROUTES_V2_CACHE_TTL_SEC)).isoformat()
+        supabase.table("routes_v2_cache").upsert({
+            "key": key,
+            "value": value,
+            "expires_at": expires_at,
+            "hits": 0,
+        }, on_conflict="key").execute()
+    except Exception as e:
+        logger.info(f"routes_v2_cache L2 write failed: {e}")
+
+
+def _routes_v2_cache_l2_bump_hit_sync(key: str) -> None:
+    """+1 hits + last_hit_at en L2 row. Fire-and-forget, no bloquea HIT response."""
+    try:
+        supabase.rpc("increment_routes_v2_cache_hit", {"p_key": key}).execute()
+    except Exception:
+        pass  # cosmético — no romper si RPC no existe aún
+
+
+async def _routes_v2_cache_get(key: str) -> Optional[dict]:
+    """Doble-nivel: L1 (in-memory, ~0ms) → L2 (Supabase, ~50-100ms) → None.
+    L2 HIT backfilla L1 para que próximas calls del MISMO backend sirvan en L1."""
+    global _routes_v2_cache_hits, _routes_v2_cache_l2_hits, _routes_v2_cache_misses
+    l1 = _routes_v2_cache_l1_get(key)
+    if l1 is not None:
+        _routes_v2_cache_hits += 1
+        return l1
+    # L1 miss → probar L2 (BD). Defensa extra: si to_thread propaga (caso
+    # raro: cliente Supabase crash duro, no exception interna), degradar a
+    # miss en vez de 500 al endpoint /places/directions.
+    try:
+        l2 = await asyncio.to_thread(_routes_v2_cache_l2_get_sync, key)
+    except Exception as e:
+        logger.info(f"routes_v2_cache L2 to_thread propagated: {e}")
+        l2 = None
+    if l2 is not None:
+        _routes_v2_cache_l2_hits += 1
+        _routes_v2_cache_l1_set(key, l2)  # backfill L1
+        # Bump hits counter en BD fire-and-forget
+        asyncio.create_task(asyncio.to_thread(_routes_v2_cache_l2_bump_hit_sync, key))
+        return l2
+    _routes_v2_cache_misses += 1
+    return None
+
+
+def _routes_v2_cache_set(key: str, value: dict) -> None:
+    """L1 write sync + L2 write fire-and-forget. Si L2 falla, L1 sigue
+    teniendo el valor — degradación graceful: el cache funciona como solo-L1
+    durante esa request."""
+    _routes_v2_cache_l1_set(key, value)
+    try:
+        asyncio.create_task(asyncio.to_thread(_routes_v2_cache_l2_set_sync, key, value))
+    except RuntimeError:
+        # No event loop (ej. test sync) → write síncrono best-effort
+        _routes_v2_cache_l2_set_sync(key, value)
 
 
 # Counter in-memory de X-Triggered-By por endpoint+source.
@@ -8862,15 +8946,21 @@ async def places_directions(
     ~50 resume/h con coords casi idénticas). Coords redondeadas a 4 dec
     (~11 m) para aumentar hit rate. Cache HIT NO llama a Google → no contamina
     counter `places_directions` (separado en `places_directions_cache/hit`).
+    24 may 2026 (tarea #285): cache de doble nivel L1 (in-mem) + L2 (Supabase
+    `routes_v2_cache`). Causa: 23 may tuvimos 16 commits/restarts backend → L1
+    se borraba antes de poblarse → 0% hit rate con 133 calls. L2 sobrevive
+    restarts. Counter HIT desglosado en `hit_l1` vs `hit_l2` para diagnóstico.
     """
     user_id = user.get("id") if user else None
     cache_key = _routes_v2_cache_key(origin, destination, waypoints, avoid, heading)
-    cached = _routes_v2_cache_get(cache_key) if _routes_v2_cache_enabled() else None
+    cached = await _routes_v2_cache_get(cache_key) if _routes_v2_cache_enabled() else None
     if cached is not None:
         # Cache HIT — no llamamos a Google. Bumpeamos counter separado por
         # source para visibilidad de QUÉ fuente cachea más (resume vs
         # optimize vs cold-start). NO `places_directions` porque ése es solo
         # calls reales a Google (lo que se factura).
+        # L1 vs L2 desglose disponible en /admin/routes/cache-stats (counters
+        # in-memory _routes_v2_cache_hits y _routes_v2_cache_l2_hits).
         _bump_api_source("places_directions_cache", x_triggered_by or "unknown", user_id=user_id)
         return cached
     _bump_routes_v2_source(x_triggered_by, user_id=user_id)
@@ -9817,6 +9907,77 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=500, detail=f"cache stats failed: {e}")
+
+
+@app.get("/admin/routes/cache-stats", tags=["admin", "costs"], summary="Stats cache Routes V2 (L1 in-mem vs L2 Supabase)")
+async def admin_routes_cache_stats(user=Depends(require_admin)):
+    """Hit/miss rate del cache server-side Routes V2 (TTL 10 min).
+    L1 = in-memory (process-local, ~0ms, se pierde con restart).
+    L2 = Supabase tabla routes_v2_cache (~50-100ms, sobrevive restarts).
+    Flujo: L1 hit → L1 miss + L2 hit → L1 miss + L2 miss → Google.
+
+    Hit rate sano: 30-70% en flujo normal. Si L1≈0 y L2>0 → backend reinicia
+    mucho. Si ambos≈0 → bug en cache key o tráfico no repetitivo."""
+    uptime_min = round((time.time() - _routes_v2_counters_started_at) / 60, 1)
+    l1_hits = _routes_v2_cache_hits
+    l2_hits = _routes_v2_cache_l2_hits
+    misses = _routes_v2_cache_misses
+    total = l1_hits + l2_hits + misses
+    # Stats persistidas L2
+    l2_rows = 0
+    l2_oldest_iso = None
+    l2_newest_iso = None
+    l2_total_hits_persisted = 0
+    try:
+        r = (
+            supabase.table("routes_v2_cache")
+            .select("created_at, hits", count="exact")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        l2_rows = getattr(r, "count", None) or len(r.data or [])
+        if r.data:
+            l2_oldest_iso = r.data[0].get("created_at")
+        r2 = (
+            supabase.table("routes_v2_cache")
+            .select("created_at, hits")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if r2.data:
+            l2_newest_iso = r2.data[0].get("created_at")
+        # Total hits persistidos (suma cosmética para detectar reuso entre restarts)
+        r3 = supabase.rpc("sum_routes_v2_cache_hits").execute()
+        l2_total_hits_persisted = int((r3.data or [0])[0]) if isinstance(r3.data, list) else 0
+    except Exception as e:
+        logger.info(f"routes_v2_cache stats fetch failed: {e}")
+    return {
+        "ok": True,
+        "uptime_minutes": uptime_min,
+        "ttl_seconds": _ROUTES_V2_CACHE_TTL_SEC,
+        "l1": {
+            "size": len(_routes_v2_cache),
+            "max_size": _ROUTES_V2_CACHE_MAX_SIZE,
+            "hits": l1_hits,
+            "hit_rate_pct": round(100 * l1_hits / total, 1) if total else 0,
+        },
+        "l2": {
+            "rows_persisted": l2_rows,
+            "hits": l2_hits,
+            "hit_rate_pct": round(100 * l2_hits / total, 1) if total else 0,
+            "oldest_entry_at": l2_oldest_iso,
+            "newest_entry_at": l2_newest_iso,
+            "total_hits_persisted_cross_restart": l2_total_hits_persisted,
+        },
+        "combined": {
+            "total_requests": total,
+            "hits_total": l1_hits + l2_hits,
+            "misses": misses,
+            "overall_hit_rate_pct": round(100 * (l1_hits + l2_hits) / total, 1) if total else 0,
+        },
+    }
 
 
 @app.get("/admin/routes/calls-by-source", tags=["admin", "costs"], summary="Desglose calls Routes V2 por origen (X-Triggered-By)")
