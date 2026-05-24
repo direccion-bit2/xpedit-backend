@@ -17,7 +17,6 @@ import pytest
 
 import main
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CACHE KEY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,19 +96,18 @@ class TestRoutesV2CacheStorage:
         main._routes_v2_cache.clear()
 
     def test_set_then_get_returns_value(self):
-        main._routes_v2_cache_set("k1", {"routes": ["a"]})
-        assert main._routes_v2_cache_get("k1") == {"routes": ["a"]}
+        main._routes_v2_cache_l1_set("k1", {"routes": ["a"]})
+        assert main._routes_v2_cache_l1_get("k1") == {"routes": ["a"]}
 
     def test_get_returns_none_on_miss(self):
-        assert main._routes_v2_cache_get("k_unknown") is None
+        assert main._routes_v2_cache_l1_get("k_unknown") is None
 
     def test_ttl_expiry(self):
-        import time as _time
-        main._routes_v2_cache_set("k1", {"routes": ["x"]})
+        main._routes_v2_cache_l1_set("k1", {"routes": ["x"]})
         # Forzar timestamp en el pasado más allá del TTL
         ts, val = main._routes_v2_cache["k1"]
         main._routes_v2_cache["k1"] = (ts - main._ROUTES_V2_CACHE_TTL_SEC - 10, val)
-        assert main._routes_v2_cache_get("k1") is None
+        assert main._routes_v2_cache_l1_get("k1") is None
         # Y la entry debe haberse borrado tras el miss expirado
         assert "k1" not in main._routes_v2_cache
 
@@ -118,7 +116,7 @@ class TestRoutesV2CacheStorage:
         main._ROUTES_V2_CACHE_MAX_SIZE = 3
         try:
             for i in range(5):
-                main._routes_v2_cache_set(f"k{i}", {"i": i})
+                main._routes_v2_cache_l1_set(f"k{i}", {"i": i})
             # Quedan las 3 últimas (k2, k3, k4)
             assert "k0" not in main._routes_v2_cache
             assert "k1" not in main._routes_v2_cache
@@ -132,10 +130,10 @@ class TestRoutesV2CacheStorage:
         main._ROUTES_V2_CACHE_MAX_SIZE = 3
         try:
             for i in range(3):
-                main._routes_v2_cache_set(f"k{i}", {"i": i})
+                main._routes_v2_cache_l1_set(f"k{i}", {"i": i})
             # Tocar k0 lo mueve al final → k1 es el más antiguo ahora
-            main._routes_v2_cache_get("k0")
-            main._routes_v2_cache_set("k3", {"i": 3})  # evict k1
+            main._routes_v2_cache_l1_get("k0")
+            main._routes_v2_cache_l1_set("k3", {"i": 3})  # evict k1
             assert "k1" not in main._routes_v2_cache
             assert "k0" in main._routes_v2_cache
         finally:
@@ -146,13 +144,13 @@ class TestRoutesV2CacheStorage:
         expirados. Evita acumular basura hasta llegar al max."""
         # Llenar con entradas que YA están expiradas
         for i in range(10):
-            main._routes_v2_cache_set(f"old{i}", {"i": i})
+            main._routes_v2_cache_l1_set(f"old{i}", {"i": i})
         # Forzar timestamps al pasado
         for k in list(main._routes_v2_cache.keys()):
             ts, val = main._routes_v2_cache[k]
             main._routes_v2_cache[k] = (ts - main._ROUTES_V2_CACHE_TTL_SEC - 10, val)
         # Añadir uno nuevo → purga expirados
-        main._routes_v2_cache_set("fresh", {"new": True})
+        main._routes_v2_cache_l1_set("fresh", {"new": True})
         # Solo queda "fresh"
         assert list(main._routes_v2_cache.keys()) == ["fresh"]
 
@@ -359,3 +357,88 @@ class TestRoutesV2CacheEndpointIntegration:
             r = await client.get("/places/directions?origin=40.41,-3.70&destination=40.45,-3.68")
         assert r.status_code == 200
         assert len(main._routes_v2_cache) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE L2 (Supabase persistente) — 24 may 2026
+# Tras 16 deploys el sábado, L1 se borraba antes de poblarse. L2 sobrevive.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRoutesV2CacheL2:
+    """Doble nivel L1 (in-mem) + L2 (Supabase routes_v2_cache)."""
+
+    @pytest.mark.asyncio
+    async def test_l1_hit_skips_l2(self):
+        """Si L1 tiene el valor, NO se consulta Supabase (latencia mínima)."""
+        main._routes_v2_cache.clear()
+        main._routes_v2_cache_l1_set("k1", {"routes": ["v1"]})
+        with patch("main._routes_v2_cache_l2_get_sync") as mock_l2:
+            result = await main._routes_v2_cache_get("k1")
+            assert result == {"routes": ["v1"]}
+            mock_l2.assert_not_called()  # L2 no se invocó
+
+    @pytest.mark.asyncio
+    async def test_l1_miss_l2_hit_backfills_l1(self):
+        """L1 miss + L2 hit → devuelve valor L2 + backfill en L1 + bump contador."""
+        main._routes_v2_cache.clear()
+        l2_value = {"routes": ["from-l2"]}
+        with patch("main._routes_v2_cache_l2_get_sync", return_value=l2_value), \
+             patch("main._routes_v2_cache_l2_bump_hit_sync") as mock_bump:
+            result = await main._routes_v2_cache_get("k_persistent")
+            assert result == l2_value
+            # L1 ahora tiene el valor (backfill)
+            assert main._routes_v2_cache_l1_get("k_persistent") == l2_value
+            # Bump hits fire-and-forget — tarea creada (puede no haber corrido aún)
+            import asyncio as _aio
+            await _aio.sleep(0)  # ceder al event loop
+            # mock_bump puede o no haberse llamado dependiendo del scheduler;
+            # lo importante es que NO crashee aquí.
+
+    @pytest.mark.asyncio
+    async def test_l1_miss_l2_miss_returns_none(self):
+        """L1 miss + L2 miss → None (caller debe llamar a Google)."""
+        main._routes_v2_cache.clear()
+        with patch("main._routes_v2_cache_l2_get_sync", return_value=None):
+            result = await main._routes_v2_cache_get("k_nonexistent")
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_l2_write_failure_does_not_break_set(self):
+        """Si L2 falla al persistir, L1 sigue teniendo el valor — degradación graceful."""
+        main._routes_v2_cache.clear()
+        with patch("main._routes_v2_cache_l2_set_sync", side_effect=Exception("supabase down")):
+            # No debe lanzar
+            main._routes_v2_cache_set("k_resilient", {"routes": ["ok"]})
+        assert main._routes_v2_cache_l1_get("k_resilient") == {"routes": ["ok"]}
+
+    @pytest.mark.asyncio
+    async def test_l2_read_failure_falls_back_to_miss(self):
+        """Si la query a Supabase falla, tratar como miss (caller llamará Google)."""
+        main._routes_v2_cache.clear()
+        with patch("main._routes_v2_cache_l2_get_sync", side_effect=Exception("supabase down")):
+            # to_thread propaga la excepción al await — debe degradar a None
+            try:
+                result = await main._routes_v2_cache_get("k_with_l2_error")
+            except Exception:
+                pytest.fail("L2 read error should be swallowed, not propagated")
+            assert result is None
+
+    def test_l2_get_sync_returns_none_when_expired(self, monkeypatch):
+        """Si la row existe pero expires_at < now, devolver None."""
+        from datetime import datetime, timedelta, timezone
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        mock_resp = MagicMock(data=[{"value": {"x": 1}, "expires_at": past}])
+        mock_chain = MagicMock()
+        mock_chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = mock_resp
+        monkeypatch.setattr(main.supabase, "table", MagicMock(return_value=mock_chain))
+        assert main._routes_v2_cache_l2_get_sync("k_expired") is None
+
+    def test_l2_get_sync_returns_value_when_fresh(self, monkeypatch):
+        """Si expires_at > now, devolver value."""
+        from datetime import datetime, timedelta, timezone
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        mock_resp = MagicMock(data=[{"value": {"polyline": "xyz"}, "expires_at": future}])
+        mock_chain = MagicMock()
+        mock_chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = mock_resp
+        monkeypatch.setattr(main.supabase, "table", MagicMock(return_value=mock_chain))
+        assert main._routes_v2_cache_l2_get_sync("k_fresh") == {"polyline": "xyz"}
