@@ -9914,9 +9914,11 @@ async def admin_cache_places_stats(user=Depends(require_admin)):
         # Nota Miguel 22 may 17:35: hits totales INFLA porque incluye el +1
         # inicial de cada entry creada (NO es uso real, es la creación). El
         # "ahorro real" es SUM(hits - 1) descontando esa creación.
-        PRICE_AUTOCOMPLETE = 0.00283
-        PRICE_DETAILS = 0.017
-        PRICE_PER_HIT_REAL = PRICE_AUTOCOMPLETE + PRICE_DETAILS  # $0.02 / hit real
+        # RECALIBRADO 25 may 2026 a Places API New v1 (prod está en v1 desde may).
+        # Antes PRICE_DETAILS=0.017 era Legacy Basic → inflaba el ahorro 2.6x.
+        PRICE_AUTOCOMPLETE = 0.00283  # New per-request (Essentials no regala sesión)
+        PRICE_DETAILS = 0.005         # Essentials New v1 (antes 0.017 = Legacy Basic)
+        PRICE_PER_HIT_REAL = PRICE_AUTOCOMPLETE + PRICE_DETAILS  # $0.00783 / hit real (v1)
         price_per_call = PRICE_AUTOCOMPLETE  # back-compat para campos legacy
         now_iso = datetime.now(timezone.utc)
         seven_days_ago_iso = (now_iso - timedelta(days=7)).isoformat()
@@ -10211,12 +10213,27 @@ async def admin_routes_calls_by_source(user=Depends(require_admin)):
     }
 
 
-# Pricing estimado por call (EUR) — usado en /admin/api-sources
-# Routes V2 Pro blend ~$0.008, Place Details Essentials $0.005, Geocoding $0.005
+# Pricing estimado por call (EUR) — usado en /admin/api-sources.
+# RECALIBRADO 25 may 2026 contra Google Cloud Billing REAL (23-24 may), NO precio
+# de lista. Antes subestimaba el total ~50% (Routes infravalorado + autocomplete
+# con fallback genérico). Sigue siendo ESTIMACIÓN — el coste exacto está en
+# Google Cloud Billing por SKU. Factor USD→EUR ~0.92.
 _PRICE_PER_CALL_EUR_BY_ENDPOINT = {
-    "places_directions": 0.0073,   # Routes V2 Pro+Essentials blend × 0.92 USD→EUR
-    "places_details": 0.0046,      # Essentials $0.005 × 0.92 (free 10k/mes ignorado)
-    "geocode": 0.0046,             # Geocoding $0.005 × 0.92 (free 10k/mes ignorado)
+    # Routes V2: verificado sáb 23 = 2,15€ / 133 calls = 0,0162€/call observado.
+    # Escala por waypoints por call, así que es promedio (no exacto). Antes 0,0073
+    # subestimaba >2x. El umbral de alerta (€/día) ahora refleja el coste real.
+    "places_directions": 0.0162,
+    # Autocomplete New v1 PER REQUEST: usamos Place Details Essentials, y New solo
+    # regala la sesión si cierras en Details Pro/Enterprise (ver
+    # project_migracion_places_api_new). Con Essentials se paga cada autocomplete:
+    # $2.83/1000 × 0.92 = 0,0026€. Antes fallback 0,005 sobreestimaba ~1,9x.
+    "places_autocomplete": 0.0026,
+    # Place Details Essentials (New v1): $5/1000 × 0.92 = 0,0046€.
+    "places_details": 0.0046,
+    # Geocoding: $5/1000 × 0.92 = 0,0046€.
+    "geocode": 0.0046,
+    # places_directions_cache = cache HIT, NO va a Google = 0€.
+    "places_directions_cache": 0.0,
 }
 
 

@@ -43,8 +43,8 @@ def _setup_counters_under_threshold():
 class TestRoutesV2EurDayThreshold:
     def test_under_amber_does_not_fire(self):
         _setup_counters_under_threshold()
-        # 1500 calls × 0.0073 = €10.95 < €15 amber
-        rows = [{"count": 1500}]
+        # 800 calls × 0.0162 = €12.96 < €15 amber (precio recalibrado 25 may)
+        rows = [{"count": 800}]
         mock_sb = MagicMock()
         mock_sb.table = MagicMock(return_value=_FixedResultChain(rows))
         with patch("main.supabase", mock_sb), \
@@ -56,8 +56,8 @@ class TestRoutesV2EurDayThreshold:
 
     def test_amber_fires_amber(self):
         _setup_counters_under_threshold()
-        # 2500 calls × 0.0073 = €18.25 > €15 amber, < €25 red
-        rows = [{"count": 2500}]
+        # 1100 calls × 0.0162 = €17.82 > €15 amber, < €25 red (precio recalibrado)
+        rows = [{"count": 1100}]
         mock_sb = MagicMock()
         mock_sb.table = MagicMock(return_value=_FixedResultChain(rows))
         with patch("main.supabase", mock_sb), \
@@ -76,8 +76,8 @@ class TestRoutesV2EurDayThreshold:
 
     def test_red_fires_red(self):
         _setup_counters_under_threshold()
-        # 3500 × 0.0073 = €25.55 > €25 red
-        rows = [{"count": 3500}]
+        # 1700 × 0.0162 = €27.54 > €25 red (precio recalibrado 25 may)
+        rows = [{"count": 1700}]
         mock_sb = MagicMock()
         mock_sb.table = MagicMock(return_value=_FixedResultChain(rows))
         with patch("main.supabase", mock_sb), \
