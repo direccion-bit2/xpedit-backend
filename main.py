@@ -9571,6 +9571,87 @@ async def admin_costs_live(
     }
 
 
+# RevenueCat API v2 — estado REAL de auto-renovación por suscriptor.
+# Nuestra BD solo guarda promo_plan_expires_at; el flag "canceló la auto-renovación
+# pero sigue activo hasta vencer" SOLO vive en RevenueCat. Esto lo trae para el
+# admin de ingresos (quién renovará vs quién va a caer). Key v2 en REVENUECAT_API_KEY.
+_REVENUECAT_API_KEY = os.getenv("REVENUECAT_API_KEY", "")
+_RC_PROJECT_ID_V2 = "proj6ce03bf9"
+_rc_status_cache: dict = {"at": 0.0, "data": None}
+
+
+@app.get("/admin/revenue/subscription-status", tags=["admin", "revenue"], summary="Estado auto-renovación RevenueCat (renovará / canceló / problema pago)")
+async def admin_revenue_subscription_status(user=Depends(require_admin)):
+    """Consulta RevenueCat API v2 el `auto_renewal_status` de cada driver con
+    subscription_source='revenuecat'. Devuelve por driver: will_renew/will_not_renew,
+    expires, gives_access. + resumen (renovarán / cancelaron-pero-activos / MRR en
+    riesgo). Cache 10 min para no martillear RC ni añadir latencia en cada carga."""
+    import time as _time
+    if not _REVENUECAT_API_KEY:
+        return {"error": "REVENUECAT_API_KEY no configurada en el backend", "items": [], "summary": {}}
+    if _rc_status_cache["data"] is not None and (_time.time() - _rc_status_cache["at"]) < 600:
+        return _rc_status_cache["data"]
+    try:
+        res = supabase.table("drivers").select(
+            "id, name, email, promo_plan, subscription_period"
+        ).eq("subscription_source", "revenuecat").execute()
+        drivers = res.data or []
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return {"error": "db error", "items": [], "summary": {}}
+
+    headers = {"Authorization": f"Bearer {_REVENUECAT_API_KEY}"}
+
+    async def _fetch_one(client, d):
+        did = d["id"]
+        try:
+            r = await client.get(
+                f"https://api.revenuecat.com/v2/projects/{_RC_PROJECT_ID_V2}/customers/{did}/subscriptions",
+                headers=headers,
+            )
+            if r.status_code != 200:
+                return None
+            subs = (r.json() or {}).get("items", [])
+            if not subs:
+                return None
+            active = next((s for s in subs if s.get("gives_access")), None)
+            if active is None:
+                active = max(subs, key=lambda s: s.get("current_period_ends_at") or 0)
+            return {
+                "driver_id": did,
+                "name": d.get("name"),
+                "email": d.get("email"),
+                "auto_renewal_status": active.get("auto_renewal_status"),
+                "status": active.get("status"),
+                "gives_access": active.get("gives_access"),
+                "current_period_ends_at": active.get("current_period_ends_at"),
+                "store": active.get("store"),
+            }
+        except Exception:
+            return None
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        results = await asyncio.gather(*[_fetch_one(client, d) for d in drivers])
+    items = [r for r in results if r]
+
+    active_items = [i for i in items if i.get("gives_access")]
+    will_renew = sum(1 for i in active_items if i.get("auto_renewal_status") == "will_renew")
+    will_not_renew = sum(1 for i in active_items if i.get("auto_renewal_status") == "will_not_renew")
+    out = {
+        "items": items,
+        "summary": {
+            "total_active": len(active_items),
+            "will_renew": will_renew,
+            "will_not_renew": will_not_renew,  # cancelaron auto-renovación, activos hasta vencer
+            "other": len(active_items) - will_renew - will_not_renew,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    _rc_status_cache["at"] = _time.time()
+    _rc_status_cache["data"] = out
+    return out
+
+
 @app.get("/admin/costs/sustainability", tags=["admin", "costs"], summary="Unit economics: €/paying, €/driver activo, €/stop, free tier ETA")
 async def admin_costs_sustainability(user=Depends(require_admin)):
     """KPIs de sostenibilidad de costes API (22 may 2026 audit dashboard).
@@ -10546,7 +10627,8 @@ async def _backfill_compute_missing_in_app(days_lookback: int, min_appearances: 
             break
         for row in chunk.data:
             addr = (row.get("address") or "").strip()
-            lat = row.get("lat"); lng = row.get("lng")
+            lat = row.get("lat")
+            lng = row.get("lng")
             if not addr or lat is None or lng is None or len(addr) < 9:
                 continue
             q = " ".join(addr.split("\n")[0].lower().strip().split())[:200]
