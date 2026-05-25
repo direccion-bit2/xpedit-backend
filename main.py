@@ -8495,6 +8495,27 @@ def _routes_v2_to_directions_shape(routes_v2_data: dict) -> dict:
 # que aquí NO pedimos. `navigationInstruction`, `staticDuration` y `viewport`
 # son Basic.
 _ROUTES_V2_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+
+# routingPreference por origen (26 may 2026 — ahorro ~65% routing). Estos sources
+# solo pintan la GEOMETRÍA del polyline (preview / recálculo de orden de paradas),
+# NO son navegación activa, así que NO necesitan tráfico en tiempo real → SKU
+# "Compute Routes Essentials" ($5/1k, 10k gratis/mes) en vez de "Pro" ($10/1k, 5k
+# gratis). Cualquier OTRO source (start-nav y futuros de conducción) se queda en
+# TRAFFIC_AWARE = Pro, donde el ETA con tráfico y esquivar atascos/cortes SÍ importa.
+# startswith() cubre los sufijos -401retry / -429retry / -returnleg / -jwt-retry que
+# añade el cliente RN (useRoutes.ts). Doc: routes/config_trade_offs.
+_ROUTES_V2_UNAWARE_PREFIXES = (
+    "optimize", "load-route", "cold-start", "resume", "invert", "auto-effect",
+)
+
+
+def _routes_v2_routing_pref(x_triggered_by: Optional[str]) -> str:
+    """Devuelve el routingPreference (SKU) según el origen de la call.
+    Preview de geometría → TRAFFIC_UNAWARE (Essentials $5/1k). Navegación activa
+    y cualquier source desconocido → TRAFFIC_AWARE (Pro $10/1k, conservador: ante
+    la duda, no degradar la conducción)."""
+    src = (x_triggered_by or "").strip().lower()
+    return "TRAFFIC_UNAWARE" if src.startswith(_ROUTES_V2_UNAWARE_PREFIXES) else "TRAFFIC_AWARE"
 _ROUTES_V2_FIELD_MASK = (
     "routes.duration,"
     "routes.distanceMeters,"
@@ -9129,11 +9150,14 @@ async def places_directions(
                     w["via"] = True
                 intermediates.append(w)
 
+    # Solo la navegación activa paga tráfico en tiempo real (Pro). El resto
+    # (preview de geometría: resume/optimize/cold-start/...) usa Essentials.
+    routing_pref = _routes_v2_routing_pref(x_triggered_by)
     body: dict = {
         "origin": _routes_v2_waypoint(origin),
         "destination": _routes_v2_waypoint(destination),
         "travelMode": "DRIVE",
-        "routingPreference": "TRAFFIC_AWARE",
+        "routingPreference": routing_pref,
         "languageCode": "es",
         "polylineEncoding": "ENCODED_POLYLINE",
         "computeAlternativeRoutes": False,
