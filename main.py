@@ -11972,13 +11972,30 @@ async def check_expiring_trials():
                 except Exception:
                     signup_at = now - timedelta(days=7)
                 kpis = _compute_trial_kpis(driver["id"], signup_at)
-                email_result = send_trial_value_recap_email(
-                    driver["email"],
-                    driver.get("name", ""),
-                    kpis["routes_optimized"],
-                    kpis["stops_completed"],
-                    kpis["total_km"],
-                )
+                # GUARD (25 may): NO enviar el recap de valor con números a 0.
+                # Si routes_optimized Y stops_completed son ambos 0, o bien el
+                # usuario no usó la app (el recap "mira lo que conseguiste" no
+                # aplica) o la query de KPIs falló. Enviar "0 entregas, hazte
+                # Pro" es vergonzoso (incidente PYTHON-FASTAPI-R: 9 días
+                # mandando 0 a todos). Fallback al email genérico de trial
+                # expirando, que nunca depende de datos calculados.
+                if kpis["routes_optimized"] == 0 and kpis["stops_completed"] == 0:
+                    days_left = max(0, int(hours_left // 24))
+                    logger.info(
+                        f"D-2 recap con KPIs vacíos para {driver['id']} → "
+                        f"fallback a email genérico (no enviar '0 entregas')"
+                    )
+                    email_result = send_trial_expiring_email(
+                        driver["email"], driver.get("name", ""), driver["promo_plan"], days_left
+                    )
+                else:
+                    email_result = send_trial_value_recap_email(
+                        driver["email"],
+                        driver.get("name", ""),
+                        kpis["routes_optimized"],
+                        kpis["stops_completed"],
+                        kpis["total_km"],
+                    )
             else:  # d1
                 email_result = send_trial_last_day_email(driver["email"], driver.get("name", ""))
 

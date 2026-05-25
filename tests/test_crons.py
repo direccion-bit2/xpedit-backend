@@ -430,6 +430,44 @@ class TestCheckExpiringTrials:
         assert call_args.args[4] == 50.0  # total_km
 
     @pytest.mark.asyncio
+    async def test_d2_cohort_with_empty_kpis_sends_generic_not_zero_recap(self):
+        """GUARD anti-basura: si los KPIs del trial salen a 0 (usuario no usó
+        la app o la query falló), NO enviar el recap de valor con '0 entregas'
+        — enviar el email genérico de trial expirando. Protege contra el
+        incidente PYTHON-FASTAPI-R (9 días mandando '0 entregas, hazte Pro')."""
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=12)).isoformat()
+        signup_at = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        drivers = [{
+            "id": "driver-d2-empty",
+            "email": "user@test.com",
+            "name": "Test User",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": expires_at,
+            "subscription_source": None,
+            "created_at": signup_at,
+            "push_token": None,
+        }]
+
+        mock_sb = make_mock_supabase()
+        # routes_count=0, stops_count=0 → KPIs vacíos → debe activar el guard
+        mock_sb.table = MagicMock(
+            side_effect=_expiry_dispatch(drivers, routes_count=0, stops_count=0)
+        )
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expiring_email", return_value={"success": True, "id": "gen"}) as mock_generic, \
+             patch("main.send_trial_value_recap_email") as mock_recap, \
+             patch("main.send_trial_last_day_email"):
+            from main import check_expiring_trials
+            await check_expiring_trials()
+
+        # El recap con números NO debe enviarse (sería "0 entregas")
+        mock_recap.assert_not_called()
+        # En su lugar, el email genérico de trial expirando
+        mock_generic.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_d1_cohort_also_sends_push_when_token_present(self):
         # D-1 driver with a push_token → email + push both fire.
         expires_at = (datetime.now(timezone.utc) + timedelta(days=1, hours=12)).isoformat()
