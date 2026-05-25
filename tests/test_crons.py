@@ -289,9 +289,10 @@ def _expiry_dispatch(drivers_data, email_log_existing=False, routes_count=0, sto
         if name == "drivers":
             return _FixedResultChain(data=drivers_data)
         if name == "routes":
-            # Each row needs total_distance_km + optimized_hash for the KPI sum.
+            # Each row needs id (para filtrar stops por route_id) +
+            # total_distance_km + optimized_hash for the KPI sum.
             return _FixedResultChain(
-                data=[{"total_distance_km": 12.5, "optimized_hash": "h"}] * routes_count,
+                data=[{"id": f"route-{i}", "total_distance_km": 12.5, "optimized_hash": "h"} for i in range(routes_count)],
                 count=routes_count,
             )
         if name == "stops":

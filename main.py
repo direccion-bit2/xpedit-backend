@@ -11852,16 +11852,23 @@ def _compute_trial_kpis(driver_id: str, signup_at: datetime) -> dict:
                     except (TypeError, ValueError):
                         pass
 
-        s = (
-            supabase.table("stops")
-            .select("id", count="exact")
-            .eq("driver_id", driver_id)
-            .eq("status", "completed")
-            .is_("deleted_at", "null")
-            .gte("created_at", signup_at.isoformat())
-            .execute()
-        )
-        stops_completed = s.count or 0
+        # stops NO tiene driver_id (tiene route_id). Filtramos por los route_ids
+        # del driver que ya cargamos arriba en `r`. Fix 25 may: la query previa
+        # con stops.driver_id fallaba con 42703 (column does not exist) → los
+        # KPIs de trial llevaban 9 días sin calcularse (PYTHON-FASTAPI-R, 138
+        # fallos) y el email D-2 de recap mostraba 0 stops a todos los trials.
+        route_ids = [row["id"] for row in (r.data or []) if row.get("id")]
+        if route_ids:
+            s = (
+                supabase.table("stops")
+                .select("id", count="exact")
+                .in_("route_id", route_ids)
+                .eq("status", "completed")
+                .is_("deleted_at", "null")
+                .gte("created_at", signup_at.isoformat())
+                .execute()
+            )
+            stops_completed = s.count or 0
     except Exception as e:
         logger.warning(f"Trial KPI compute failed for {driver_id}: {e}")
     return {
