@@ -9590,6 +9590,12 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
         today_iso,
     )
     eur_24h_neto = float(costs_24h.get("_total_cost_usd") or 0) * USD_TO_EUR
+    # BRUTO = coste real de servir (antes del regalo free tier de Google). Las
+    # métricas unitarias (€/paying, €/driver, €/stop) DEBEN usar bruto: la
+    # pregunta es "¿cuánto cuesta de verdad servir a cada uno?", no "cuánto
+    # pago tras el regalo temporal de Google". Con neto siempre daban 0,00€
+    # porque el free tier $200/mes cubre el uso actual (Miguel 25 may).
+    eur_24h_bruto = float(costs_24h.get("_total_cost_gross_usd") or 0) * USD_TO_EUR
 
     # Coste mes (consumido del free tier — Google Maps gross only)
     # Suma de daily_api_metrics desde día 1 del mes para servicios que cuentan
@@ -9705,10 +9711,11 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
         _paying_count(), _active_drivers_today(), _stops_created_today(), _stops_created_last_24h()
     )
 
-    cost_per_paying = (eur_24h_neto / paying) if paying else 0
-    cost_per_driver = (eur_24h_neto / active_drivers) if active_drivers else 0
-    # Misma ventana 24h para numerador y denominador (antes mezclaba)
-    cost_per_stop = (eur_24h_neto / stops_24h) if stops_24h else 0
+    # Unit economics con BRUTO (coste real de servir), no neto (que da 0 por
+    # el free tier). Misma ventana 24h para numerador y denominador.
+    cost_per_paying = (eur_24h_bruto / paying) if paying else 0
+    cost_per_driver = (eur_24h_bruto / active_drivers) if active_drivers else 0
+    cost_per_stop = (eur_24h_bruto / stops_24h) if stops_24h else 0
 
     # Comparativa semanal: ISO weeks current vs previous
     try:
