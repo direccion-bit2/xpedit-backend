@@ -5390,6 +5390,8 @@ async def ocr_label(request: OCRLabelRequest, user=Depends(get_current_user)):
 
     import time
     t0 = time.perf_counter()
+    # Trazabilidad (25 may): cada scan de etiqueta = 1 llamada Gemini (Vertex).
+    _bump_api_source("vertex_gemini", "ocr-label", user_id=user.get("id"))
     try:
         data = await asyncio.to_thread(
             _ocr_label_with_gemini,
@@ -6295,6 +6297,8 @@ async def _msi_get_candidates_for_stop(
         avg_lng = (bbox["sw_lng"] + bbox["ne_lng"]) / 2
         params["location"] = f"{avg_lat},{avg_lng}"
         params["radius"] = "30000"
+    # Trazabilidad (25 may): fallback autocomplete para stops MSI baja confianza.
+    _bump_api_source("places_autocomplete", "msi-candidates", user_id=None)
     try:
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/place/autocomplete/json",
@@ -6471,6 +6475,8 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
     check_ocr_image_quota(quota_key, tier, len(req.images))
 
     t_start = time.perf_counter()
+    # Trazabilidad (25 may): cada extracción MSI = N imágenes a Gemini (Vertex).
+    _bump_api_source("vertex_gemini", "msi-extract", user_id=auth_user_id)
     try:
         gemini_result = await asyncio.to_thread(
             _msi_extract_stops_with_gemini, req.images, req.carrier_hint, req.route_context
@@ -9864,6 +9870,7 @@ async def admin_diag_smoke(user=Depends(require_admin)):
     # 4. Google Places ping (HEAD a la API endpoint, no real query)
     try:
         client = google_maps_client()
+        _bump_api_source("places_autocomplete", "admin-diag", user_id=None)
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/place/autocomplete/json",
             params={"input": "test", "key": GOOGLE_API_KEY, "language": "es"},
@@ -10427,6 +10434,7 @@ async def admin_cache_backfill_missing(
             "radius": "20000",  # bias 20km
         }
         try:
+            _bump_api_source("places_autocomplete", "cache-backfill", user_id=None)
             resp = await client.get(
                 "https://maps.googleapis.com/maps/api/place/autocomplete/json",
                 params=params,
@@ -13159,6 +13167,7 @@ async def periodic_health_check():
         places_ok = _places_api_healthy  # Use cached value by default
         if GOOGLE_API_KEY and (not _places_api_last_check or (datetime.now(timezone.utc) - _places_api_last_check).total_seconds() > 3600):
             places_ok = False
+            _bump_api_source("places_autocomplete", "health-check", user_id=None)
             for _hc_attempt in range(2):
                 try:
                     resp = await google_maps_client().get(

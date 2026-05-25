@@ -98,6 +98,12 @@ async def _directions_polyline(
     pedestrian zones excluded).
     """
     try:
+        # Trazabilidad (25 may): localizar esta call del scraper en el counter.
+        from main import _bump_api_source
+        _bump_api_source("places_directions", "closures-polyline", user_id=None)
+    except Exception:
+        pass  # no romper el scraper por la métrica
+    try:
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/directions/json",
             params={
