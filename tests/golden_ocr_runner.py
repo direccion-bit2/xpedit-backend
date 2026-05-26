@@ -137,8 +137,8 @@ def run(api_url: str, token: str | None) -> int:
             print(f"  - {fn}: expected={len(expected_stops)} got={len(got_stops)} matched={file_matches}")
 
     print("\n## Summary\n")
-    print(f"| Carrier | Images | Expected | Got | Matched | Recall |")
-    print(f"|---|---|---|---|---|---|")
+    print("| Carrier | Images | Expected | Got | Matched | Recall |")
+    print("|---|---|---|---|---|---|")
     for c, s in sorted(by_carrier.items()):
         recall = s["matches"] / s["expected"] if s["expected"] else 0
         print(f"| {c} | {s['images']} | {s['expected']} | {s['got']} | {s['matches']} | {recall:.2%} |")

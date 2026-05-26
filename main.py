@@ -808,7 +808,15 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# Rate limiting (in-memory, single instance)
+# Rate limiting (in-memory, SINGLE worker — Procfile runs `uvicorn main:app` with no --workers).
+# Thread-safety: check_rate_limit / check_ocr_image_quota are SYNC functions with NO `await`
+# inside, and every caller is an `async def` endpoint/middleware. On a single-threaded event
+# loop that makes the check-then-act ATOMIC (no coroutine can interleave without an await), so
+# there is NO race condition today (verified 26 may 2026).
+# ⚠️ If we ever scale to multiple uvicorn workers / Railway replicas, this dict is per-process →
+# the limit stops being global (each worker counts apart); AND if any SYNC `def` endpoint starts
+# calling these (FastAPI runs those in a threadpool) a real race appears. At that point move the
+# counter to a shared store (Redis / Supabase). See scaling plan.
 from collections import defaultdict
 
 _rate_limits: dict = defaultdict(list)
@@ -996,6 +1004,13 @@ def _resolve_user_tier(auth_user_id: str) -> tuple[str, Optional[str]]:
                 return "trial", driver_id
         except (ValueError, AttributeError):
             pass
+    # Permanent promo grant: promo='pro'|'pro_plus' with NO store subscription AND
+    # NO expiry date = a Pro/Pro+ granted by hand (collaborators, trusted drivers).
+    # Trials always carry an expires_at; a promo plan WITHOUT one is a permanent
+    # grant. Without this branch these accounts fell through to 'free' and lost
+    # paid features (e.g. OCR quota 0). Bug #pro-permanente-paywall (26 may 2026).
+    if promo in ("pro", "pro_plus") and sub_src is None and not expires_raw:
+        return ("pro_plus" if promo == "pro_plus" else "pro"), driver_id
     return "free", driver_id
 
 @app.middleware("http")
@@ -5505,6 +5520,8 @@ def _verify_msi_access(auth_user_id: str) -> dict:
       - Pro paid (monthly o yearly): promo_plan='pro' AND subscription_source IN ('stripe','revenuecat')
       - Pro yearly por sub_period: subscription_period='yearly' (any plan name)
       - Active trial: promo_plan IN ('pro','pro_plus') AND expires > NOW() AND source IS NULL
+      - Permanent promo grant: promo_plan IN ('pro','pro_plus') AND source IS NULL AND no expiry
+        (Pro/Pro+ dado a mano a colaboradores/drivers de confianza)
 
     Solo `free` (sin trial activo y sin pago) cae al paywall. La quota diaria
     por tier la cubre `_OCR_DAILY_IMG_QUOTA` (trial=pro=30, pro_plus=50).
@@ -5538,14 +5555,23 @@ def _verify_msi_access(auth_user_id: str) -> dict:
         except (ValueError, AttributeError):
             is_trial = False
 
-    is_eligible = is_pro_plus_paid or is_pro_paid or is_pro_yearly or is_trial
+    # Permanent promo grant: Pro/Pro+ granted by hand (no store sub, no expiry).
+    # Trials always carry an expires_at; a promo plan WITHOUT one is permanent.
+    # Without this they'd hit the paywall here. Bug #pro-permanente-paywall (26 may 2026).
+    is_pro_plus_promo = promo == "pro_plus" and sub_src is None and not expires_raw
+    is_pro_promo = promo == "pro" and sub_src is None and not expires_raw
+
+    is_eligible = (
+        is_pro_plus_paid or is_pro_paid or is_pro_yearly or is_trial
+        or is_pro_plus_promo or is_pro_promo
+    )
 
     # Tier resolution: pro_plus wins over yearly wins over pro wins over trial.
-    if is_pro_plus_paid:
+    if is_pro_plus_paid or is_pro_plus_promo:
         tier = "pro_plus"
     elif is_pro_yearly:
         tier = "pro_yearly"
-    elif is_pro_paid:
+    elif is_pro_paid or is_pro_promo:
         tier = "pro"
     elif is_trial:
         tier = "trial"
