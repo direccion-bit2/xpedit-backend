@@ -10355,7 +10355,35 @@ _PRICE_PER_CALL_EUR_BY_ENDPOINT = {
     "geocode": 0.0046,
     # places_directions_cache = cache HIT, NO va a Google = 0€.
     "places_directions_cache": 0.0,
+    # Maps JS Dynamic map load (mapas del admin, #54): $7/1000 × 0.92 ≈ 0,0065€/carga.
+    "maps_js_dynamic": 0.0065,
 }
+
+
+@app.get("/admin/maps-config", tags=["admin", "costs"], summary="Flag + tracking de cargas de mapa del admin (#54)")
+async def admin_maps_config(user=Depends(require_admin)):
+    """Los componentes de mapa del admin llaman esto al montar. Si el flag
+    app_config.admin_maps_enabled != 'off', cuenta 1 carga de Maps JS Dynamic en
+    api_source_daily (visible en /admin/costs, ~0,0065€/carga) y devuelve
+    enabled=true. Kill switch instantáneo SIN redeploy:
+        UPDATE app_config SET value='off' WHERE key='admin_maps_enabled';
+    Con 'off', los mapas del admin caen al esquema ligero (coste Google = 0)."""
+    enabled = True
+    try:
+        r = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "admin_maps_enabled")
+            .limit(1)
+            .execute()
+        )
+        if r.data and str(r.data[0].get("value") or "").lower() == "off":
+            enabled = False
+    except Exception:
+        enabled = True  # fail-open: si no se puede leer el flag, mapas ON
+    if enabled:
+        _bump_api_source("maps_js_dynamic", "admin", user_id=user.get("id"))
+    return {"enabled": enabled}
 
 
 @app.get("/admin/api-sources", tags=["admin", "costs"], summary="Desglose calls por endpoint+origen X-Triggered-By (TODOS los endpoints)")
