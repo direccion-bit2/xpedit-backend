@@ -10872,7 +10872,9 @@ async def delete_account(user=Depends(get_current_user)):
         tables_user = [
             ("code_redemptions", "user_id"),
             ("company_driver_links", "user_id"),
-            ("company_invites", "user_id"),
+            # company_invites has no user_id column — the creator is `created_by`
+            # (verified 26 may, error 42703 on delete_account). #55
+            ("company_invites", "created_by"),
         ]
         for table, column in tables_user:
             try:
