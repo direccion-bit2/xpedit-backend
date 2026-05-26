@@ -10333,39 +10333,40 @@ _PRICE_PER_CALL_EUR_BY_ENDPOINT = {
 
 
 @app.get("/admin/api-sources", tags=["admin", "costs"], summary="Desglose calls por endpoint+origen X-Triggered-By (TODOS los endpoints)")
-async def admin_api_sources(user=Depends(require_admin)):
-    """Desglose 360° de calls Google Maps por endpoint y origen (X-Triggered-By).
+async def admin_api_sources(date: Optional[str] = None, user=Depends(require_admin)):
+    """Desglose 360° de calls Google Maps por endpoint y origen (X-Triggered-By),
+    POR DÍA NATURAL (tabla api_source_daily, fecha UTC). `date` (YYYY-MM-DD) elige
+    el día a ver (default = hoy). Para comparar, el cliente pide dos fechas.
 
-    Cubre /places/directions, /places/details, /geocode. Combina counter
-    in-memory (al minuto) + persistido Supabase (sobrevive restarts).
-    Histórico 7d por endpoint para detectar drift de uso entre días.
+    Fix 26 may (#46): ya NO mezcla el counter in-memory, que acumulaba desde el
+    arranque del proceso y falseaba "hoy" (mostraba el acumulado de ~16h, no el día
+    natural). Histórico 7d por endpoint para drift de uso.
     """
     uptime_min = round((time.time() - _api_counters_started_at) / 60, 1)
     today_iso = datetime.now(timezone.utc).date().isoformat()
+    target_date = (date or today_iso).strip()
+    if len(target_date) != 10 or target_date[4] != "-" or target_date[7] != "-":
+        raise HTTPException(status_code=400, detail="Fecha inválida, usa YYYY-MM-DD")
     cutoff_7d = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+    fetch_from = min(cutoff_7d, target_date)
 
-    # Lee BD api_source_daily (tabla nueva). Si falla (tabla aún no
-    # creada por Supabase MCP, devolverá [] → solo veremos in-memory).
     persisted_rows: list[dict] = []
     try:
         persisted_rows = (
             supabase.table("api_source_daily")
             .select("endpoint, date, source, count")
-            .gte("date", cutoff_7d)
+            .gte("date", fetch_from)
             .execute()
         ).data or []
     except Exception as e:
         logger.info(f"api_source_daily fetch failed (table may not exist yet): {e}")
 
-    # Agregados por endpoint
+    # Agregados por endpoint — SOLO de la BD por fecha (no in-memory).
     out_endpoints: list[dict] = []
-    seen_endpoints = set(_api_source_counters.keys())
-    for row in persisted_rows:
-        seen_endpoints.add(row["endpoint"])
+    seen_endpoints = {row["endpoint"] for row in persisted_rows}
 
     from collections import defaultdict
     for endpoint in sorted(seen_endpoints):
-        inmem_today = _api_source_counters.get(endpoint, {})
         persisted_today: dict = defaultdict(int)
         persisted_7d: dict = defaultdict(int)
         for row in persisted_rows:
@@ -10373,15 +10374,11 @@ async def admin_api_sources(user=Depends(require_admin)):
                 continue
             cnt = int(row.get("count") or 0)
             persisted_7d[row["source"]] += cnt
-            if row.get("date") == today_iso:
+            if row.get("date") == target_date:
                 persisted_today[row["source"]] += cnt
 
-        # Hoy = max(BD persistido, in-memory) por source (in-mem puede ir delante)
-        all_sources_today = set(list(persisted_today.keys()) + list(inmem_today.keys()))
-        today_by_source = {
-            src: max(persisted_today.get(src, 0), inmem_today.get(src, 0))
-            for src in all_sources_today
-        }
+        # Día natural REAL (solo api_source_daily, por fecha). Sin in-memory.
+        today_by_source = dict(persisted_today)
         today_total = sum(today_by_source.values())
         price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint, 0.005)
 
@@ -10422,10 +10419,12 @@ async def admin_api_sources(user=Depends(require_admin)):
 
     return {
         "ok": True,
+        "date": target_date,
+        "is_today": target_date == today_iso,
         "uptime_minutes": uptime_min,
         "endpoints": out_endpoints,
-        "note": "Datos hoy = BD persistente + in-memory. Histórico 7d solo BD. "
-                "Pricing estimado por blend tier; valores reales en Cloud Console.",
+        "note": "Datos por DÍA NATURAL (api_source_daily, UTC). Histórico 7d. "
+                "Pricing estimado; valores reales en Cloud Console / billing.",
     }
 
 
