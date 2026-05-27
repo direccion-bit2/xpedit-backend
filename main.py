@@ -1168,6 +1168,23 @@ class RouteCreate(BaseModel):
     total_distance_km: Optional[float] = None
 
 
+class ImportRow(BaseModel):
+    """Una fila de un CSV de pedidos importado por el dispatcher (solo dirección de
+    texto + datos opcionales; el backend geocodifica)."""
+    address: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    notes: Optional[str] = None
+    packages: Optional[int] = None
+
+
+class RouteImportRequest(BaseModel):
+    driver_id: str
+    name: Optional[str] = None
+    country: Optional[str] = None  # ISO-2 para sesgar el geocoding (ES, CO, MX...)
+    rows: List[ImportRow]
+
+
 class LocationUpdate(BaseModel):
     driver_id: str
     route_id: Optional[str] = None
@@ -2205,6 +2222,105 @@ async def assign_route_driver(route_id: str, req: AssignDriverRequest,
     if req.driver_id:
         await notify_driver_route_assigned(req.driver_id, route_id)
     return {"success": True, "route": updated}
+
+
+async def _geocode_address(address: str, country: Optional[str] = None) -> Optional[dict]:
+    """Geocodifica una dirección de texto con Google Geocoding. Devuelve
+    {'lat','lng','display_name'} o None si no se encuentra/falla. Usado por el import
+    de pedidos del dispatcher (CSV)."""
+    if not GOOGLE_API_KEY or not address or not address.strip():
+        return None
+    params = {"address": address, "language": "es", "key": GOOGLE_API_KEY}
+    if country and country.strip():
+        cc = country.strip().upper()
+        params["region"] = cc.lower()
+        params["components"] = f"country:{cc}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://maps.googleapis.com/maps/api/geocode/json", params=params, timeout=10.0)
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"Geocode (import) error for '{address[:60]}': {e}")
+        return None
+    if data.get("status") != "OK" or not data.get("results"):
+        return None
+    r = data["results"][0]
+    loc = (r.get("geometry", {}) or {}).get("location", {}) or {}
+    if loc.get("lat") is None or loc.get("lng") is None:
+        return None
+    return {"lat": loc["lat"], "lng": loc["lng"], "display_name": r.get("formatted_address", address)}
+
+
+@app.post("/company/routes/import", tags=["routes", "company"],
+          summary="Importar pedidos (CSV) como ruta para un conductor (dispatcher)")
+async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_admin_or_dispatcher)):
+    """El dispatcher importa pedidos en bloque (filas de un CSV ya parseado en el
+    dashboard) y se crea una ruta para un conductor de SU empresa. El backend geocodifica
+    cada dirección; las que no se encuentran se devuelven en `failed_addresses` y NO
+    bloquean al resto. Misma validación de empresa que crear/asignar (verify_driver_access)
+    + rellena company_id + push 'nueva ruta asignada'."""
+    await verify_driver_access(req.driver_id, user)
+    if not req.rows:
+        raise HTTPException(status_code=400, detail="No hay filas para importar")
+    if len(req.rows) > 200:
+        raise HTTPException(status_code=400, detail="Máximo 200 paradas por importación")
+
+    stops_data: list[dict] = []
+    failed: list[str] = []
+    for row in req.rows:
+        geo = await _geocode_address(row.address, req.country)
+        if not geo:
+            failed.append(row.address)
+            continue
+        stops_data.append({
+            "address": geo["display_name"],
+            "lat": geo["lat"],
+            "lng": geo["lng"],
+            "position": len(stops_data),
+            "notes": row.notes,
+            "phone": row.phone,
+            "packages": row.packages,
+        })
+
+    if not stops_data:
+        raise HTTPException(status_code=422, detail={
+            "error": "no_geocoded",
+            "message": "Ninguna dirección se pudo geocodificar",
+            "failed_addresses": failed,
+        })
+
+    driver_q = await asyncio.to_thread(
+        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+    )
+    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+
+    route_data: dict = {
+        "driver_id": req.driver_id,
+        "name": req.name or f"Importada {datetime.now(timezone.utc).strftime('%d/%m %H:%M')}",
+        "total_stops": len(stops_data),
+        "status": "pending",
+    }
+    if driver_company_id:
+        route_data["company_id"] = driver_company_id
+
+    route_result = await asyncio.to_thread(lambda: supabase.table("routes").insert(route_data).execute())
+    route_row = safe_first(route_result)
+    if not route_row:
+        raise HTTPException(status_code=500, detail="Error al crear la ruta importada")
+    route_id = route_row["id"]
+
+    for s in stops_data:
+        s["route_id"] = route_id
+    stops_insert = await asyncio.to_thread(lambda: supabase.table("stops").insert(stops_data).execute())
+    if not stops_insert.data:
+        logger.error(f"Import: failed to insert stops for route {route_id}")
+        raise HTTPException(status_code=500, detail="Error al crear las paradas importadas")
+
+    await notify_driver_route_assigned(req.driver_id, route_id)
+    log_audit(user["id"], "import_route", "route", route_id,
+              {"driver_id": req.driver_id, "imported": len(stops_data), "failed": len(failed)})
+    return {"success": True, "route_id": route_id, "imported": len(stops_data),
+            "failed_count": len(failed), "failed_addresses": failed}
 
 
 class ReconcileOptimizationBody(BaseModel):

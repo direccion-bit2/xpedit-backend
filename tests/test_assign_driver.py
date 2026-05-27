@@ -249,3 +249,97 @@ class TestDispatcherCreateRoute:
             resp = await dispatcher_client.post("/routes", json=payload)
 
         assert resp.status_code == 403
+
+
+class TestImportRoute:
+    """POST /company/routes/import: dispatcher importa pedidos (CSV) → ruta geocodificada (Fase 1)."""
+
+    def _table_dispatch_factory(self, captured):
+        def table_dispatch(name):
+            chain = MagicMock()
+            if name == "drivers":
+                dl = MagicMock()
+                dl.data = [{"company_id": FAKE_COMPANY_A}]
+                chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = dl
+            elif name == "routes":
+                def cap_route(data):
+                    captured["route"] = data
+                    ins = MagicMock()
+                    ins.data = [{"id": "imp-route-1"}]
+                    m = MagicMock()
+                    m.execute.return_value = ins
+                    return m
+                chain.insert.side_effect = cap_route
+            elif name == "stops":
+                def cap_stops(data):
+                    captured["stops"] = data
+                    st = MagicMock()
+                    st.data = [{"id": f"s{i}"} for i in range(len(data))]
+                    m = MagicMock()
+                    m.execute.return_value = st
+                    return m
+                chain.insert.side_effect = cap_stops
+            return chain
+        return table_dispatch
+
+    @pytest.mark.asyncio
+    async def test_import_creates_route_with_geocoded_stops(self, dispatcher_client):
+        payload = {"driver_id": TARGET_DRIVER, "name": "Import test", "country": "ES",
+                   "rows": [{"address": "Calle A 1"}, {"address": "Calle B 2", "phone": "600"}]}
+        captured = {}
+
+        async def fake_geocode(addr, country=None):
+            return {"lat": 40.0, "lng": -3.0, "display_name": f"{addr} (geo)"}
+
+        with patch("main.verify_driver_access", new=AsyncMock(return_value=True)), \
+             patch("main._geocode_address", new=AsyncMock(side_effect=fake_geocode)), \
+             patch("main.notify_driver_route_assigned", new=AsyncMock()) as notify, \
+             patch("main.log_audit"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(side_effect=self._table_dispatch_factory(captured))
+            resp = await dispatcher_client.post("/company/routes/import", json=payload)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["imported"] == 2
+        assert body["failed_count"] == 0
+        assert captured["route"]["company_id"] == FAKE_COMPANY_A
+        assert captured["route"]["total_stops"] == 2
+        assert len(captured["stops"]) == 2
+        notify.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_import_skips_failed_geocode(self, dispatcher_client):
+        payload = {"driver_id": TARGET_DRIVER,
+                   "rows": [{"address": "Calle OK"}, {"address": "Calle FAIL"}]}
+        captured = {}
+
+        async def fake_geocode(addr, country=None):
+            if "FAIL" in addr:
+                return None
+            return {"lat": 40.0, "lng": -3.0, "display_name": addr}
+
+        with patch("main.verify_driver_access", new=AsyncMock(return_value=True)), \
+             patch("main._geocode_address", new=AsyncMock(side_effect=fake_geocode)), \
+             patch("main.notify_driver_route_assigned", new=AsyncMock()), \
+             patch("main.log_audit"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(side_effect=self._table_dispatch_factory(captured))
+            resp = await dispatcher_client.post("/company/routes/import", json=payload)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["imported"] == 1
+        assert body["failed_count"] == 1
+        assert body["failed_addresses"] == ["Calle FAIL"]
+        assert len(captured["stops"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_import_all_failed_returns_422(self, dispatcher_client):
+        payload = {"driver_id": TARGET_DRIVER, "rows": [{"address": "X"}, {"address": "Y"}]}
+        with patch("main.verify_driver_access", new=AsyncMock(return_value=True)), \
+             patch("main._geocode_address", new=AsyncMock(return_value=None)), \
+             patch("main.supabase"):
+            resp = await dispatcher_client.post("/company/routes/import", json=payload)
+
+        assert resp.status_code == 422
