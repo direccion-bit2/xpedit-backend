@@ -264,6 +264,26 @@ async def send_push_to_token(token: str, title: str, body: str, data: dict = Non
         return False
 
 
+async def notify_driver_route_assigned(driver_id: str, route_id: str) -> None:
+    """Push 'nueva ruta asignada' al conductor cuando un dispatcher/empresa le asigna o
+    crea una ruta. Fire-and-forget: si falla el push NO debe romper la asignación."""
+    try:
+        q = await asyncio.to_thread(
+            lambda: supabase.table("drivers").select("push_token").eq("id", driver_id).limit(1).execute()
+        )
+        token = q.data[0].get("push_token") if q.data else None
+        if token:
+            await send_push_to_token(
+                token,
+                "Nueva ruta asignada",
+                "Tu empresa te ha asignado una ruta. Ábrela en Xpedit.",
+                {"type": "route_assigned", "route_id": route_id},
+            )
+    except Exception as e:
+        logger.warning(f"No se pudo notificar ruta asignada a {driver_id}: {e}")
+        sentry_sdk.capture_exception(e)
+
+
 # ========== ADDRESS NORMALIZATION ==========
 _STREET_PREFIXES = {
     "c/": "calle", "cl": "calle", "cl.": "calle",
@@ -808,7 +828,15 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# Rate limiting (in-memory, single instance)
+# Rate limiting (in-memory, SINGLE worker — Procfile runs `uvicorn main:app` with no --workers).
+# Thread-safety: check_rate_limit / check_ocr_image_quota are SYNC functions with NO `await`
+# inside, and every caller is an `async def` endpoint/middleware. On a single-threaded event
+# loop that makes the check-then-act ATOMIC (no coroutine can interleave without an await), so
+# there is NO race condition today (verified 26 may 2026).
+# ⚠️ If we ever scale to multiple uvicorn workers / Railway replicas, this dict is per-process →
+# the limit stops being global (each worker counts apart); AND if any SYNC `def` endpoint starts
+# calling these (FastAPI runs those in a threadpool) a real race appears. At that point move the
+# counter to a shared store (Redis / Supabase). See scaling plan.
 from collections import defaultdict
 
 _rate_limits: dict = defaultdict(list)
@@ -996,6 +1024,13 @@ def _resolve_user_tier(auth_user_id: str) -> tuple[str, Optional[str]]:
                 return "trial", driver_id
         except (ValueError, AttributeError):
             pass
+    # Permanent promo grant: promo='pro'|'pro_plus' with NO store subscription AND
+    # NO expiry date = a Pro/Pro+ granted by hand (collaborators, trusted drivers).
+    # Trials always carry an expires_at; a promo plan WITHOUT one is a permanent
+    # grant. Without this branch these accounts fell through to 'free' and lost
+    # paid features (e.g. OCR quota 0). Bug #pro-permanente-paywall (26 may 2026).
+    if promo in ("pro", "pro_plus") and sub_src is None and not expires_raw:
+        return ("pro_plus" if promo == "pro_plus" else "pro"), driver_id
     return "free", driver_id
 
 @app.middleware("http")
@@ -2015,11 +2050,30 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
 async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     """Crea una nueva ruta con sus paradas. El conductor debe ser el usuario autenticado (salvo admin)."""
     route_request = route  # Save original request before reassignment
-    # Verify user can create route for this driver
-    if user["role"] != "admin":
+    # Verify user can create route for this driver:
+    # - admin: para cualquier conductor
+    # - dispatcher: solo para conductores de SU empresa (verify_driver_access valida company)
+    # - driver: solo para sí mismo
+    if user["role"] == "admin":
+        pass
+    elif user.get("role") == "dispatcher":
+        await verify_driver_access(route_request.driver_id, user)
+    else:
         user_driver_id = await get_user_driver_id(user)
         if route_request.driver_id != user_driver_id:
             raise HTTPException(status_code=403, detail="No puedes crear rutas para otro conductor")
+    # Resolver la empresa del driver ANTES de crear la ruta, para asociar la ruta a
+    # su empresa (V1 multi-empresa: que el dispatcher solo vea/gestione SUS rutas).
+    # Si el driver no pertenece a ninguna empresa (self-service normal), queda NULL y
+    # el comportamiento es idéntico al actual → cero impacto para drivers sueltos.
+    driver_company_id = None
+    try:
+        driver_q = supabase.table("drivers").select("company_id").eq("id", route_request.driver_id).limit(1).execute()
+        driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+    except Exception as e:
+        logger.warning(f"No se pudo resolver company_id del driver: {e}")
+        sentry_sdk.capture_exception(e)
+
     # Crear la ruta
     route_data = {
         "driver_id": route_request.driver_id,
@@ -2028,6 +2082,8 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
         "total_stops": len(route_request.stops),
         "status": "pending"
     }
+    if driver_company_id:
+        route_data["company_id"] = driver_company_id
 
     route_result = supabase.table("routes").insert(route_data).execute()
     route_row = safe_first(route_result)
@@ -2054,11 +2110,10 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     ]
 
     # Enriquecer stops desde el directorio de clientes de la empresa
+    # (reutiliza driver_company_id ya resuelto arriba — evita una 2ª query)
     try:
-        driver_q = supabase.table("drivers").select("company_id").eq("id", route_request.driver_id).limit(1).execute()
-        company_id = driver_q.data[0].get("company_id") if driver_q.data else None
-        if company_id:
-            stops_data, enriched = enrich_stops_from_directory(company_id, stops_data)
+        if driver_company_id:
+            stops_data, enriched = enrich_stops_from_directory(driver_company_id, stops_data)
             if enriched:
                 logger.info(f"Enriched {enriched} stops from customer directory")
     except Exception as e:
@@ -2069,6 +2124,11 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     if not stops_insert.data:
         logger.error(f"Failed to insert stops for route {route_id}")
         raise HTTPException(status_code=500, detail="Error al crear las paradas de la ruta")
+
+    # Si quien crea es dispatcher/admin (creando para un driver de la flota, no para sí
+    # mismo), avisar al conductor con un push de "nueva ruta asignada".
+    if user.get("role") in ("dispatcher", "admin"):
+        await notify_driver_route_assigned(route_request.driver_id, route_id)
 
     # Devolver ruta completa
     result = supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
@@ -2100,6 +2160,51 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
     if not route:
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
     return {"success": True, "route": route}
+
+
+class AssignDriverRequest(BaseModel):
+    driver_id: Optional[str] = None  # None = desasignar (quitar conductor de la ruta)
+
+
+@app.patch("/routes/{route_id}/assign-driver", tags=["routes", "company"],
+           summary="Asignar/reasignar/desasignar una ruta a un conductor (dispatcher)")
+async def assign_route_driver(route_id: str, req: AssignDriverRequest,
+                              user=Depends(require_admin_or_dispatcher)):
+    """Asigna (o desasigna) una ruta a un conductor con validación de empresa en el
+    BACKEND. Sustituye el `supabase.update({driver_id})` directo del dashboard, que solo
+    comprobaba el rol y NO la empresa (un dispatcher podía asignar a un conductor de
+    OTRA empresa). Reutiliza los helpers de ownership:
+    - `verify_route_access`: el dispatcher solo toca rutas de SU empresa (admin: todas).
+    - `verify_driver_access`: el conductor destino debe ser de SU empresa (admin: todos).
+
+    `driver_id=None` desasigna la ruta (solo valida acceso a la ruta; no se toca
+    `company_id`, la ruta sigue perteneciendo a la empresa).
+    """
+    await verify_route_access(route_id, user)
+
+    update_data: dict = {"driver_id": req.driver_id}
+    if req.driver_id:
+        # Asignación real: el conductor destino debe ser de la empresa del que asigna,
+        # y mantenemos routes.company_id consistente con la empresa del conductor.
+        await verify_driver_access(req.driver_id, user)
+        driver_q = await asyncio.to_thread(
+            lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+        )
+        driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+        if driver_company_id:
+            update_data["company_id"] = driver_company_id
+
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").update(update_data).eq("id", route_id).execute()
+    )
+    updated = safe_first(result)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+
+    log_audit(user["id"], "assign_route_driver", "route", route_id, {"driver_id": req.driver_id})
+    if req.driver_id:
+        await notify_driver_route_assigned(req.driver_id, route_id)
+    return {"success": True, "route": updated}
 
 
 class ReconcileOptimizationBody(BaseModel):
@@ -5505,6 +5610,8 @@ def _verify_msi_access(auth_user_id: str) -> dict:
       - Pro paid (monthly o yearly): promo_plan='pro' AND subscription_source IN ('stripe','revenuecat')
       - Pro yearly por sub_period: subscription_period='yearly' (any plan name)
       - Active trial: promo_plan IN ('pro','pro_plus') AND expires > NOW() AND source IS NULL
+      - Permanent promo grant: promo_plan IN ('pro','pro_plus') AND source IS NULL AND no expiry
+        (Pro/Pro+ dado a mano a colaboradores/drivers de confianza)
 
     Solo `free` (sin trial activo y sin pago) cae al paywall. La quota diaria
     por tier la cubre `_OCR_DAILY_IMG_QUOTA` (trial=pro=30, pro_plus=50).
@@ -5538,14 +5645,23 @@ def _verify_msi_access(auth_user_id: str) -> dict:
         except (ValueError, AttributeError):
             is_trial = False
 
-    is_eligible = is_pro_plus_paid or is_pro_paid or is_pro_yearly or is_trial
+    # Permanent promo grant: Pro/Pro+ granted by hand (no store sub, no expiry).
+    # Trials always carry an expires_at; a promo plan WITHOUT one is permanent.
+    # Without this they'd hit the paywall here. Bug #pro-permanente-paywall (26 may 2026).
+    is_pro_plus_promo = promo == "pro_plus" and sub_src is None and not expires_raw
+    is_pro_promo = promo == "pro" and sub_src is None and not expires_raw
+
+    is_eligible = (
+        is_pro_plus_paid or is_pro_paid or is_pro_yearly or is_trial
+        or is_pro_plus_promo or is_pro_promo
+    )
 
     # Tier resolution: pro_plus wins over yearly wins over pro wins over trial.
-    if is_pro_plus_paid:
+    if is_pro_plus_paid or is_pro_plus_promo:
         tier = "pro_plus"
     elif is_pro_yearly:
         tier = "pro_yearly"
-    elif is_pro_paid:
+    elif is_pro_paid or is_pro_promo:
         tier = "pro"
     elif is_trial:
         tier = "trial"
@@ -10353,43 +10469,72 @@ _PRICE_PER_CALL_EUR_BY_ENDPOINT = {
     "geocode": 0.0046,
     # places_directions_cache = cache HIT, NO va a Google = 0€.
     "places_directions_cache": 0.0,
+    # Maps JS Dynamic map load (mapas del admin, #54): $7/1000 × 0.92 ≈ 0,0065€/carga.
+    "maps_js_dynamic": 0.0065,
 }
 
 
-@app.get("/admin/api-sources", tags=["admin", "costs"], summary="Desglose calls por endpoint+origen X-Triggered-By (TODOS los endpoints)")
-async def admin_api_sources(user=Depends(require_admin)):
-    """Desglose 360° de calls Google Maps por endpoint y origen (X-Triggered-By).
+@app.get("/admin/maps-config", tags=["admin", "costs"], summary="Flag + tracking de cargas de mapa del admin (#54)")
+async def admin_maps_config(user=Depends(require_admin)):
+    """Los componentes de mapa del admin llaman esto al montar. Si el flag
+    app_config.admin_maps_enabled != 'off', cuenta 1 carga de Maps JS Dynamic en
+    api_source_daily (visible en /admin/costs, ~0,0065€/carga) y devuelve
+    enabled=true. Kill switch instantáneo SIN redeploy:
+        UPDATE app_config SET value='off' WHERE key='admin_maps_enabled';
+    Con 'off', los mapas del admin caen al esquema ligero (coste Google = 0)."""
+    enabled = True
+    try:
+        r = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "admin_maps_enabled")
+            .limit(1)
+            .execute()
+        )
+        if r.data and str(r.data[0].get("value") or "").lower() == "off":
+            enabled = False
+    except Exception:
+        enabled = True  # fail-open: si no se puede leer el flag, mapas ON
+    if enabled:
+        _bump_api_source("maps_js_dynamic", "admin", user_id=user.get("id"))
+    return {"enabled": enabled}
 
-    Cubre /places/directions, /places/details, /geocode. Combina counter
-    in-memory (al minuto) + persistido Supabase (sobrevive restarts).
-    Histórico 7d por endpoint para detectar drift de uso entre días.
+
+@app.get("/admin/api-sources", tags=["admin", "costs"], summary="Desglose calls por endpoint+origen X-Triggered-By (TODOS los endpoints)")
+async def admin_api_sources(date: Optional[str] = None, user=Depends(require_admin)):
+    """Desglose 360° de calls Google Maps por endpoint y origen (X-Triggered-By),
+    POR DÍA NATURAL (tabla api_source_daily, fecha UTC). `date` (YYYY-MM-DD) elige
+    el día a ver (default = hoy). Para comparar, el cliente pide dos fechas.
+
+    Fix 26 may (#46): ya NO mezcla el counter in-memory, que acumulaba desde el
+    arranque del proceso y falseaba "hoy" (mostraba el acumulado de ~16h, no el día
+    natural). Histórico 7d por endpoint para drift de uso.
     """
     uptime_min = round((time.time() - _api_counters_started_at) / 60, 1)
     today_iso = datetime.now(timezone.utc).date().isoformat()
+    target_date = (date or today_iso).strip()
+    if len(target_date) != 10 or target_date[4] != "-" or target_date[7] != "-":
+        raise HTTPException(status_code=400, detail="Fecha inválida, usa YYYY-MM-DD")
     cutoff_7d = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+    fetch_from = min(cutoff_7d, target_date)
 
-    # Lee BD api_source_daily (tabla nueva). Si falla (tabla aún no
-    # creada por Supabase MCP, devolverá [] → solo veremos in-memory).
     persisted_rows: list[dict] = []
     try:
         persisted_rows = (
             supabase.table("api_source_daily")
             .select("endpoint, date, source, count")
-            .gte("date", cutoff_7d)
+            .gte("date", fetch_from)
             .execute()
         ).data or []
     except Exception as e:
         logger.info(f"api_source_daily fetch failed (table may not exist yet): {e}")
 
-    # Agregados por endpoint
+    # Agregados por endpoint — SOLO de la BD por fecha (no in-memory).
     out_endpoints: list[dict] = []
-    seen_endpoints = set(_api_source_counters.keys())
-    for row in persisted_rows:
-        seen_endpoints.add(row["endpoint"])
+    seen_endpoints = {row["endpoint"] for row in persisted_rows}
 
     from collections import defaultdict
     for endpoint in sorted(seen_endpoints):
-        inmem_today = _api_source_counters.get(endpoint, {})
         persisted_today: dict = defaultdict(int)
         persisted_7d: dict = defaultdict(int)
         for row in persisted_rows:
@@ -10397,15 +10542,11 @@ async def admin_api_sources(user=Depends(require_admin)):
                 continue
             cnt = int(row.get("count") or 0)
             persisted_7d[row["source"]] += cnt
-            if row.get("date") == today_iso:
+            if row.get("date") == target_date:
                 persisted_today[row["source"]] += cnt
 
-        # Hoy = max(BD persistido, in-memory) por source (in-mem puede ir delante)
-        all_sources_today = set(list(persisted_today.keys()) + list(inmem_today.keys()))
-        today_by_source = {
-            src: max(persisted_today.get(src, 0), inmem_today.get(src, 0))
-            for src in all_sources_today
-        }
+        # Día natural REAL (solo api_source_daily, por fecha). Sin in-memory.
+        today_by_source = dict(persisted_today)
         today_total = sum(today_by_source.values())
         price = _PRICE_PER_CALL_EUR_BY_ENDPOINT.get(endpoint, 0.005)
 
@@ -10446,10 +10587,12 @@ async def admin_api_sources(user=Depends(require_admin)):
 
     return {
         "ok": True,
+        "date": target_date,
+        "is_today": target_date == today_iso,
         "uptime_minutes": uptime_min,
         "endpoints": out_endpoints,
-        "note": "Datos hoy = BD persistente + in-memory. Histórico 7d solo BD. "
-                "Pricing estimado por blend tier; valores reales en Cloud Console.",
+        "note": "Datos por DÍA NATURAL (api_source_daily, UTC). Histórico 7d. "
+                "Pricing estimado; valores reales en Cloud Console / billing.",
     }
 
 
@@ -10843,7 +10986,9 @@ async def delete_account(user=Depends(get_current_user)):
         tables_user = [
             ("code_redemptions", "user_id"),
             ("company_driver_links", "user_id"),
-            ("company_invites", "user_id"),
+            # company_invites has no user_id column — the creator is `created_by`
+            # (verified 26 may, error 42703 on delete_account). #55
+            ("company_invites", "created_by"),
         ]
         for table, column in tables_user:
             try:

@@ -187,6 +187,38 @@ class TestMSIGate:
         assert resp.json()["tier"] == "pro"
 
     @pytest.mark.asyncio
+    async def test_permanent_promo_pro_plus_allowed(self, client):
+        """Pro+ dado a mano (promo, sin sub de store, sin caducidad) debe ser
+        elegible. Bug #pro-permanente-paywall (26 may 2026): estas cuentas caían
+        al paywall por exigir subscription_source IN (stripe,revenuecat)."""
+        row = _drivers_row(promo_plan="pro_plus", sub_src=None, expires_at=None)
+        with patch("main.supabase") as mock_sb, patch(
+            "main._msi_extract_stops_with_gemini", return_value=_gemini_ok_payload()
+        ):
+            mock_sb.table.return_value = _patch_drivers_lookup(row)
+            resp = await client.post(
+                "/ocr/screenshots-batch",
+                json={"images": [{"image_base64": "AAAA", "media_type": "image/jpeg"}]},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["tier"] == "pro_plus"
+
+    @pytest.mark.asyncio
+    async def test_permanent_promo_pro_allowed(self, client):
+        """Pro dado a mano (promo permanente, sin sub de store, sin caducidad)."""
+        row = _drivers_row(promo_plan="pro", sub_src=None, expires_at=None)
+        with patch("main.supabase") as mock_sb, patch(
+            "main._msi_extract_stops_with_gemini", return_value=_gemini_ok_payload()
+        ):
+            mock_sb.table.return_value = _patch_drivers_lookup(row)
+            resp = await client.post(
+                "/ocr/screenshots-batch",
+                json={"images": [{"image_base64": "AAAA", "media_type": "image/jpeg"}]},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["tier"] == "pro"
+
+    @pytest.mark.asyncio
     async def test_free_user_blocked_with_trial_eligible(self, client):
         row = _drivers_row()  # all None
         with patch("main.supabase") as mock_sb:

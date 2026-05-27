@@ -20,6 +20,7 @@ NO corren en CI normal (necesitan red + credenciales). Opt-in:
 Correr SIEMPRE antes de un deploy que toque queries de crons/emails.
 """
 import os
+
 import httpx
 import pytest
 

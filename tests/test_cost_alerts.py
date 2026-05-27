@@ -12,8 +12,6 @@ Plus anti-spam: same alert_key within 4h must NOT re-fire.
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 class _FixedResultChain:
     """Chainable mock returning fixed data on .execute()."""

@@ -519,7 +519,9 @@ class TestL1InMemoryCache:
 
     def test_l1_ttl_expires(self):
         """Entrada con timestamp > TTL no devuelve cache."""
-        import main, time as _t
+        import time as _t
+
+        import main
         main._places_l1_cache.clear()
         # Insertar con timestamp viejo manualmente
         main._places_l1_cache[("q1", "b")] = (_t.time() - main._PLACES_L1_TTL_SEC - 1, {"v": 1})
@@ -565,7 +567,7 @@ class TestTtlEscalonado:
             main._places_cache_bump_sync("q", "b", 9)  # current_hits=9, becomes 10
         assert "expires_at" in captured["payload"]
         # Verifica que el TTL extendido es razonable (+90d desde now)
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
         exp = datetime.fromisoformat(captured["payload"]["expires_at"].replace("Z", "+00:00"))
         delta = exp - datetime.now(timezone.utc)
         assert 89 <= delta.days <= 91, f"Expected ~90d, got {delta.days}d"
@@ -691,7 +693,7 @@ class TestAdminCachePlacesStatsEndpoint:
     async def test_admin_cache_places_stats_returns_expected_shape(self, admin_client):
         """Verifica fields exactos del JSON response — si cambian, panel website /admin/costs se rompe."""
         # Mock: 3 entries, una expirada, 2 activas; total 5 hits.
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         now = datetime.now(timezone.utc)
         future = (now + timedelta(days=5)).isoformat()
         past = (now - timedelta(days=1)).isoformat()
@@ -721,7 +723,9 @@ class TestAdminCachePlacesStatsEndpoint:
         def table_side_effect(name):
             if name == "app_config":
                 c = MagicMock()
-                c.select.return_value = c; c.eq.return_value = c; c.limit.return_value = c
+                c.select.return_value = c
+                c.eq.return_value = c
+                c.limit.return_value = c
                 c.execute.return_value = flag_row
                 return c
             if name == "places_autocomplete_cache":
@@ -757,7 +761,7 @@ class TestAdminCachePlacesStatsEndpoint:
         capa silenciosamente a 1000 rows/request. .limit(10000) NO funciona.
         Si quitan el while-paginate, total_entries vuelve a subestimarse a 1000.
         Este test simula 1500 entries reales → debe devolver 1500."""
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         now = datetime.now(timezone.utc)
         future = (now + timedelta(days=5)).isoformat()
         # 3 páginas de cache (1000 + 500 + vacía) + 1 query top_queries final.
@@ -775,7 +779,9 @@ class TestAdminCachePlacesStatsEndpoint:
         def table_side_effect(name):
             if name == "app_config":
                 c = MagicMock()
-                c.select.return_value = c; c.eq.return_value = c; c.limit.return_value = c
+                c.select.return_value = c
+                c.eq.return_value = c
+                c.limit.return_value = c
                 c.execute.return_value = MagicMock(data=[{"value": "on"}])
                 return c
             if name == "places_autocomplete_cache":
