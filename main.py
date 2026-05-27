@@ -2030,8 +2030,15 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
 async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     """Crea una nueva ruta con sus paradas. El conductor debe ser el usuario autenticado (salvo admin)."""
     route_request = route  # Save original request before reassignment
-    # Verify user can create route for this driver
-    if user["role"] != "admin":
+    # Verify user can create route for this driver:
+    # - admin: para cualquier conductor
+    # - dispatcher: solo para conductores de SU empresa (verify_driver_access valida company)
+    # - driver: solo para sí mismo
+    if user["role"] == "admin":
+        pass
+    elif user.get("role") == "dispatcher":
+        await verify_driver_access(route_request.driver_id, user)
+    else:
         user_driver_id = await get_user_driver_id(user)
         if route_request.driver_id != user_driver_id:
             raise HTTPException(status_code=403, detail="No puedes crear rutas para otro conductor")

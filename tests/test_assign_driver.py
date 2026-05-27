@@ -156,3 +156,62 @@ class TestAssignRouteDriver:
             )
 
         assert resp.status_code == 403
+
+
+class TestDispatcherCreateRoute:
+    """POST /routes: un dispatcher puede crear ruta para drivers de SU empresa (Fase 1)."""
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_creates_route_for_company_driver(self, dispatcher_client):
+        """Dispatcher de empresa A crea ruta para un driver de A → 200."""
+        payload = {
+            "driver_id": TARGET_DRIVER,
+            "name": "Ruta dispatcher",
+            "stops": [{"address": "Calle 1", "lat": 40.4, "lng": -3.7, "position": 0}],
+            "total_distance_km": 1.0,
+        }
+        call = {"routes": 0}
+
+        def table_dispatch(name):
+            chain = MagicMock()
+            if name == "drivers":
+                dl = MagicMock()
+                dl.data = [{"company_id": FAKE_COMPANY_A}]
+                chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = dl
+            elif name == "routes":
+                call["routes"] += 1
+                if call["routes"] <= 1:
+                    ins = MagicMock()
+                    ins.data = [{"id": "new-route-id", "driver_id": TARGET_DRIVER}]
+                    chain.insert.return_value.execute.return_value = ins
+                else:
+                    fin = MagicMock()
+                    fin.data = {"id": "new-route-id", "stops": []}
+                    chain.select.return_value.eq.return_value.single.return_value.execute.return_value = fin
+            elif name == "stops":
+                st = MagicMock()
+                st.data = [{"id": "s1"}]
+                chain.insert.return_value.execute.return_value = st
+            return chain
+
+        with patch("main.verify_driver_access", new=AsyncMock(return_value=True)), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            resp = await dispatcher_client.post("/routes", json=payload)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_cannot_create_for_other_company_driver(self, dispatcher_client):
+        """Dispatcher intenta crear ruta para un driver de OTRA empresa → 403 (verify_driver_access)."""
+        payload = {
+            "driver_id": "driver-of-company-b",
+            "name": "x",
+            "stops": [{"address": "C", "lat": 40.4, "lng": -3.7, "position": 0}],
+            "total_distance_km": 1.0,
+        }
+        with patch("main.verify_driver_access", new=AsyncMock(side_effect=HTTPException(status_code=403, detail="no"))), \
+             patch("main.supabase"):
+            resp = await dispatcher_client.post("/routes", json=payload)
+
+        assert resp.status_code == 403
