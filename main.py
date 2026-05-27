@@ -264,6 +264,26 @@ async def send_push_to_token(token: str, title: str, body: str, data: dict = Non
         return False
 
 
+async def notify_driver_route_assigned(driver_id: str, route_id: str) -> None:
+    """Push 'nueva ruta asignada' al conductor cuando un dispatcher/empresa le asigna o
+    crea una ruta. Fire-and-forget: si falla el push NO debe romper la asignación."""
+    try:
+        q = await asyncio.to_thread(
+            lambda: supabase.table("drivers").select("push_token").eq("id", driver_id).limit(1).execute()
+        )
+        token = q.data[0].get("push_token") if q.data else None
+        if token:
+            await send_push_to_token(
+                token,
+                "Nueva ruta asignada",
+                "Tu empresa te ha asignado una ruta. Ábrela en Xpedit.",
+                {"type": "route_assigned", "route_id": route_id},
+            )
+    except Exception as e:
+        logger.warning(f"No se pudo notificar ruta asignada a {driver_id}: {e}")
+        sentry_sdk.capture_exception(e)
+
+
 # ========== ADDRESS NORMALIZATION ==========
 _STREET_PREFIXES = {
     "c/": "calle", "cl": "calle", "cl.": "calle",
@@ -2105,6 +2125,11 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
         logger.error(f"Failed to insert stops for route {route_id}")
         raise HTTPException(status_code=500, detail="Error al crear las paradas de la ruta")
 
+    # Si quien crea es dispatcher/admin (creando para un driver de la flota, no para sí
+    # mismo), avisar al conductor con un push de "nueva ruta asignada".
+    if user.get("role") in ("dispatcher", "admin"):
+        await notify_driver_route_assigned(route_request.driver_id, route_id)
+
     # Devolver ruta completa
     result = supabase.table("routes").select("*, stops(*)").eq("id", route_id).single().execute()
     return result.data
@@ -2177,6 +2202,8 @@ async def assign_route_driver(route_id: str, req: AssignDriverRequest,
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
 
     log_audit(user["id"], "assign_route_driver", "route", route_id, {"driver_id": req.driver_id})
+    if req.driver_id:
+        await notify_driver_route_assigned(req.driver_id, route_id)
     return {"success": True, "route": updated}
 
 

@@ -86,6 +86,37 @@ class TestAssignRouteDriver:
         mock_audit.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_assign_triggers_push_notification(self, dispatcher_client):
+        """Al asignar una ruta a un conductor se le envía push de 'nueva ruta asignada'."""
+        def table_dispatch(name):
+            chain = MagicMock()
+            if name == "drivers":
+                dl = MagicMock()
+                dl.data = [{"company_id": FAKE_COMPANY_A}]
+                chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = dl
+            elif name == "routes":
+                upd = MagicMock()
+                upd.data = [{"id": FAKE_ROUTE_ID, "driver_id": TARGET_DRIVER}]
+                m = MagicMock()
+                m.eq.return_value.execute.return_value = upd
+                chain.update.side_effect = lambda _d: m
+            return chain
+
+        notify = AsyncMock()
+        with patch("main.verify_route_access", new=AsyncMock(return_value={"id": FAKE_ROUTE_ID, "driver_id": "old"})), \
+             patch("main.verify_driver_access", new=AsyncMock(return_value=True)), \
+             patch("main.notify_driver_route_assigned", new=notify), \
+             patch("main.log_audit"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            resp = await dispatcher_client.patch(
+                f"/routes/{FAKE_ROUTE_ID}/assign-driver", json={"driver_id": TARGET_DRIVER}
+            )
+
+        assert resp.status_code == 200
+        notify.assert_awaited_once_with(TARGET_DRIVER, FAKE_ROUTE_ID)
+
+    @pytest.mark.asyncio
     async def test_unassign_sets_driver_null_without_driver_check(self, dispatcher_client):
         """driver_id=None desasigna la ruta: 200, update driver_id=None, sin validar
         conductor (verify_driver_access NO se llama) ni tocar company_id."""
@@ -105,8 +136,10 @@ class TestAssignRouteDriver:
             return chain
 
         vda = AsyncMock(return_value=True)
+        notify = AsyncMock()
         with patch("main.verify_route_access", new=AsyncMock(return_value={"id": FAKE_ROUTE_ID, "driver_id": "old"})), \
              patch("main.verify_driver_access", new=vda), \
+             patch("main.notify_driver_route_assigned", new=notify), \
              patch("main.log_audit"), \
              patch("main.supabase") as mock_sb:
             mock_sb.table = MagicMock(side_effect=table_dispatch)
@@ -118,6 +151,7 @@ class TestAssignRouteDriver:
         assert captured["update"]["driver_id"] is None
         assert "company_id" not in captured["update"]
         vda.assert_not_called()
+        notify.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_assign_cross_company_driver_forbidden(self, dispatcher_client):
