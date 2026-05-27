@@ -11188,13 +11188,17 @@ async def start_social_scheduler():
         logger.info("Social scheduler: checking every 60s")
     else:
         logger.info("Social: Twitter credentials not configured, social posts not scheduled")
-    # Closures scrapers: refresh every 30 minutes
-    social_scheduler.add_job(
-        run_all_closure_scrapers, "interval", minutes=30,
-        id="closures_scraper", replace_existing=True,
-        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),  # first run 2 min after boot
-    )
-    logger.info("Closures scrapers: every 30 min")
+    # Closures scrapers: DESACTIVADO 27 may 2026 (Miguel) — coste (requests a webs
+    # municipales + geocoding Google cada 30 min) sin uso real de la feature. Se deja
+    # TODO el código por si se reactiva: la función run_all_closure_scrapers, el endpoint
+    # manual /admin/scrape-closures/{city} y la lectura /closures/* siguen disponibles.
+    # Para reactivar el cron, descomentar este add_job.
+    # social_scheduler.add_job(
+    #     run_all_closure_scrapers, "interval", minutes=30,
+    #     id="closures_scraper", replace_existing=True,
+    #     next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),  # first run 2 min after boot
+    # )
+    logger.info("Closures scrapers: DESACTIVADO (cron desconectado 27 may, feature sin uso)")
     # Daily costs snapshot (Miguel 21 may 2026 — task #169): snapshot del día
     # anterior cada día a las 09:17 UTC (minuto :17 para evitar ruido cron).
     social_scheduler.add_job(
