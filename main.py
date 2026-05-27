@@ -2130,6 +2130,46 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
     return {"success": True, "route": route}
 
 
+class AssignDriverRequest(BaseModel):
+    driver_id: str
+
+
+@app.patch("/routes/{route_id}/assign-driver", tags=["routes", "company"],
+           summary="Asignar/reasignar una ruta a un conductor (dispatcher)")
+async def assign_route_driver(route_id: str, req: AssignDriverRequest,
+                              user=Depends(require_admin_or_dispatcher)):
+    """Asigna una ruta a un conductor con validación de empresa en el BACKEND.
+
+    Sustituye el `supabase.update({driver_id})` directo del dashboard, que solo
+    comprobaba el rol y NO la empresa (un dispatcher podía asignar a un conductor
+    de OTRA empresa). Aquí validamos, reutilizando los helpers de ownership:
+    - `verify_route_access`: el dispatcher solo toca rutas de SU empresa (admin: todas).
+    - `verify_driver_access`: el conductor destino debe ser de SU empresa (admin: todos).
+    Además, mantiene `routes.company_id` consistente con la empresa del conductor.
+    """
+    await verify_route_access(route_id, user)
+    await verify_driver_access(req.driver_id, user)
+
+    driver_q = await asyncio.to_thread(
+        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+    )
+    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+
+    update_data: dict = {"driver_id": req.driver_id}
+    if driver_company_id:
+        update_data["company_id"] = driver_company_id
+
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").update(update_data).eq("id", route_id).execute()
+    )
+    updated = safe_first(result)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+
+    log_audit(user["id"], "assign_route_driver", "route", route_id, {"driver_id": req.driver_id})
+    return {"success": True, "route": updated}
+
+
 class ReconcileOptimizationBody(BaseModel):
     """Cliente envía los datos de optimización que tiene en local cuando
     detecta que BD los perdió (optimized_hash NULL en una ruta in_progress).
