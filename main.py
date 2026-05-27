@@ -2035,6 +2035,18 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
         user_driver_id = await get_user_driver_id(user)
         if route_request.driver_id != user_driver_id:
             raise HTTPException(status_code=403, detail="No puedes crear rutas para otro conductor")
+    # Resolver la empresa del driver ANTES de crear la ruta, para asociar la ruta a
+    # su empresa (V1 multi-empresa: que el dispatcher solo vea/gestione SUS rutas).
+    # Si el driver no pertenece a ninguna empresa (self-service normal), queda NULL y
+    # el comportamiento es idéntico al actual → cero impacto para drivers sueltos.
+    driver_company_id = None
+    try:
+        driver_q = supabase.table("drivers").select("company_id").eq("id", route_request.driver_id).limit(1).execute()
+        driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+    except Exception as e:
+        logger.warning(f"No se pudo resolver company_id del driver: {e}")
+        sentry_sdk.capture_exception(e)
+
     # Crear la ruta
     route_data = {
         "driver_id": route_request.driver_id,
@@ -2043,6 +2055,8 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
         "total_stops": len(route_request.stops),
         "status": "pending"
     }
+    if driver_company_id:
+        route_data["company_id"] = driver_company_id
 
     route_result = supabase.table("routes").insert(route_data).execute()
     route_row = safe_first(route_result)
@@ -2069,11 +2083,10 @@ async def create_route(route: RouteCreate, user=Depends(get_current_user)):
     ]
 
     # Enriquecer stops desde el directorio de clientes de la empresa
+    # (reutiliza driver_company_id ya resuelto arriba — evita una 2ª query)
     try:
-        driver_q = supabase.table("drivers").select("company_id").eq("id", route_request.driver_id).limit(1).execute()
-        company_id = driver_q.data[0].get("company_id") if driver_q.data else None
-        if company_id:
-            stops_data, enriched = enrich_stops_from_directory(company_id, stops_data)
+        if driver_company_id:
+            stops_data, enriched = enrich_stops_from_directory(driver_company_id, stops_data)
             if enriched:
                 logger.info(f"Enriched {enriched} stops from customer directory")
     except Exception as e:

@@ -408,6 +408,104 @@ class TestRoutesCreate:
         assert response.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_create_route_assigns_company_id_for_company_driver(self, client):
+        """Si el driver pertenece a una empresa, la ruta creada DEBE llevar company_id
+        (cimiento V1 multi-empresa: el dispatcher solo ve/gestiona rutas de su empresa)."""
+        route_payload = {
+            "driver_id": FAKE_DRIVER_ID,
+            "name": "Ruta Empresa",
+            "stops": [{"address": "Calle Gran Via 1", "lat": 40.420, "lng": -3.705, "position": 0}],
+            "total_distance_km": 1.0,
+        }
+        captured = {}
+        with patch("main.supabase") as mock_sb:
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": "comp-xyz"}]
+            route_insert_result = MagicMock()
+            route_insert_result.data = [AttrDict({"id": "new-route-id", "driver_id": FAKE_DRIVER_ID,
+                                                  "name": "Ruta Empresa", "status": "pending",
+                                                  "total_stops": 1, "stops": []})]
+            stops_insert_result = MagicMock()
+            stops_insert_result.data = [{"id": "s1"}]
+            final_route = MagicMock()
+            final_route.data = {"id": "new-route-id", "company_id": "comp-xyz", "stops": []}
+            call_count = {"routes": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                elif name == "routes":
+                    call_count["routes"] += 1
+                    if call_count["routes"] <= 1:
+                        def capture_insert(data):
+                            captured["route_data"] = data
+                            m = MagicMock()
+                            m.execute.return_value = route_insert_result
+                            return m
+                        chain.insert.side_effect = capture_insert
+                    else:
+                        chain.select.return_value.eq.return_value.single.return_value.execute.return_value = final_route
+                elif name == "stops":
+                    chain.insert.return_value.execute.return_value = stops_insert_result
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.post("/routes", json=route_payload)
+
+        assert response.status_code == 200
+        assert captured["route_data"].get("company_id") == "comp-xyz"
+
+    @pytest.mark.asyncio
+    async def test_create_route_no_company_id_for_solo_driver(self, client):
+        """Un driver self-service (sin empresa) NO debe meter company_id en la ruta
+        → comportamiento idéntico al actual, cero impacto para drivers sueltos."""
+        route_payload = {
+            "driver_id": FAKE_DRIVER_ID,
+            "name": "Ruta Solo",
+            "stops": [{"address": "Calle Gran Via 1", "lat": 40.420, "lng": -3.705, "position": 0}],
+            "total_distance_km": 1.0,
+        }
+        captured = {}
+        with patch("main.supabase") as mock_sb:
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+            route_insert_result = MagicMock()
+            route_insert_result.data = [AttrDict({"id": "new-route-id", "driver_id": FAKE_DRIVER_ID,
+                                                  "name": "Ruta Solo", "status": "pending",
+                                                  "total_stops": 1, "stops": []})]
+            stops_insert_result = MagicMock()
+            stops_insert_result.data = [{"id": "s1"}]
+            final_route = MagicMock()
+            final_route.data = {"id": "new-route-id", "company_id": None, "stops": []}
+            call_count = {"routes": 0}
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                elif name == "routes":
+                    call_count["routes"] += 1
+                    if call_count["routes"] <= 1:
+                        def capture_insert(data):
+                            captured["route_data"] = data
+                            m = MagicMock()
+                            m.execute.return_value = route_insert_result
+                            return m
+                        chain.insert.side_effect = capture_insert
+                    else:
+                        chain.select.return_value.eq.return_value.single.return_value.execute.return_value = final_route
+                elif name == "stops":
+                    chain.insert.return_value.execute.return_value = stops_insert_result
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.post("/routes", json=route_payload)
+
+        assert response.status_code == 200
+        assert "company_id" not in captured["route_data"]
+
+    @pytest.mark.asyncio
     async def test_create_route_empty_stops_rejected(self, client):
         """Route creation without stops should be rejected."""
         response = await client.post("/routes", json={
