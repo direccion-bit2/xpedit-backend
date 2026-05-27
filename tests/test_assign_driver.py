@@ -86,6 +86,40 @@ class TestAssignRouteDriver:
         mock_audit.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_unassign_sets_driver_null_without_driver_check(self, dispatcher_client):
+        """driver_id=None desasigna la ruta: 200, update driver_id=None, sin validar
+        conductor (verify_driver_access NO se llama) ni tocar company_id."""
+        captured = {}
+
+        def table_dispatch(name):
+            chain = MagicMock()
+            if name == "routes":
+                def capture_update(data):
+                    captured["update"] = data
+                    upd = MagicMock()
+                    upd.data = [{"id": FAKE_ROUTE_ID, "driver_id": None}]
+                    m = MagicMock()
+                    m.eq.return_value.execute.return_value = upd
+                    return m
+                chain.update.side_effect = capture_update
+            return chain
+
+        vda = AsyncMock(return_value=True)
+        with patch("main.verify_route_access", new=AsyncMock(return_value={"id": FAKE_ROUTE_ID, "driver_id": "old"})), \
+             patch("main.verify_driver_access", new=vda), \
+             patch("main.log_audit"), \
+             patch("main.supabase") as mock_sb:
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            resp = await dispatcher_client.patch(
+                f"/routes/{FAKE_ROUTE_ID}/assign-driver", json={"driver_id": None}
+            )
+
+        assert resp.status_code == 200
+        assert captured["update"]["driver_id"] is None
+        assert "company_id" not in captured["update"]
+        vda.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_assign_cross_company_driver_forbidden(self, dispatcher_client):
         """Asignar a un conductor de OTRA empresa: verify_driver_access lanza 403
         y NO se debe tocar la ruta."""

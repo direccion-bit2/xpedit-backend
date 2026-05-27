@@ -2131,33 +2131,36 @@ async def start_route(route_id: str, user=Depends(get_current_user)):
 
 
 class AssignDriverRequest(BaseModel):
-    driver_id: str
+    driver_id: Optional[str] = None  # None = desasignar (quitar conductor de la ruta)
 
 
 @app.patch("/routes/{route_id}/assign-driver", tags=["routes", "company"],
-           summary="Asignar/reasignar una ruta a un conductor (dispatcher)")
+           summary="Asignar/reasignar/desasignar una ruta a un conductor (dispatcher)")
 async def assign_route_driver(route_id: str, req: AssignDriverRequest,
                               user=Depends(require_admin_or_dispatcher)):
-    """Asigna una ruta a un conductor con validación de empresa en el BACKEND.
-
-    Sustituye el `supabase.update({driver_id})` directo del dashboard, que solo
-    comprobaba el rol y NO la empresa (un dispatcher podía asignar a un conductor
-    de OTRA empresa). Aquí validamos, reutilizando los helpers de ownership:
+    """Asigna (o desasigna) una ruta a un conductor con validación de empresa en el
+    BACKEND. Sustituye el `supabase.update({driver_id})` directo del dashboard, que solo
+    comprobaba el rol y NO la empresa (un dispatcher podía asignar a un conductor de
+    OTRA empresa). Reutiliza los helpers de ownership:
     - `verify_route_access`: el dispatcher solo toca rutas de SU empresa (admin: todas).
     - `verify_driver_access`: el conductor destino debe ser de SU empresa (admin: todos).
-    Además, mantiene `routes.company_id` consistente con la empresa del conductor.
+
+    `driver_id=None` desasigna la ruta (solo valida acceso a la ruta; no se toca
+    `company_id`, la ruta sigue perteneciendo a la empresa).
     """
     await verify_route_access(route_id, user)
-    await verify_driver_access(req.driver_id, user)
-
-    driver_q = await asyncio.to_thread(
-        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
-    )
-    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
 
     update_data: dict = {"driver_id": req.driver_id}
-    if driver_company_id:
-        update_data["company_id"] = driver_company_id
+    if req.driver_id:
+        # Asignación real: el conductor destino debe ser de la empresa del que asigna,
+        # y mantenemos routes.company_id consistente con la empresa del conductor.
+        await verify_driver_access(req.driver_id, user)
+        driver_q = await asyncio.to_thread(
+            lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+        )
+        driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+        if driver_company_id:
+            update_data["company_id"] = driver_company_id
 
     result = await asyncio.to_thread(
         lambda: supabase.table("routes").update(update_data).eq("id", route_id).execute()
