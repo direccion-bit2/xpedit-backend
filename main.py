@@ -5707,7 +5707,8 @@ def _msi_gemini_response_schema() -> dict:
                     "type": "OBJECT",
                     "properties": {
                         "raw_text": {"type": "STRING", "description": "Original text block from screenshot"},
-                        "name": {"type": "STRING", "description": "Recipient name if visible"},
+                        "name": {"type": "STRING", "description": "Recipient PERSON name if visible"},
+                        "business_name": {"type": "STRING", "description": "Business / establishment at the delivery point (Farmacia, Mapfre, Konilcity SL, Hotel X). DISTINCT from 'name' (the recipient person). When present, the geocoder uses it for Places Text Search (Place Search prioritized over street geocoding)."},
                         "street": {"type": "STRING", "description": "Street name only — NOT including floor/etc."},
                         "number": {"type": "STRING", "description": "Street number (5, 5B, 5-7, s/n)"},
                         "floor_etc": {"type": "STRING", "description": "Floor/portal/staircase: '4B', 'Esc 2', 'Pta 3'. Save for delivery instructions, NEVER send to geocoder."},
@@ -6692,7 +6693,7 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
                     model_name=_MSI_MODEL,
                     model_extracted_address=stop.get("address") or stop.get("street"),
                     model_extracted_parts={k: stop.get(k) for k in (
-                        "name", "street", "city", "postalCode", "province", "floor_etc",
+                        "name", "business_name", "street", "city", "postalCode", "province", "floor_etc",
                     ) if stop.get(k) is not None},
                     model_confidence=float(stop.get("extraction_confidence")) if stop.get("extraction_confidence") is not None else None,
                     carrier_hint=req.carrier_hint or carrier_detected,

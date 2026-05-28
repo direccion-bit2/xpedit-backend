@@ -463,6 +463,46 @@ class TestMSINormalizationHelpers:
         assert "Mayor" in out["street"]
 
 
+class TestMSIBusinessNameSchema:
+    """Fase A.1 (28 may 2026): business_name añadido al schema MSI para Place
+    Search prioritario en geocoding. El prompt ya instruía 'Farmacia / Mapfre /
+    Konilcity SL', pero el schema no declaraba la propiedad y Gemini con
+    structured output la descartaba (letra muerta — 60% errores en CTT/MRW/
+    SEUR/NACEX mayo). Estos tests blindan que el campo entra, sobrevive al
+    normalize y no se inventa cuando no viene."""
+
+    def test_schema_declares_business_name_string(self):
+        from main import _msi_gemini_response_schema
+        schema = _msi_gemini_response_schema()
+        item_props = schema["properties"]["stops"]["items"]["properties"]
+        assert "business_name" in item_props, (
+            "business_name debe estar en el schema MSI para que Gemini "
+            "structured output lo emita (sin esto, el prompt lo describe "
+            "pero el JSON output nunca lo lleva)."
+        )
+        assert item_props["business_name"]["type"] == "STRING"
+
+    def test_normalize_preserves_business_name(self):
+        """El normalize muta el dict in-place; NO debe descartar business_name
+        (passthrough). Si esto rompe, el campo se pierde entre Gemini y el
+        endpoint y volvemos a la letra muerta."""
+        from main import _msi_normalize_extracted_stop
+        out = _msi_normalize_extracted_stop({
+            "street": "Avda Suero de Quiñones 4",
+            "city": "León",
+            "business_name": "Mapfre",
+        })
+        assert out.get("business_name") == "Mapfre"
+
+    def test_normalize_does_not_invent_business_name(self):
+        """Sin business_name de entrada, el normalize no debe crearlo."""
+        from main import _msi_normalize_extracted_stop
+        out = _msi_normalize_extracted_stop({
+            "street": "Calle Mayor 5", "city": "Sevilla",
+        })
+        assert not out.get("business_name")
+
+
 class TestMSICentroidBbox:
     def test_two_or_more_coords_yields_bbox(self):
         from main import _msi_compute_centroid_bbox
