@@ -2938,7 +2938,7 @@ class EnrichExistingRequest(BaseModel):
 @app.post("/customer-directory/enrich-existing", tags=["directory"], summary="Enriquecer paradas existentes")
 async def enrich_existing_stops(request: EnrichExistingRequest, user=Depends(get_current_user)):
     """Enriquece paradas de hoy con datos del directorio de clientes de la empresa."""
-    if user["role"] not in ("admin", "dispatcher"):
+    if user["role"] not in ("admin", "dispatcher", "company_admin"):
         raise HTTPException(status_code=403, detail="Solo admin o dispatcher")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     drivers = supabase.table("drivers").select("id").eq("company_id", request.company_id).execute()
@@ -14508,7 +14508,9 @@ async def fleet_login(request: Request):
             raise HTTPException(status_code=403, detail="Usuario no encontrado")
 
         user_data = user_result.data[0]
-        if user_data.get("role") not in ("admin", "dispatcher"):
+        # company_admin = dueño de empresa (lo acuña /company/register). DEBE poder
+        # entrar al dashboard o el onboarding queda roto de fábrica.
+        if user_data.get("role") not in ("admin", "dispatcher", "company_admin"):
             raise HTTPException(status_code=403, detail="Acceso restringido a dispatchers y administradores")
 
         return {
