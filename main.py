@@ -227,6 +227,40 @@ _raw_jwt = os.getenv("SUPABASE_JWT_SECRET", "")
 SUPABASE_JWT_SECRET = _raw_jwt + "=" * ((4 - len(_raw_jwt) % 4) % 4) if _raw_jwt else ""
 
 
+def fetch_all_rows(build_query, page_size: int = 1000, hard_cap: int = 200_000) -> list:
+    """Pagina una query Supabase para saltarse el cap silencioso de 1000 filas de PostgREST.
+
+    Supabase Cloud limita server-side a 1000 filas (db-max-rows=1000) SIN lanzar error:
+    cualquier `.execute()` que devuelva >1000 filas se trunca y el código consume datos
+    incompletos creyendo que tiene todo. Este helper recorre la query por páginas con
+    `.range()` hasta agotar resultados.
+
+    build_query: callable que DEVUELVE una query NUEVA (sin .execute()), p.ej.
+        lambda: supabase.table("stops").select("id").in_("route_id", ids).order("id")
+    IMPORTANTE: la query DEBE incluir un .order(...) estable (ej .order("id")), o
+    `.range()` puede saltar/duplicar filas entre páginas.
+
+    Devuelve una lista con TODAS las filas (puede ser vacía).
+    """
+    rows: list = []
+    start = 0
+    while start < hard_cap:
+        page = build_query().range(start, start + page_size - 1).execute()
+        data = page.data or []
+        rows.extend(data)
+        if len(data) < page_size:
+            break
+        start += page_size
+    return rows
+
+
+def chunked(items: list, size: int = 500):
+    """Trocea una lista en sublistas de `size`. Útil para `.in_(col, ids)` con listas
+    de IDs grandes (PostgREST/URL también tienen límites prácticos con listas enormes)."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def safe_first(result) -> Optional[dict]:
     """Safely get first result from Supabase query, returns None if empty"""
     return result.data[0] if result.data else None
@@ -1851,28 +1885,39 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     try:
-        # Obtener rutas filtradas por permisos
-        query = supabase.table("routes").select("*, stops(*)")
-        # Filter by today's date
-        query = query.gte("created_at", f"{today}T00:00:00")
+        # Obtener rutas filtradas por permisos. Reconstruimos la query dentro del
+        # builder (con .order para .range estable) y paginamos: para admin/dispatcher
+        # las rutas del día pueden superar 1000 y se truncarían en silencio.
+        dispatcher_driver_ids: Optional[list] = None
         if user["role"] == "admin":
-            if company_id:
-                query = query.eq("company_id", company_id)
+            pass
         elif user["role"] == "dispatcher" and user.get("company_id"):
-            company_drivers = supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).execute()
-            driver_ids = [d["id"] for d in (company_drivers.data or [])]
-            if driver_ids:
-                query = query.in_("driver_id", driver_ids)
-            else:
+            company_drivers = fetch_all_rows(
+                lambda: supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).order("id")
+            )
+            dispatcher_driver_ids = [d["id"] for d in company_drivers]
+            if not dispatcher_driver_ids:
                 return {"success": True, "date": today, "routes": {"total": 0, "completed": 0, "pending": 0}, "stops": {"total": 0, "completed": 0, "failed": 0, "pending": 0}, "success_rate": 0, "total_distance_km": 0}
         else:
             user_driver_id = await get_user_driver_id(user)
             if not user_driver_id:
                 return {"success": True, "date": today, "routes": {"total": 0, "completed": 0, "pending": 0}, "stops": {"total": 0, "completed": 0, "failed": 0, "pending": 0}, "success_rate": 0, "total_distance_km": 0}
-            query = query.eq("driver_id", user_driver_id)
 
-        routes_result = query.execute()
-        routes = routes_result.data or []
+        def _build_daily_routes_query():
+            q = (
+                supabase.table("routes").select("*, stops(*)")
+                .gte("created_at", f"{today}T00:00:00")
+            )
+            if user["role"] == "admin":
+                if company_id:
+                    q = q.eq("company_id", company_id)
+            elif user["role"] == "dispatcher" and user.get("company_id"):
+                q = q.in_("driver_id", dispatcher_driver_ids)
+            else:
+                q = q.eq("driver_id", user_driver_id)
+            return q.order("id")
+
+        routes = fetch_all_rows(_build_daily_routes_query)
 
         # Calcular estadísticas
         total_routes = len(routes)
@@ -1922,15 +1967,19 @@ async def get_daily_stats(company_id: Optional[str] = None, user=Depends(get_cur
 @app.get("/drivers", tags=["drivers"], summary="Listar conductores")
 async def get_drivers(user=Depends(get_current_user)):
     """Lista conductores activos. Admin ve todos, dispatcher ve su empresa, driver ve solo él."""
-    query = supabase.table("drivers").select("*").eq("active", True)
-    if user["role"] == "admin":
-        pass  # Admin sees all
-    elif user["role"] == "dispatcher" and user.get("company_id"):
-        query = query.eq("company_id", user.get("company_id"))
-    else:
-        query = query.eq("user_id", user["id"])
-    result = query.execute()
-    return {"drivers": result.data}
+    # Paginar: la rama admin (sin filtro) devuelve >1000 drivers en prod y se
+    # truncaba en silencio. Reconstruimos en el builder con .order estable.
+    def _build_drivers_query():
+        q = supabase.table("drivers").select("*").eq("active", True)
+        if user["role"] == "admin":
+            pass  # Admin sees all
+        elif user["role"] == "dispatcher" and user.get("company_id"):
+            q = q.eq("company_id", user.get("company_id"))
+        else:
+            q = q.eq("user_id", user["id"])
+        return q.order("id")
+
+    return {"drivers": fetch_all_rows(_build_drivers_query)}
 
 
 # Disposable email domains blocklist — prevent trial abuse with throwaway accounts
@@ -2941,16 +2990,27 @@ async def enrich_existing_stops(request: EnrichExistingRequest, user=Depends(get
     if user["role"] not in ("admin", "dispatcher", "company_admin"):
         raise HTTPException(status_code=403, detail="Solo admin o dispatcher")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    drivers = supabase.table("drivers").select("id").eq("company_id", request.company_id).execute()
-    driver_ids = [d["id"] for d in (drivers.data or [])]
+    # Paginar: si una empresa tiene muchas paradas hoy, sin paginar algunas se
+    # quedaban SIN enriquecer en silencio (se materializan y se actualizan abajo).
+    drivers = fetch_all_rows(
+        lambda: supabase.table("drivers").select("id").eq("company_id", request.company_id).order("id")
+    )
+    driver_ids = [d["id"] for d in drivers]
     if not driver_ids:
         return {"enriched": 0}
-    routes = supabase.table("routes").select("id").in_("driver_id", driver_ids).gte("created_at", today).execute()
-    route_ids = [r["id"] for r in (routes.data or [])]
+    route_ids = []
+    for id_chunk in chunked(driver_ids, 500):
+        rows = fetch_all_rows(
+            lambda c=id_chunk: supabase.table("routes").select("id").in_("driver_id", c).gte("created_at", today).order("id")
+        )
+        route_ids.extend(r["id"] for r in rows)
     if not route_ids:
         return {"enriched": 0}
-    stops = supabase.table("stops").select("id, address, lat, lng, phone, email").in_("route_id", route_ids).execute()
-    stops_data = stops.data or []
+    stops_data = []
+    for rid_chunk in chunked(route_ids, 500):
+        stops_data.extend(fetch_all_rows(
+            lambda c=rid_chunk: supabase.table("stops").select("id, address, lat, lng, phone, email").in_("route_id", c).order("id")
+        ))
     enriched_stops, match_count = enrich_stops_from_directory(request.company_id, stops_data)
     # Group stops by the {phone,email} fields they need so we can do one UPDATE
     # per distinct field-set instead of one UPDATE per stop. Previous N+1 made
@@ -3035,21 +3095,24 @@ async def admin_send_email_to_user(user_id: str, request: AdminSendEmailRequest,
 async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depends(require_admin)):
     """Envía un email masivo a todos los usuarios o filtrado por plan (free, pro, pro_plus). Solo admin."""
     try:
-        query = supabase.table("drivers").select("email, name, promo_plan")
+        # Paginar: el broadcast debe alcanzar a TODOS los drivers del target,
+        # no solo los primeros 1000 (cap silencioso de PostgREST).
+        def _build_broadcast_query():
+            q = supabase.table("drivers").select("email, name, promo_plan").order("id")
+            if request.target == "free":
+                q = q.is_("promo_plan", "null")
+            elif request.target == "pro":
+                q = q.eq("promo_plan", "pro")
+            elif request.target == "pro_plus":
+                q = q.eq("promo_plan", "pro_plus")
+            return q
 
-        if request.target == "free":
-            query = query.is_("promo_plan", "null")
-        elif request.target == "pro":
-            query = query.eq("promo_plan", "pro")
-        elif request.target == "pro_plus":
-            query = query.eq("promo_plan", "pro_plus")
+        drivers_rows = fetch_all_rows(_build_broadcast_query)
 
-        drivers = query.execute()
-
-        if not drivers.data:
+        if not drivers_rows:
             return {"success": True, "sent": 0, "failed": 0, "total": 0}
 
-        emails = [d["email"] for d in drivers.data if d.get("email")]
+        emails = [d["email"] for d in drivers_rows if d.get("email")]
         results = send_broadcast_email(emails, request.subject, request.body)
 
         # Log all emails in broadcast (batch insert)
@@ -3063,7 +3126,7 @@ async def admin_broadcast_email(request: AdminBroadcastEmailRequest, user=Depend
                     "sent_by": f"broadcast:{request.target}",
                     "status": "sent",
                 }
-                for d in drivers.data if d.get("email")
+                for d in drivers_rows if d.get("email")
             ]
             if email_logs:
                 supabase.table("email_log").insert(email_logs).execute()
@@ -3090,11 +3153,14 @@ async def admin_reengagement_broadcast(user=Depends(require_admin)):
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # migue995@gmail.com
     ]
     try:
-        drivers = supabase.table("drivers").select("id, email, name").not_.is_("email", "null").execute()
-        if not drivers.data:
+        # Paginar para alcanzar a todos los drivers con email (no solo 1000).
+        drivers_rows = fetch_all_rows(
+            lambda: supabase.table("drivers").select("id, email, name").not_.is_("email", "null").order("id")
+        )
+        if not drivers_rows:
             return {"success": True, "sent": 0, "failed": 0, "total": 0}
 
-        targets = [d for d in drivers.data if d["id"] not in EXCLUDED_IDS and d.get("email")]
+        targets = [d for d in drivers_rows if d["id"] not in EXCLUDED_IDS and d.get("email")]
         results = send_reengagement_broadcast(targets)
 
         try:
@@ -3134,11 +3200,14 @@ async def admin_broadcast_social_login(user=Depends(require_admin)):
         "e481de53-bb8c-4b76-8b56-04a7d00f9c6f",  # migue995@gmail.com
     ]
     try:
-        drivers = supabase.table("drivers").select("id, email, name").not_.is_("email", "null").execute()
-        if not drivers.data:
+        # Paginar para alcanzar a todos los drivers con email (no solo 1000).
+        drivers_rows = fetch_all_rows(
+            lambda: supabase.table("drivers").select("id, email, name").not_.is_("email", "null").order("id")
+        )
+        if not drivers_rows:
             return {"success": True, "sent": 0, "failed": 0, "total": 0}
 
-        targets = [d for d in drivers.data if d["id"] not in EXCLUDED_IDS and d.get("email")]
+        targets = [d for d in drivers_rows if d["id"] not in EXCLUDED_IDS and d.get("email")]
         results = send_social_login_broadcast(targets)
 
         try:
@@ -3182,20 +3251,23 @@ REACTIVATION_PUSH_TITLE = "Hemos arreglado lo de las paradas"
 REACTIVATION_PUSH_BODY = "Vuelve a Xpedit. App rediseñada, mapas más rápidos y paradas que ya se guardan siempre."
 
 
-def _reactivation_audience_query(days_inactive: int):
-    """Base query for the reactivation audience. Returns Supabase result.
+def _reactivation_audience_query(days_inactive: int) -> list:
+    """Base query for the reactivation audience. Returns a list with ALL matching rows.
 
     Audience: drivers who used the app at some point, have email, and last session
     is older than days_inactive. Excludes internal accounts.
+
+    Paginado (fetch_all_rows): la audiencia puede superar 1000 drivers, y sin paginar
+    PostgREST trunca a 1000 en silencio dejando fuera a parte del público.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days_inactive)).isoformat()
-    return (
-        supabase.table("drivers")
+    return fetch_all_rows(
+        lambda: supabase.table("drivers")
         .select("id, email, name, push_token, session_started_at, promo_plan, subscription_source")
         .not_.is_("email", "null")
         .not_.is_("session_started_at", "null")
         .lt("session_started_at", cutoff)
-        .execute()
+        .order("id")
     )
 
 
@@ -3231,8 +3303,8 @@ class ReactivationSendRequest(BaseModel):
 async def admin_reactivation_preview(body: ReactivationPreviewRequest, user=Depends(require_admin)):
     """Returns audience count + breakdown without sending anything."""
     try:
-        result = _reactivation_audience_query(body.days_inactive)
-        targets = _reactivation_filter_internal(result.data or [])
+        audience = _reactivation_audience_query(body.days_inactive)
+        targets = _reactivation_filter_internal(audience)
         with_push = [d for d in targets if d.get("push_token") and str(d["push_token"]).startswith("ExponentPushToken[")]
         without_push = [d for d in targets if d not in with_push]
         sample = [{"name": d.get("name"), "email": d["email"], "channel": "push" if d in with_push else "email"} for d in targets[:5]]
@@ -3268,8 +3340,8 @@ async def admin_reactivation_send(body: ReactivationSendRequest, user=Depends(re
             )
             targets = test_query.data or []
         else:
-            result = _reactivation_audience_query(body.days_inactive)
-            targets = _reactivation_filter_internal(result.data or [])
+            audience = _reactivation_audience_query(body.days_inactive)
+            targets = _reactivation_filter_internal(audience)
 
         if body.limit is not None and body.limit > 0:
             targets = targets[: body.limit]
@@ -3381,18 +3453,23 @@ async def admin_push_blast(request: AdminPushBlastRequest, user=Depends(require_
     import asyncio
 
     try:
-        # Get all drivers with push tokens
-        drivers_result = supabase.table("drivers").select("id, name, push_token").not_.is_("push_token", "null").execute()
-        if not drivers_result.data:
+        # Get all drivers with push tokens (paginado: pueden ser >1000)
+        targets = fetch_all_rows(
+            lambda: supabase.table("drivers").select("id, name, push_token").not_.is_("push_token", "null").order("id")
+        )
+        if not targets:
             return {"success": True, "sent": 0, "failed": 0, "total": 0, "message": "No drivers with push tokens"}
 
-        targets = drivers_result.data
-
         if request.target == "inactive":
-            # Filter to drivers with 0 routes - only fetch distinct driver_ids, not all rows
+            # Filter to drivers with 0 routes - only fetch distinct driver_ids, not all rows.
+            # Paginar filas Y trocear la lista de IDs (puede superar 1000).
             target_ids = [d["id"] for d in targets]
-            routes_result = supabase.table("routes").select("driver_id").in_("driver_id", target_ids).execute()
-            drivers_with_routes = {r["driver_id"] for r in (routes_result.data or []) if r.get("driver_id")}
+            drivers_with_routes = set()
+            for id_chunk in chunked(target_ids, 500):
+                rows = fetch_all_rows(
+                    lambda c=id_chunk: supabase.table("routes").select("driver_id").in_("driver_id", c).order("driver_id")
+                )
+                drivers_with_routes.update(r["driver_id"] for r in rows if r.get("driver_id"))
             targets = [d for d in targets if d["id"] not in drivers_with_routes]
 
         if not targets:
@@ -3457,20 +3534,21 @@ async def admin_send_survey(request: SurveySendRequest, user=Depends(require_adm
 
     target = campaign.data.get("target", "all")
 
-    # Get target drivers
-    query = supabase.table("drivers").select("id, name, email, push_token")
-    if target == "free":
-        query = query.is_("promo_plan", "null").is_("subscription_source", "null")
-    elif target == "trial_expired":
-        query = query.is_("promo_plan", "null").is_("subscription_source", "null")
-    elif target == "pro":
-        query = query.not_.is_("subscription_source", "null")
-    drivers_result = query.execute()
+    # Get target drivers (paginado: el público objetivo puede superar 1000)
+    def _build_survey_target_query():
+        q = supabase.table("drivers").select("id, name, email, push_token").order("id")
+        if target == "free":
+            q = q.is_("promo_plan", "null").is_("subscription_source", "null")
+        elif target == "trial_expired":
+            q = q.is_("promo_plan", "null").is_("subscription_source", "null")
+        elif target == "pro":
+            q = q.not_.is_("subscription_source", "null")
+        return q
 
-    if not drivers_result.data:
+    drivers = fetch_all_rows(_build_survey_target_query)
+
+    if not drivers:
         return {"success": True, "push_sent": 0, "email_sent": 0, "message": "No matching drivers"}
-
-    drivers = drivers_result.data
     push_sent = 0
     push_failed = 0
     email_sent = 0
@@ -3544,18 +3622,28 @@ async def admin_get_survey_responses(campaign_id: str, user=Depends(require_admi
     # Get campaign
     campaign = supabase.table("survey_campaigns").select("*").eq("id", campaign_id).single().execute()
 
-    # Get responses with driver info
-    responses = supabase.table("survey_responses").select("*").eq("campaign_id", campaign_id).order("created_at", desc=True).execute()
+    # Get responses with driver info (paginado para no cortar a 1000; orden display
+    # created_at desc + tie-break por id para que .range() no salte/duplique filas).
+    responses_data = fetch_all_rows(
+        lambda: supabase.table("survey_responses").select("*")
+        .eq("campaign_id", campaign_id).order("created_at", desc=True).order("id")
+    )
 
     # Enrich with driver info
     enriched = []
-    driver_ids = [r["driver_id"] for r in (responses.data or []) if r.get("driver_id")]
+    driver_ids = [r["driver_id"] for r in responses_data if r.get("driver_id")]
     drivers_map = {}
     if driver_ids:
-        drivers_result = supabase.table("drivers").select("id, name, email, promo_plan, subscription_source").in_("id", driver_ids).execute()
-        drivers_map = {d["id"]: d for d in (drivers_result.data or [])}
+        # Trocear la lista de IDs (puede superar 1000) + paginar filas.
+        for id_chunk in chunked(driver_ids, 500):
+            rows = fetch_all_rows(
+                lambda c=id_chunk: supabase.table("drivers")
+                .select("id, name, email, promo_plan, subscription_source").in_("id", c).order("id")
+            )
+            for d in rows:
+                drivers_map[d["id"]] = d
 
-    for r in (responses.data or []):
+    for r in responses_data:
         driver = drivers_map.get(r.get("driver_id"), {})
         enriched.append({
             **r,
@@ -3565,7 +3653,7 @@ async def admin_get_survey_responses(campaign_id: str, user=Depends(require_admi
         })
 
     # Aggregate stats
-    answers = [r.get("answers", {}) for r in (responses.data or [])]
+    answers = [r.get("answers", {}) for r in responses_data]
     q1_counts = {}
     q2_counts = {}
     ratings = []
@@ -3576,7 +3664,7 @@ async def admin_get_survey_responses(campaign_id: str, user=Depends(require_admi
             q1_counts[q1] = q1_counts.get(q1, 0) + 1
         if q2:
             q2_counts[q2] = q2_counts.get(q2, 0) + 1
-    for r in (responses.data or []):
+    for r in responses_data:
         if r.get("rating"):
             ratings.append(r["rating"])
 
@@ -3584,7 +3672,7 @@ async def admin_get_survey_responses(campaign_id: str, user=Depends(require_admi
         "campaign": campaign.data,
         "responses": enriched,
         "stats": {
-            "total_responses": len(responses.data or []),
+            "total_responses": len(responses_data),
             "avg_rating": round(sum(ratings) / len(ratings), 1) if ratings else None,
             "q1_breakdown": q1_counts,
             "q2_breakdown": q2_counts,
@@ -3883,12 +3971,13 @@ async def update_promo_code(code_id: str, request: PromoCodeUpdateRequest, user=
 async def list_admin_users(user=Depends(require_admin)):
     """Lista todos los usuarios/conductores con su estado de plan promo. Solo admin."""
     try:
-        result = supabase.table("drivers")\
-            .select("*")\
-            .order("created_at", desc=True)\
-            .execute()
+        # Paginar: hay >1000 drivers en prod; sin esto el admin solo veía los
+        # 1000 más recientes. Tie-break por id para .range() estable.
+        users = fetch_all_rows(
+            lambda: supabase.table("drivers").select("*").order("created_at", desc=True).order("id")
+        )
 
-        return {"success": True, "users": result.data}
+        return {"success": True, "users": users}
 
     except Exception as e:
         logger.error(f"{type(e).__name__}: {e}")
@@ -4236,13 +4325,18 @@ async def admin_stats(user=Depends(require_admin)):
         # Total drivers
         drivers_total = supabase.table("drivers").select("id", count="exact").execute()
 
-        # Active today (have routes created today)
-        routes_today = supabase.table("routes").select("driver_id", count="exact").gte("created_at", today_start).execute()
-        active_today_ids = {r["driver_id"] for r in (routes_today.data or []) if r.get("driver_id")}
+        # Active today (have routes created today) — paginar: contamos drivers
+        # DISTINTOS sobre las filas, así que necesitamos TODAS (no solo 1000).
+        routes_today_rows = fetch_all_rows(
+            lambda: supabase.table("routes").select("driver_id").gte("created_at", today_start).order("driver_id")
+        )
+        active_today_ids = {r["driver_id"] for r in routes_today_rows if r.get("driver_id")}
 
         # Active this week
-        routes_week = supabase.table("routes").select("driver_id", count="exact").gte("created_at", week_start).execute()
-        active_week_ids = {r["driver_id"] for r in (routes_week.data or []) if r.get("driver_id")}
+        routes_week_rows = fetch_all_rows(
+            lambda: supabase.table("routes").select("driver_id").gte("created_at", week_start).order("driver_id")
+        )
+        active_week_ids = {r["driver_id"] for r in routes_week_rows if r.get("driver_id")}
 
         # New drivers this month
         new_month = supabase.table("drivers").select("id", count="exact").gte("created_at", month_start).execute()
@@ -4269,8 +4363,8 @@ async def admin_stats(user=Depends(require_admin)):
                     "new_month": new_month.count or 0,
                 },
                 "routes": {
-                    "today": routes_today.count or 0,
-                    "week": routes_week.count or 0,
+                    "today": len(routes_today_rows),
+                    "week": len(routes_week_rows),
                     "month": routes_month.count or 0,
                     "total": routes_total.count or 0,
                 },
@@ -4295,27 +4389,36 @@ async def admin_stats(user=Depends(require_admin)):
 async def admin_list_companies(user=Depends(require_admin)):
     """Lista todas las empresas con conteo de drivers y suscripción. Solo admin."""
     try:
-        companies = supabase.table("companies").select("*").order("created_at", desc=True).execute()
-        company_ids = [c["id"] for c in (companies.data or [])]
+        companies = fetch_all_rows(
+            lambda: supabase.table("companies").select("*").order("created_at", desc=True).order("id")
+        )
+        company_ids = [c["id"] for c in companies]
 
-        # Batch fetch: all driver links and subscriptions in 2 queries instead of 2*N
-        all_links = supabase.table("company_driver_links").select("company_id", count="exact").in_("company_id", company_ids).execute() if company_ids else None
-        all_subs = supabase.table("company_subscriptions").select("*").in_("company_id", company_ids).order("created_at", desc=True).execute() if company_ids else None
+        # Batch fetch: all driver links and subscriptions in 2 queries instead of 2*N.
+        # Paginar: bucketizamos por company en Python, así que necesitamos TODAS las filas.
+        all_links_rows = fetch_all_rows(
+            lambda: supabase.table("company_driver_links").select("company_id").in_("company_id", company_ids).order("company_id")
+        ) if company_ids else []
+        # Tie-break por id para que el orden created_at desc sea estable entre páginas
+        # (el dedup de abajo asume "primera = más reciente").
+        all_subs_rows = fetch_all_rows(
+            lambda: supabase.table("company_subscriptions").select("*").in_("company_id", company_ids).order("created_at", desc=True).order("id")
+        ) if company_ids else []
 
         # Build lookup maps
         driver_counts: dict = {}
-        for link in (all_links.data if all_links else []):
+        for link in all_links_rows:
             cid = link["company_id"]
             driver_counts[cid] = driver_counts.get(cid, 0) + 1
 
         sub_map: dict = {}
-        for sub in (all_subs.data if all_subs else []):
+        for sub in all_subs_rows:
             cid = sub["company_id"]
             if cid not in sub_map:  # first = most recent (ordered desc)
                 sub_map[cid] = sub
 
         result = []
-        for company in (companies.data or []):
+        for company in companies:
             result.append({
                 **company,
                 "driver_count": driver_counts.get(company["id"], 0),
@@ -10134,14 +10237,17 @@ async def admin_costs_sustainability(user=Depends(require_admin)):
             today_cest_start = (now - timedelta(hours=cest_offset)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             ) + timedelta(hours=cest_offset)
-            r = await asyncio.to_thread(
-                lambda: supabase.table("location_history")
-                .select("driver_id")
-                .gte("recorded_at", today_cest_start.isoformat())
-                .limit(10000)
-                .execute()
+            # Paginar: location_history del día supera de largo 1000 filas y aquí
+            # contamos drivers DISTINTOS, así que el .limit(10000) no-op infravaloraba.
+            rows = await asyncio.to_thread(
+                lambda: fetch_all_rows(
+                    lambda: supabase.table("location_history")
+                    .select("driver_id")
+                    .gte("recorded_at", today_cest_start.isoformat())
+                    .order("driver_id")
+                )
             )
-            return len({row["driver_id"] for row in (r.data or []) if row.get("driver_id")})
+            return len({row["driver_id"] for row in rows if row.get("driver_id")})
         except Exception:
             return 0
 
@@ -11140,33 +11246,45 @@ async def delete_account(user=Depends(get_current_user)):
         driver_id = driver_row["id"] if driver_row else None
 
         if driver_id:
-            # Get all route IDs for this driver (needed for stops and delivery_proofs)
-            routes_result = supabase.table("routes").select("id").eq("driver_id", driver_id).execute()
-            route_ids = [r["id"] for r in (routes_result.data or [])]
+            # Get all route IDs for this driver (needed for stops and delivery_proofs).
+            # Paginar: un driver puede tener >1000 rutas; sin esto quedarían rutas/stops
+            # huérfanas tras "borrar la cuenta" (GDPR exige borrado completo).
+            route_rows = fetch_all_rows(
+                lambda: supabase.table("routes").select("id").eq("driver_id", driver_id).order("id")
+            )
+            route_ids = [r["id"] for r in route_rows]
 
             if route_ids:
-                # Collect all stop IDs — batch query instead of N+1
+                # Collect all stop IDs — batch query instead of N+1.
+                # Paginar filas Y trocear route_ids (un driver llega a 1845 stops).
+                all_stop_ids = []
                 try:
-                    stops_result = supabase.table("stops").select("id").in_("route_id", route_ids).execute()
-                    all_stop_ids = [s["id"] for s in (stops_result.data or [])]
+                    for rid_chunk in chunked(route_ids, 500):
+                        stop_rows = fetch_all_rows(
+                            lambda c=rid_chunk: supabase.table("stops").select("id").in_("route_id", c).order("id")
+                        )
+                        all_stop_ids.extend(s["id"] for s in stop_rows)
                 except Exception as e:
                     all_stop_ids = []
                     deletion_errors.append(f"stops select: {e}")
 
-                # Batch delete delivery_proofs for all stops at once
+                # Batch delete delivery_proofs for all stops at once (trocear stop_ids)
                 if all_stop_ids:
                     try:
-                        supabase.table("delivery_proofs").delete().in_("stop_id", all_stop_ids).execute()
+                        for sid_chunk in chunked(all_stop_ids, 500):
+                            supabase.table("delivery_proofs").delete().in_("stop_id", sid_chunk).execute()
                     except Exception as e:
                         deletion_errors.append(f"delivery_proofs: {e}")
 
-                # Batch delete tracking_links and stops for all routes at once
+                # Batch delete tracking_links and stops for all routes at once (trocear route_ids)
                 try:
-                    supabase.table("tracking_links").delete().in_("route_id", route_ids).execute()
+                    for rid_chunk in chunked(route_ids, 500):
+                        supabase.table("tracking_links").delete().in_("route_id", rid_chunk).execute()
                 except Exception as e:
                     deletion_errors.append(f"tracking_links: {e}")
                 try:
-                    supabase.table("stops").delete().in_("route_id", route_ids).execute()
+                    for rid_chunk in chunked(route_ids, 500):
+                        supabase.table("stops").delete().in_("route_id", rid_chunk).execute()
                 except Exception as e:
                     deletion_errors.append(f"stops delete: {e}")
 
@@ -11563,9 +11681,16 @@ async def start_social_scheduler():
     # Cost alerts (Miguel 23 may 2026 — task #277): chequea 4 umbrales cada
     # hora a HH:05 (offset 5min vs hora en punto para evitar competencia con
     # otros crons). Anti-spam 4h por alert_key. Bloquea regresiones tipo #266.
+    # coalesce=True + max_instances=1 + misfire_grace_time=300: si el event loop
+    # va con unos segundos de retraso (29 may 2026: Sentry "job missed by 2.24s"),
+    # el default de APScheduler (grace=1s) marcaba el job como perdido y SE SALTABA
+    # esa comprobación de coste de esa hora. Con grace=300s un hipo no lo salta.
     social_scheduler.add_job(
         check_cost_alerts, "cron", minute=5,
         id="cost_alerts_hourly", replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
     )
     logger.info("Cost alerts: cron HH:05 (4 thresholds, anti-spam 4h)")
     # Siempre arrancar el scheduler (tambien para backups y retention)
@@ -12205,10 +12330,12 @@ async def backup_critical_tables():
 
         for table in tables:
             try:
-                result = supabase.table(table).select("*").execute()
+                # Paginar: sin esto el backup solo guardaría 1000 filas/tabla (cap
+                # silencioso de PostgREST). Todas estas tablas tienen columna `id`.
+                rows = fetch_all_rows(lambda t=table: supabase.table(t).select("*").order("id"))
                 backup_data[table] = {
-                    "count": len(result.data),
-                    "data": result.data,
+                    "count": len(rows),
+                    "data": rows,
                     "backed_up_at": datetime.now(timezone.utc).isoformat()
                 }
             except Exception as e:
@@ -12304,23 +12431,24 @@ async def send_weekly_reengagement_push():
         sentry_check_in(monitor_slug="weekly-reengagement-push", status="in_progress")
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        # Drivers registered in last 30 days with push tokens
-        drivers_result = (
-            supabase.table("drivers")
-            .select("id, name, push_token")
-            .not_.is_("push_token", "null")
-            .gte("created_at", cutoff)
-            .execute()
+        # Drivers registered in last 30 days with push tokens (paginar: pueden ser >1000)
+        recent_drivers = fetch_all_rows(
+            lambda: supabase.table("drivers").select("id, name, push_token")
+            .not_.is_("push_token", "null").gte("created_at", cutoff).order("id")
         )
-        if not drivers_result.data:
+        if not recent_drivers:
             logger.info("Weekly re-engagement: no recent drivers with push tokens")
             return
 
-        # Filter out those who already created routes (only check the candidate drivers)
-        candidate_ids = [d["id"] for d in drivers_result.data]
-        routes_result = supabase.table("routes").select("driver_id").in_("driver_id", candidate_ids).execute()
-        drivers_with_routes = {r["driver_id"] for r in (routes_result.data or []) if r.get("driver_id")}
-        inactive = [d for d in drivers_result.data if d["id"] not in drivers_with_routes]
+        # Filter out those who already created routes. Paginar filas + trocear ids.
+        candidate_ids = [d["id"] for d in recent_drivers]
+        drivers_with_routes = set()
+        for id_chunk in chunked(candidate_ids, 500):
+            rows = fetch_all_rows(
+                lambda c=id_chunk: supabase.table("routes").select("driver_id").in_("driver_id", c).order("driver_id")
+            )
+            drivers_with_routes.update(r["driver_id"] for r in rows if r.get("driver_id"))
+        inactive = [d for d in recent_drivers if d["id"] not in drivers_with_routes]
 
         if not inactive:
             logger.info("Weekly re-engagement: all recent drivers already have routes")
@@ -12910,8 +13038,9 @@ async def admin_trial_feedback_backfill(body: _FeedbackBackfillRequest, user=Dep
         window_start = (now - timedelta(days=body.window_days)).isoformat()
         window_end = now.isoformat()
 
-        result = (
-            supabase.table("drivers")
+        # Paginar: la ventana de drivers con trial expirado podría superar 1000.
+        audience_rows = fetch_all_rows(
+            lambda: supabase.table("drivers")
             .select("id, email, name")
             .is_("subscription_source", "null")
             .is_("promo_plan", "null")
@@ -12919,22 +13048,23 @@ async def admin_trial_feedback_backfill(body: _FeedbackBackfillRequest, user=Dep
             .not_.is_("promo_plan_expires_at", "null")
             .gte("promo_plan_expires_at", window_start)
             .lte("promo_plan_expires_at", window_end)
-            .execute()
+            .order("id")
         )
-        candidates = [d for d in (result.data or []) if d["id"] not in EXCLUDED_IDS]
+        candidates = [d for d in audience_rows if d["id"] not in EXCLUDED_IDS]
 
         # Filter: only drivers with at least 1 stop. Excludes "installed but
         # never used" cohort whose feedback would just be silence.
         if body.require_stops and candidates:
             ids = [d["id"] for d in candidates]
-            routes_with_stops = (
-                supabase.table("routes")
-                .select("driver_id, stops!inner(id)")
-                .in_("driver_id", ids)
-                .limit(1000)
-                .execute()
-            )
-            active_drivers = {r["driver_id"] for r in (routes_with_stops.data or []) if r.get("stops")}
+            # Paginar (quita el .limit(1000) que truncaba) + trocear ids: marcamos
+            # qué drivers tienen >=1 stop, así que necesitamos TODAS las rutas-con-stop.
+            active_drivers = set()
+            for id_chunk in chunked(ids, 500):
+                rows = fetch_all_rows(
+                    lambda c=id_chunk: supabase.table("routes")
+                    .select("driver_id, stops!inner(id)").in_("driver_id", c).order("driver_id")
+                )
+                active_drivers.update(r["driver_id"] for r in rows if r.get("stops"))
             candidates = [d for d in candidates if d["id"] in active_drivers]
 
         # Drop ones already emailed
@@ -12954,7 +13084,7 @@ async def admin_trial_feedback_backfill(body: _FeedbackBackfillRequest, user=Dep
                 "dry_run": True,
                 "window_days": body.window_days,
                 "require_stops": body.require_stops,
-                "candidates_in_window": len(result.data or []),
+                "candidates_in_window": len(audience_rows),
                 "after_filters": len(eligible),
                 "sample": [{"name": d.get("name"), "email": d["email"]} for d in eligible[:10]],
             }
@@ -13175,10 +13305,11 @@ def compute_daily_health_digest() -> dict:
     # 4. Active drivers 24h (drivers who created at least one route)
     active_24h: Optional[int] = None
     try:
-        active_rows = (
-            supabase.table("routes").select("driver_id").gte("created_at", last_24h).execute()
+        # Paginar: contamos drivers DISTINTOS sobre las rutas de 24h (pueden ser >1000).
+        active_rows = fetch_all_rows(
+            lambda: supabase.table("routes").select("driver_id").gte("created_at", last_24h).order("driver_id")
         )
-        active_24h = len({r["driver_id"] for r in (active_rows.data or []) if r.get("driver_id")})
+        active_24h = len({r["driver_id"] for r in active_rows if r.get("driver_id")})
     except Exception as e:
         logger.warning(f"Health digest active_24h failed: {e}")
         digest_errors.append("routes/active_drivers")
@@ -13461,8 +13592,9 @@ async def admin_trials_expiring(days: int = 7, user=Depends(require_admin)):
     last_7d = (now - timedelta(days=7)).isoformat()
 
     try:
-        drivers_res = (
-            supabase.table("drivers")
+        # Paginar (tie-break por id sobre el orden de display).
+        drivers = fetch_all_rows(
+            lambda: supabase.table("drivers")
             .select("id, email, name, phone, promo_plan, promo_plan_expires_at, subscription_source, created_at")
             .in_("promo_plan", ["pro", "pro_plus"])
             .is_("subscription_source", "null")
@@ -13471,48 +13603,44 @@ async def admin_trials_expiring(days: int = 7, user=Depends(require_admin)):
             .gte("promo_plan_expires_at", window_start)
             .lte("promo_plan_expires_at", window_end)
             .order("promo_plan_expires_at", desc=False)
-            .execute()
+            .order("id")
         )
-        drivers = drivers_res.data or []
 
         if not drivers:
             return {"success": True, "count": 0, "drivers": []}
 
         driver_ids = [d["id"] for d in drivers]
 
-        # Aggregate routes + stops per driver last 7 days (one query each, then bucket in Python)
-        routes_res = (
-            supabase.table("routes")
-            .select("id, driver_id")
-            .in_("driver_id", driver_ids)
-            .gte("created_at", last_7d)
-            .execute()
-        )
+        # Aggregate routes + stops per driver last 7 days (then bucket in Python).
+        # Paginar filas Y trocear los id-lists (routes/stops de 7d superan 1000).
         routes_by_driver: dict = {}
         route_ids_by_driver: dict = {}
-        for r in (routes_res.data or []):
-            did = r.get("driver_id")
-            if not did:
-                continue
-            routes_by_driver[did] = routes_by_driver.get(did, 0) + 1
-            route_ids_by_driver.setdefault(did, []).append(r["id"])
+        for id_chunk in chunked(driver_ids, 500):
+            routes_rows = fetch_all_rows(
+                lambda c=id_chunk: supabase.table("routes").select("id, driver_id")
+                .in_("driver_id", c).gte("created_at", last_7d).order("id")
+            )
+            for r in routes_rows:
+                did = r.get("driver_id")
+                if not did:
+                    continue
+                routes_by_driver[did] = routes_by_driver.get(did, 0) + 1
+                route_ids_by_driver.setdefault(did, []).append(r["id"])
 
         # Count stops per driver by joining via route_id
         all_route_ids = [rid for ids in route_ids_by_driver.values() for rid in ids]
         stops_by_driver: dict = {}
         if all_route_ids:
-            stops_res = (
-                supabase.table("stops")
-                .select("id, route_id")
-                .in_("route_id", all_route_ids)
-                .gte("created_at", last_7d)
-                .execute()
-            )
             route_to_driver = {rid: did for did, ids in route_ids_by_driver.items() for rid in ids}
-            for s in (stops_res.data or []):
-                did = route_to_driver.get(s.get("route_id"))
-                if did:
-                    stops_by_driver[did] = stops_by_driver.get(did, 0) + 1
+            for rid_chunk in chunked(all_route_ids, 500):
+                stops_rows = fetch_all_rows(
+                    lambda c=rid_chunk: supabase.table("stops").select("id, route_id")
+                    .in_("route_id", c).gte("created_at", last_7d).order("id")
+                )
+                for s in stops_rows:
+                    did = route_to_driver.get(s.get("route_id"))
+                    if did:
+                        stops_by_driver[did] = stops_by_driver.get(did, 0) + 1
 
         enriched = []
         for d in drivers:
@@ -14007,32 +14135,45 @@ async def fleet_dashboard_stats(user=Depends(require_admin_or_dispatcher)):
 
         company_id = user.get("company_id")
 
-        # Build base queries
-        routes_q = supabase.table("routes").select("id,status,started_at,completed_at,driver_id")
-        stops_q = supabase.table("stops").select("id,status,completed_at,time_window_start,time_window_end")
-        drivers_q = supabase.table("drivers").select("id,active")
+        # Build base query factories (paginadas). Reconstruimos la query en cada
+        # lambda para no reutilizar un builder ya consumido entre páginas.
+        def _routes_base():
+            q = supabase.table("routes").select("id,status,started_at,completed_at,driver_id")
+            if company_id:
+                q = q.eq("company_id", company_id)
+            return q
 
-        if company_id:
-            routes_q = routes_q.eq("company_id", company_id)
-            drivers_q = drivers_q.eq("company_id", company_id)
+        def _drivers_base():
+            q = supabase.table("drivers").select("id,active")
+            if company_id:
+                q = q.eq("company_id", company_id)
+            return q
 
-        # Today's routes
-        routes_today = routes_q.gte("created_at", today_start).execute()
-        routes_data = [r for r in (routes_today.data or []) if r.get("driver_id") not in ADMIN_EXCLUDE_IDS]
+        # Today's routes (paginar: pueden ser >1000)
+        routes_all = fetch_all_rows(
+            lambda: _routes_base().gte("created_at", today_start).order("id")
+        )
+        routes_data = [r for r in routes_all if r.get("driver_id") not in ADMIN_EXCLUDE_IDS]
 
-        # All drivers
-        drivers_result = drivers_q.eq("active", True).execute()
-        driver_ids = [d["id"] for d in (drivers_result.data or []) if d["id"] not in ADMIN_EXCLUDE_IDS]
+        # All drivers (paginar)
+        drivers_all = fetch_all_rows(lambda: _drivers_base().eq("active", True).order("id"))
+        driver_ids = [d["id"] for d in drivers_all if d["id"] not in ADMIN_EXCLUDE_IDS]
         total_drivers = len(driver_ids)
 
-        # Active drivers (location update in last 5 min) — batch query instead of N+1
+        # Active drivers (location update in last 5 min) — contamos drivers DISTINTOS,
+        # así que paginamos filas y troceamos la lista de driver_ids.
         active_count = 0
         if driver_ids:
-            locs = supabase.table("location_history").select("driver_id").in_("driver_id", driver_ids).gte("recorded_at", five_min_ago).execute()
-            active_driver_ids = set(loc["driver_id"] for loc in (locs.data or []))
+            active_driver_ids = set()
+            for id_chunk in chunked(driver_ids, 500):
+                loc_rows = fetch_all_rows(
+                    lambda c=id_chunk: supabase.table("location_history").select("driver_id")
+                    .in_("driver_id", c).gte("recorded_at", five_min_ago).order("driver_id")
+                )
+                active_driver_ids.update(loc["driver_id"] for loc in loc_rows)
             active_count = len(active_driver_ids)
 
-        # Today's stops (from today's routes) — batch query instead of N+1
+        # Today's stops (from today's routes) — paginar filas + trocear route_ids
         route_ids = [r["id"] for r in routes_data]
         completed_stops = 0
         failed_stops = 0
@@ -14041,8 +14182,14 @@ async def fleet_dashboard_stats(user=Depends(require_admin_or_dispatcher)):
         delivery_times = []
 
         if route_ids:
-            all_stops = stops_q.in_("route_id", route_ids).execute()
-            for s in (all_stops.data or []):
+            all_stops_rows = []
+            for rid_chunk in chunked(route_ids, 500):
+                all_stops_rows.extend(fetch_all_rows(
+                    lambda c=rid_chunk: supabase.table("stops")
+                    .select("id,status,completed_at,time_window_start,time_window_end")
+                    .in_("route_id", c).order("id")
+                ))
+            for s in all_stops_rows:
                 if s["status"] == "completed":
                     completed_stops += 1
                     if s.get("time_window_end") and s.get("completed_at"):
