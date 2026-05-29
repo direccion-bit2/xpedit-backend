@@ -546,8 +546,8 @@ def log_audit(admin_id: str, action: str, resource_type: str, resource_id: str =
 
 
 async def require_admin_or_dispatcher(user=Depends(get_current_user)):
-    """Require admin or dispatcher role"""
-    if user.get("role") not in ("admin", "dispatcher"):
+    """Require admin, dispatcher or company_admin role (company operators)."""
+    if user.get("role") not in ("admin", "dispatcher", "company_admin"):
         raise HTTPException(status_code=403, detail="Acceso restringido")
     return user
 
@@ -564,7 +564,7 @@ async def get_user_driver_id(user: dict) -> Optional[str]:
 
 async def verify_route_access(route_id: str, user: dict):
     """Verify the user can access this route. Returns route data or raises 403."""
-    route_result = supabase.table("routes").select("id, driver_id").eq("id", route_id).limit(1).execute()
+    route_result = supabase.table("routes").select("id, driver_id, company_id").eq("id", route_id).limit(1).execute()
     if not route_result.data:
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
     route = route_result.data[0]
@@ -573,11 +573,17 @@ async def verify_route_access(route_id: str, user: dict):
     user_driver_id = await get_user_driver_id(user)
     if route["driver_id"] == user_driver_id:
         return route
-    # Dispatcher can access routes from same company
-    if user["role"] == "dispatcher" and user.get("company_id"):
-        driver_result = supabase.table("drivers").select("company_id").eq("id", route["driver_id"]).limit(1).execute()
-        if driver_result.data and driver_result.data[0].get("company_id") == user.get("company_id"):
+    # Company operator (dispatcher / company_admin) can access routes of their company.
+    # Match on the route's own company_id FIRST so UNASSIGNED routes (driver_id NULL,
+    # e.g. just created or just unassigned) are still reachable; fall back to the
+    # assigned driver's company for legacy routes that lack company_id.
+    if user["role"] in ("dispatcher", "company_admin") and user.get("company_id"):
+        if route.get("company_id") and route["company_id"] == user.get("company_id"):
             return route
+        if route["driver_id"]:
+            driver_result = supabase.table("drivers").select("company_id").eq("id", route["driver_id"]).limit(1).execute()
+            if driver_result.data and driver_result.data[0].get("company_id") == user.get("company_id"):
+                return route
     raise HTTPException(status_code=403, detail="No tienes acceso a esta ruta")
 
 
@@ -597,7 +603,7 @@ async def verify_driver_access(driver_id: str, user: dict):
     user_driver_id = await get_user_driver_id(user)
     if driver_id == user_driver_id:
         return True
-    if user["role"] == "dispatcher" and user.get("company_id"):
+    if user["role"] in ("dispatcher", "company_admin") and user.get("company_id"):
         driver_result = supabase.table("drivers").select("company_id").eq("id", driver_id).limit(1).execute()
         if driver_result.data and driver_result.data[0].get("company_id") == user.get("company_id"):
             return True
@@ -608,7 +614,7 @@ async def verify_company_management(user: dict, company_id: str = None):
     """Verify the user can manage this company (admin or dispatcher of the company)."""
     if user["role"] == "admin":
         return True
-    if user["role"] == "dispatcher" and user.get("company_id"):
+    if user["role"] in ("dispatcher", "company_admin") and user.get("company_id"):
         if company_id is None or user.get("company_id") == company_id:
             return True
     raise HTTPException(status_code=403, detail="No tienes permisos para gestionar esta empresa")
@@ -1070,6 +1076,14 @@ async def rate_limit_middleware(request: Request, call_next):
             check_rate_limit(f"fleet_login:{client_ip}", max_requests=5, window_seconds=60)
         elif path.startswith("/fleet"):
             check_rate_limit(f"fleet:{client_ip}", max_requests=30, window_seconds=60)
+        elif path == "/company/join":
+            # Invite codes are bearer join-credentials (~1M space) — throttle hard against brute-force.
+            check_rate_limit(f"company_join:{client_ip}", max_requests=10, window_seconds=60)
+        elif path == "/company/drivers" or path == "/company/register":
+            # Each creates an auth user — throttle to prevent mass account creation.
+            check_rate_limit(f"company_write:{client_ip}", max_requests=10, window_seconds=60)
+        elif path.startswith("/company"):
+            check_rate_limit(f"company:{client_ip}", max_requests=30, window_seconds=60)
         elif path.startswith("/stripe"):
             check_rate_limit(f"stripe:{client_ip}", max_requests=20, window_seconds=60)
         elif path.startswith("/revenuecat"):
@@ -1166,6 +1180,23 @@ class RouteCreate(BaseModel):
     name: Optional[str] = None
     stops: List[StopCreate]
     total_distance_km: Optional[float] = None
+
+
+class ImportRow(BaseModel):
+    """Una fila de un CSV de pedidos importado por el dispatcher (solo dirección de
+    texto + datos opcionales; el backend geocodifica)."""
+    address: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    notes: Optional[str] = None
+    packages: Optional[int] = None
+
+
+class RouteImportRequest(BaseModel):
+    driver_id: str
+    name: Optional[str] = None
+    country: Optional[str] = None  # ISO-2 para sesgar el geocoding (ES, CO, MX...)
+    rows: List[ImportRow]
 
 
 class LocationUpdate(BaseModel):
@@ -2205,6 +2236,105 @@ async def assign_route_driver(route_id: str, req: AssignDriverRequest,
     if req.driver_id:
         await notify_driver_route_assigned(req.driver_id, route_id)
     return {"success": True, "route": updated}
+
+
+async def _geocode_address(address: str, country: Optional[str] = None) -> Optional[dict]:
+    """Geocodifica una dirección de texto con Google Geocoding. Devuelve
+    {'lat','lng','display_name'} o None si no se encuentra/falla. Usado por el import
+    de pedidos del dispatcher (CSV)."""
+    if not GOOGLE_API_KEY or not address or not address.strip():
+        return None
+    params = {"address": address, "language": "es", "key": GOOGLE_API_KEY}
+    if country and country.strip():
+        cc = country.strip().upper()
+        params["region"] = cc.lower()
+        params["components"] = f"country:{cc}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://maps.googleapis.com/maps/api/geocode/json", params=params, timeout=10.0)
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"Geocode (import) error for '{address[:60]}': {e}")
+        return None
+    if data.get("status") != "OK" or not data.get("results"):
+        return None
+    r = data["results"][0]
+    loc = (r.get("geometry", {}) or {}).get("location", {}) or {}
+    if loc.get("lat") is None or loc.get("lng") is None:
+        return None
+    return {"lat": loc["lat"], "lng": loc["lng"], "display_name": r.get("formatted_address", address)}
+
+
+@app.post("/company/routes/import", tags=["routes", "company"],
+          summary="Importar pedidos (CSV) como ruta para un conductor (dispatcher)")
+async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_admin_or_dispatcher)):
+    """El dispatcher importa pedidos en bloque (filas de un CSV ya parseado en el
+    dashboard) y se crea una ruta para un conductor de SU empresa. El backend geocodifica
+    cada dirección; las que no se encuentran se devuelven en `failed_addresses` y NO
+    bloquean al resto. Misma validación de empresa que crear/asignar (verify_driver_access)
+    + rellena company_id + push 'nueva ruta asignada'."""
+    await verify_driver_access(req.driver_id, user)
+    if not req.rows:
+        raise HTTPException(status_code=400, detail="No hay filas para importar")
+    if len(req.rows) > 200:
+        raise HTTPException(status_code=400, detail="Máximo 200 paradas por importación")
+
+    stops_data: list[dict] = []
+    failed: list[str] = []
+    for row in req.rows:
+        geo = await _geocode_address(row.address, req.country)
+        if not geo:
+            failed.append(row.address)
+            continue
+        stops_data.append({
+            "address": geo["display_name"],
+            "lat": geo["lat"],
+            "lng": geo["lng"],
+            "position": len(stops_data),
+            "notes": row.notes,
+            "phone": row.phone,
+            "packages": row.packages,
+        })
+
+    if not stops_data:
+        raise HTTPException(status_code=422, detail={
+            "error": "no_geocoded",
+            "message": "Ninguna dirección se pudo geocodificar",
+            "failed_addresses": failed,
+        })
+
+    driver_q = await asyncio.to_thread(
+        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+    )
+    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+
+    route_data: dict = {
+        "driver_id": req.driver_id,
+        "name": req.name or f"Importada {datetime.now(timezone.utc).strftime('%d/%m %H:%M')}",
+        "total_stops": len(stops_data),
+        "status": "pending",
+    }
+    if driver_company_id:
+        route_data["company_id"] = driver_company_id
+
+    route_result = await asyncio.to_thread(lambda: supabase.table("routes").insert(route_data).execute())
+    route_row = safe_first(route_result)
+    if not route_row:
+        raise HTTPException(status_code=500, detail="Error al crear la ruta importada")
+    route_id = route_row["id"]
+
+    for s in stops_data:
+        s["route_id"] = route_id
+    stops_insert = await asyncio.to_thread(lambda: supabase.table("stops").insert(stops_data).execute())
+    if not stops_insert.data:
+        logger.error(f"Import: failed to insert stops for route {route_id}")
+        raise HTTPException(status_code=500, detail="Error al crear las paradas importadas")
+
+    await notify_driver_route_assigned(req.driver_id, route_id)
+    log_audit(user["id"], "import_route", "route", route_id,
+              {"driver_id": req.driver_id, "imported": len(stops_data), "failed": len(failed)})
+    return {"success": True, "route_id": route_id, "imported": len(stops_data),
+            "failed_count": len(failed), "failed_addresses": failed}
 
 
 class ReconcileOptimizationBody(BaseModel):
@@ -4354,11 +4484,15 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
 
         company_id = company["id"]
 
-        # Update owner's role to admin in users table
+        # Mint the owner as a COMPANY-SCOPED role, NOT the global platform 'admin'.
+        # The global 'admin' role bypasses tenant scope in RLS + backend helpers and
+        # would make every company owner a super-admin over all tenants. 'company_admin'
+        # is recognised by verify_* helpers and by the company-scoped RLS policies.
         supabase.table("users").update({
-            "role": "admin",
+            "role": "company_admin",
             "company_id": company_id,
         }).eq("id", user["id"]).execute()
+        invalidate_user_cache(user["id"])
 
         # Update owner's company_id in drivers table
         supabase.table("drivers").update({
@@ -4800,10 +4934,16 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
 
         company_id = invite["company_id"]
 
+        # Honor the invite's role, but ONLY allow the two safe company-operator roles
+        # (never the global platform 'admin'). A plain driver invite leaves role untouched.
+        invite_role = (invite.get("role") or "").strip()
+        user_update = {"company_id": company_id}
+        if invite_role in ("dispatcher", "company_admin"):
+            user_update["role"] = invite_role
+
         # Update users table
-        supabase.table("users").update({
-            "company_id": company_id,
-        }).eq("id", user_id).execute()
+        supabase.table("users").update(user_update).eq("id", user_id).execute()
+        invalidate_user_cache(user_id)
 
         # Update drivers table
         supabase.table("drivers").update({
@@ -13893,6 +14033,8 @@ async def fleet_driver_locations(user=Depends(require_admin_or_dispatcher)):
 async def fleet_driver_performance(driver_id: str, period: str = "today", user=Depends(require_admin_or_dispatcher)):
     """Driver performance metrics for a given period."""
     try:
+        # IDOR guard: a dispatcher may only read drivers of their own company.
+        await verify_driver_access(driver_id, user)
         start_dt, end_dt = _period_to_date_range(period)
         start_str = start_dt.isoformat()
 
@@ -14155,6 +14297,8 @@ async def delete_fleet_zone(zone_id: str, user=Depends(require_admin_or_dispatch
 async def send_fleet_message(msg: FleetMessageCreate, user=Depends(require_admin_or_dispatcher)):
     """Send a message from dispatcher to driver."""
     try:
+        # IDOR guard: only message drivers of your own company (also stops cross-company push spam).
+        await verify_driver_access(msg.driver_id, user)
         data = {
             "company_id": user.get("company_id"),
             "sender_id": user["id"],
