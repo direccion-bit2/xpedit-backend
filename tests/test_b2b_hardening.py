@@ -132,3 +132,39 @@ async def test_invite_dispatcher_cannot_mint_elevated_role(dispatcher_client):
         json={"company_id": COMPANY_A, "role": "company_admin"},
     )
     assert res.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_fleet_login_accepts_company_admin():
+    """company_admin (company owner minted by /company/register) MUST be able to log
+    into the fleet dashboard. Before, /fleet/login whitelisted only admin/dispatcher
+    → the owner got 403 and onboarding was broken at the door."""
+    auth_resp = MagicMock()
+    auth_resp.status_code = 200
+    auth_resp.json.return_value = {"access_token": "tok", "user": {"id": "u-owner"}}
+    mock_http = AsyncMock()
+    mock_http.post.return_value = auth_resp
+    mock_http.__aenter__.return_value = mock_http
+    mock_http.__aexit__.return_value = False
+
+    users_res = MagicMock()
+    users_res.data = [{
+        "id": "u-owner", "email": "o@a.com", "full_name": "Owner",
+        "role": "company_admin", "company_id": COMPANY_A,
+    }]
+
+    def table_dispatch(name):
+        chain = MagicMock()
+        if name == "users":
+            chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = users_res
+        return chain
+
+    with patch("main.httpx.AsyncClient", return_value=mock_http), \
+         patch.object(main, "supabase") as sb:
+        sb.table.side_effect = table_dispatch
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            res = await ac.post("/fleet/login", json={"email": "o@a.com", "password": "x"})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["user"]["role"] == "company_admin"
