@@ -97,3 +97,34 @@ async def test_driver_access_same_company_allowed():
          patch.object(main, "get_user_driver_id", new=AsyncMock(return_value="my-driver")):
         sb.table.side_effect = _drivers_table(COMPANY_A)
         assert await verify_driver_access("driver-of-A", _dispatcher()) is True
+
+
+# --- Invite endpoint: privilege-escalation guard --------------------------------
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from main import app, get_current_user
+
+
+@pytest_asyncio.fixture
+async def dispatcher_client():
+    user = {"id": "u-disp-A", "email": "d@a.com", "role": "dispatcher", "company_id": COMPANY_A}
+
+    async def _override():
+        return user
+
+    app.dependency_overrides[get_current_user] = _override
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_invite_dispatcher_cannot_mint_elevated_role(dispatcher_client):
+    """A dispatcher requesting an elevated invite role (company_admin) is rejected 403,
+    before ever touching the DB — prevents privilege escalation via the invite body."""
+    res = await dispatcher_client.post(
+        "/company/invites",
+        json={"company_id": COMPANY_A, "role": "company_admin"},
+    )
+    assert res.status_code == 403

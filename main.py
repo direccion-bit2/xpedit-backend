@@ -4800,6 +4800,21 @@ async def get_company_stats(company_id: str, user=Depends(get_current_user)):
 async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_current_user)):
     """Genera un código de invitación para unirse a la empresa. Solo admin/dispatcher."""
     await verify_company_management(user, request.company_id)
+    # SECURITY (no confiar en el cliente):
+    # 1) Tenant scope server-side: un operador NO-plataforma solo puede invitar a SU empresa.
+    #    'admin' (plataforma) sí puede para cualquiera (lo valida verify_company_management).
+    company_id = request.company_id
+    if user["role"] != "admin":
+        company_id = user.get("company_id") or request.company_id
+    # 2) Rol: whitelist + solo company_admin/plataforma pueden emitir invitaciones con rol
+    #    ELEVADO. Un dispatcher solo puede invitar 'driver' (evita escalada de privilegios).
+    requested_role = (request.role or "driver").strip().lower()
+    if requested_role not in ("driver", "dispatcher", "company_admin"):
+        requested_role = "driver"
+    if requested_role in ("dispatcher", "company_admin") and user["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Solo un company_admin puede invitar con rol elevado")
+    # 3) TTL acotado server-side (1h..168h) — no confiar en expires_hours del cliente.
+    expires_hours = max(1, min(int(request.expires_hours or 168), 168))
     try:
         # Generate unique code
         for _ in range(10):
@@ -4813,12 +4828,12 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
         else:
             raise HTTPException(status_code=500, detail="Failed to generate unique invite code")
 
-        expires_at = (datetime.now(timezone.utc) + timedelta(hours=request.expires_hours)).isoformat()
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_hours)).isoformat()
 
         invite_data = {
             "code": code,
-            "company_id": request.company_id,
-            "role": request.role,
+            "company_id": company_id,          # server-derived (no client-trusted)
+            "role": requested_role,            # whitelisted + privilege-checked
             "max_uses": request.max_uses,
             "current_uses": 0,
             "active": True,
