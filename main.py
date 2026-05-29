@@ -2224,6 +2224,12 @@ async def assign_route_driver(route_id: str, req: AssignDriverRequest,
         driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
         if driver_company_id:
             update_data["company_id"] = driver_company_id
+        # Registrar QUIÉN asignó. Es lo que la app usa para distinguir una ruta
+        # "asignada por tu empresa" (badge) de un borrador propio del conductor.
+        update_data["assigned_by"] = user["id"]
+    else:
+        # Desasignar: limpiar también assigned_by para que no quede marcada como asignada.
+        update_data["assigned_by"] = None
 
     result = await asyncio.to_thread(
         lambda: supabase.table("routes").update(update_data).eq("id", route_id).execute()
