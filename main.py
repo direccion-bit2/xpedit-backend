@@ -2489,27 +2489,42 @@ async def clear_route(route_id: str, user=Depends(get_current_user)):
     }
 
 
-@app.delete("/routes/{route_id}", tags=["routes"], summary="Eliminar ruta")
+@app.delete("/routes/{route_id}", tags=["routes"], summary="Eliminar ruta (soft-delete)")
 async def delete_route(route_id: str, user=Depends(get_current_user)):
-    """Elimina una ruta y todas sus dependencias (paradas, tracking, pruebas de entrega)."""
+    """Soft-delete de una ruta: marca `deleted_at`. El trigger
+    `trg_soft_delete_route_stops` cascada `deleted_at` a sus paradas
+    automáticamente.
+
+    NUNCA hard-delete (regla dura — 4 may 2026 Miguel perdió una ruta de 14
+    paradas). Antes este endpoint hacía `.delete()` de routes+stops+proofs y eso:
+      (1) borraba paradas YA completadas → desaparecían del conteo de 'trabajadas'
+          (la métrica canónica cuenta completed/failed INCLUYENDO `deleted_at`,
+          que asume soft-delete);
+      (2) si un complete/fail offline encolado apuntaba a una parada de esa ruta,
+          al drenar la cola el UPDATE afectaba 0 filas → tripwire 1E "RLS silent
+          drop" + pérdida real.
+    Ahora se conservan todas las filas (incl. delivery_proofs/tracking_links =
+    evidencia de entrega); la ruta y sus paradas quedan ocultas por `deleted_at`.
+
+    Server-side con service_role (evita 42501 con JWT stale). Idempotente: si la
+    ruta ya estaba borrada devuelve already_deleted=true.
+    """
     await verify_route_access(route_id, user)
-    # Get stop IDs for this route
-    stops_result = supabase.table("stops").select("id").eq("route_id", route_id).execute()
-    stop_ids = [s["id"] for s in (stops_result.data or [])]
-
-    if stop_ids:
-        # Delete delivery proofs linked to these stops (batch)
-        supabase.table("delivery_proofs").delete().in_("stop_id", stop_ids).execute()
-
-        # Delete tracking links for this route
-        supabase.table("tracking_links").delete().eq("route_id", route_id).execute()
-
-        # Delete stops
-        supabase.table("stops").delete().eq("route_id", route_id).execute()
-
-    # Delete the route itself
-    supabase.table("routes").delete().eq("id", route_id).execute()
-    return {"success": True}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = await asyncio.to_thread(
+        lambda: supabase.table("routes").update({
+            "deleted_at": now_iso,
+        }).eq("id", route_id).is_("deleted_at", None).execute()
+    )
+    route = safe_first(result)
+    if not route:
+        existing = supabase.table("routes").select("id, deleted_at").eq("id", route_id).limit(1).execute()
+        if existing.data:
+            return {"success": True, "already_deleted": True}
+        raise HTTPException(status_code=404, detail="Ruta no encontrada")
+    # Count stops cascaded by the trigger (deleted_at now set) for a client toast.
+    stops_count = supabase.table("stops").select("id", count="exact").eq("route_id", route_id).not_.is_("deleted_at", None).execute()
+    return {"success": True, "stops_deleted": stops_count.count or 0}
 
 
 # -- Paradas --
@@ -11516,13 +11531,17 @@ async def start_social_scheduler():
         logger.info("Social scheduler: checking every 60s")
     else:
         logger.info("Social: Twitter credentials not configured, social posts not scheduled")
-    # Closures scrapers: refresh every 30 minutes
-    social_scheduler.add_job(
-        run_all_closure_scrapers, "interval", minutes=30,
-        id="closures_scraper", replace_existing=True,
-        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),  # first run 2 min after boot
-    )
-    logger.info("Closures scrapers: every 30 min")
+    # Closures scrapers: DESACTIVADO 27 may 2026 (Miguel) — coste (requests a webs
+    # municipales + geocoding Google cada 30 min) sin uso real de la feature. Se deja
+    # TODO el código por si se reactiva: la función run_all_closure_scrapers, el endpoint
+    # manual /admin/scrape-closures/{city} y la lectura /closures/* siguen disponibles.
+    # Para reactivar el cron, descomentar este add_job.
+    # social_scheduler.add_job(
+    #     run_all_closure_scrapers, "interval", minutes=30,
+    #     id="closures_scraper", replace_existing=True,
+    #     next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),  # first run 2 min after boot
+    # )
+    logger.info("Closures scrapers: DESACTIVADO (cron desconectado 27 may, feature sin uso)")
     # Daily costs snapshot (Miguel 21 may 2026 — task #169): snapshot del día
     # anterior cada día a las 09:17 UTC (minuto :17 para evitar ruido cron).
     social_scheduler.add_job(
