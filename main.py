@@ -2322,6 +2322,81 @@ async def fail_stop(stop_id: str, user=Depends(get_current_user)):
     return {"success": True, "stop": stop}
 
 
+# === PROOF OF DELIVERY (POD) — signed-URL access ===
+# The `proof-of-delivery` storage bucket is PRIVATE. POD photos/signatures are
+# served only through short-lived signed URLs minted here, AFTER authorizing the
+# caller against the proof's route (owner driver, same-company dispatcher /
+# company_admin, or platform admin). This is the only path that lets a dispatcher
+# view a driver's POD without making the bucket public — object names are flat
+# (proof_<ts>_<rand>.jpg), so per-object RLS by folder is impossible.
+_POD_BUCKET = "proof-of-delivery"
+_POD_SIGNED_URL_TTL_S = 600  # 10 min: long enough to view, short enough to not leak
+
+
+def _pod_object_path(stored_url: Optional[str]) -> Optional[str]:
+    """Derive the storage object path from a stored POD url.
+
+    Historic rows store a PUBLIC url (…/object/public/proof-of-delivery/<name>);
+    be defensive and also accept an already-signed url or a bare object name.
+    Returns None if nothing usable can be extracted.
+    """
+    if not stored_url:
+        return None
+    marker = f"/{_POD_BUCKET}/"
+    if marker in stored_url:
+        return stored_url.split(marker, 1)[1].split("?", 1)[0]
+    if "://" not in stored_url:  # already a bare object name
+        return stored_url.split("?", 1)[0]
+    return None
+
+
+def _pod_signed_url(stored_url: Optional[str]) -> Optional[str]:
+    """Mint a short-lived signed url for a stored POD object, or None on failure."""
+    path = _pod_object_path(stored_url)
+    if not path:
+        return None
+    try:
+        res = supabase.storage.from_(_POD_BUCKET).create_signed_url(path, _POD_SIGNED_URL_TTL_S)
+        signed = None
+        if isinstance(res, dict):
+            signed = res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
+        if signed and signed.startswith("/"):
+            signed = f"{SUPABASE_URL.rstrip('/')}{signed}"
+        return signed
+    except Exception as e:
+        logger.warning(f"POD signed url failed for path={path}: {e}")
+        return None
+
+
+@app.get("/pod/{proof_id}/signed-urls", tags=["stops"], summary="Signed URLs de una prueba de entrega")
+async def get_pod_signed_urls(proof_id: str, user=Depends(get_current_user)):
+    """Devuelve signed URLs (foto/firma) de un delivery_proof tras autorizar al
+    solicitante contra la ruta del proof. El bucket es privado; las URLs caducan
+    en 10 min. Reemplaza el uso de las antiguas URLs públicas en app y dashboard."""
+    result = await asyncio.to_thread(
+        lambda: supabase.table("delivery_proofs")
+            .select("id, route_id, driver_id, photo_url, signature_url")
+            .eq("id", proof_id).limit(1).execute()
+    )
+    proof = safe_first(result)
+    if not proof:
+        raise HTTPException(status_code=404, detail="Prueba de entrega no encontrada")
+
+    # Authorize via the route (covers owner driver + same-company operator +
+    # platform admin). Legacy proofs without route_id fall back to the owning driver.
+    if proof.get("route_id"):
+        await verify_route_access(proof["route_id"], user)
+    elif proof.get("driver_id"):
+        await verify_driver_access(proof["driver_id"], user)
+    else:
+        raise HTTPException(status_code=403, detail="Prueba sin contexto verificable")
+
+    photo_signed, sig_signed = await asyncio.to_thread(
+        lambda: (_pod_signed_url(proof.get("photo_url")), _pod_signed_url(proof.get("signature_url")))
+    )
+    return {"photo_url": photo_signed, "signature_url": sig_signed}
+
+
 class StopDeleteRequest(BaseModel):
     # Cliente puede mandar dbId conocido, o (route_id + client_id) cuando la
     # INSERT inicial aún no ha confirmado el dbId (offline queue drain path).
