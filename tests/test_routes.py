@@ -660,18 +660,67 @@ class TestRouteActions:
         assert response.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_delete_route(self, client):
-        """Deleting a route should succeed with proper access."""
+    async def test_delete_route_soft_deletes_never_hard(self, client):
+        """DELETE /routes/{id} must SOFT-delete (set deleted_at), NEVER hard-delete.
+
+        The old hard-delete wiped completed stops from the 'trabajadas' count
+        (the canonical metric counts completed/failed INCLUDING deleted_at) and
+        caused REACT-NATIVE-1E silent drops when an offline complete/fail op
+        targeted a stop of the deleted route. trg_soft_delete_route_stops cascades
+        deleted_at to the stops; proofs/tracking are kept."""
         with patch("main.supabase") as mock_sb:
             route_access = MagicMock()
             route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
-
             driver_lookup = MagicMock()
             driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+            update_result = MagicMock()
+            update_result.data = [{"id": "route-1", "deleted_at": "2026-05-29T11:00:00+00:00"}]
+            stops_count = MagicMock()
+            stops_count.count = 7
 
-            stops_result = MagicMock()
-            stops_result.data = [{"id": "stop-1"}]
+            hard_delete_called = {"any": False}
+            call_count = {"routes": 0}
 
+            def table_dispatch(name):
+                chain = MagicMock()
+                # A .delete() on ANY table is a hard-delete → must NEVER happen.
+                def _mark_hard_delete(*a, **k):
+                    hard_delete_called["any"] = True
+                    return MagicMock()
+                chain.delete.side_effect = _mark_hard_delete
+                if name == "routes":
+                    call_count["routes"] += 1
+                    if call_count["routes"] == 1:
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                    else:
+                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = update_result
+                elif name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                elif name == "stops":
+                    chain.select.return_value.eq.return_value.not_.is_.return_value.execute.return_value = stops_count
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.delete("/routes/route-1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["stops_deleted"] == 7
+        assert hard_delete_called["any"] is False, "delete_route must NOT hard-delete any row"
+
+    @pytest.mark.asyncio
+    async def test_delete_route_idempotent(self, client):
+        """Re-deleting an already soft-deleted route → 200 + already_deleted=true."""
+        with patch("main.supabase") as mock_sb:
+            route_access = MagicMock()
+            route_access.data = [{"id": "route-1", "driver_id": FAKE_DRIVER_ID}]
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+            empty_update = MagicMock()
+            empty_update.data = []
+            already = MagicMock()
+            already.data = [{"id": "route-1", "deleted_at": "2026-05-29T08:00:00+00:00"}]
             call_count = {"routes": 0}
 
             def table_dispatch(name):
@@ -680,24 +729,41 @@ class TestRouteActions:
                     call_count["routes"] += 1
                     if call_count["routes"] == 1:
                         chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                    elif call_count["routes"] == 2:
+                        chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = empty_update
                     else:
-                        chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
+                        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = already
                 elif name == "drivers":
                     chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
-                elif name == "stops":
-                    chain.select.return_value.eq.return_value.execute.return_value = stops_result
-                    chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
-                else:
-                    chain.delete.return_value.eq.return_value.execute.return_value = MagicMock()
-                    chain.delete.return_value.in_.return_value.execute.return_value = MagicMock()
                 return chain
 
             mock_sb.table = MagicMock(side_effect=table_dispatch)
-
             response = await client.delete("/routes/route-1")
 
         assert response.status_code == 200
-        assert response.json()["success"] is True
+        assert response.json().get("already_deleted") is True
+
+    @pytest.mark.asyncio
+    async def test_delete_route_requires_ownership(self, client):
+        """delete_route must reject a driver who doesn't own the route."""
+        with patch("main.supabase") as mock_sb:
+            route_access = MagicMock()
+            route_access.data = [{"id": "route-1", "driver_id": "different-driver"}]
+            driver_lookup = MagicMock()
+            driver_lookup.data = [{"id": FAKE_DRIVER_ID, "company_id": None}]
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "routes":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = route_access
+                elif name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = driver_lookup
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            response = await client.delete("/routes/route-1")
+
+        assert response.status_code == 403
 
 
 class TestReconcileOptimization:
