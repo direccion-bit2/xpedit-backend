@@ -227,6 +227,33 @@ _raw_jwt = os.getenv("SUPABASE_JWT_SECRET", "")
 SUPABASE_JWT_SECRET = _raw_jwt + "=" * ((4 - len(_raw_jwt) % 4) % 4) if _raw_jwt else ""
 
 
+def fetch_all_rows(build_query, page_size: int = 1000, hard_cap: int = 200_000) -> list:
+    """Pagina una query Supabase para saltarse el cap silencioso de 1000 filas de PostgREST.
+
+    Supabase Cloud limita server-side a 1000 filas (db-max-rows=1000) SIN lanzar error:
+    cualquier `.execute()` que devuelva >1000 filas se trunca y el código consume datos
+    incompletos creyendo que tiene todo. Este helper recorre la query por páginas con
+    `.range()` hasta agotar resultados.
+
+    build_query: callable que DEVUELVE una query NUEVA (sin .execute()), p.ej.
+        lambda: supabase.table("stops").select("id").in_("route_id", ids).order("id")
+    IMPORTANTE: la query DEBE incluir un .order(...) estable (ej .order("id")), o
+    `.range()` puede saltar/duplicar filas entre páginas.
+
+    Devuelve una lista con TODAS las filas (puede ser vacía).
+    """
+    rows: list = []
+    start = 0
+    while start < hard_cap:
+        page = build_query().range(start, start + page_size - 1).execute()
+        data = page.data or []
+        rows.extend(data)
+        if len(data) < page_size:
+            break
+        start += page_size
+    return rows
+
+
 def safe_first(result) -> Optional[dict]:
     """Safely get first result from Supabase query, returns None if empty"""
     return result.data[0] if result.data else None
@@ -11313,6 +11340,13 @@ async def start_social_scheduler():
     social_scheduler.add_job(
         check_cost_alerts, "cron", minute=5,
         id="cost_alerts_hourly", replace_existing=True,
+        # coalesce=True + max_instances=1 + misfire_grace_time=300: si el event loop
+        # va con unos segundos de retraso (29 may 2026: Sentry "job missed by 2.24s"),
+        # el default de APScheduler (grace=1s) marcaba el job como perdido y SE SALTABA
+        # esa comprobación de coste de esa hora. Con grace=300s un hipo no lo salta.
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
     )
     logger.info("Cost alerts: cron HH:05 (4 thresholds, anti-spam 4h)")
     # Siempre arrancar el scheduler (tambien para backups y retention)
@@ -11952,10 +11986,13 @@ async def backup_critical_tables():
 
         for table in tables:
             try:
-                result = supabase.table(table).select("*").execute()
+                # Paginado: PostgREST capa a 1000 filas en silencio. Sin esto el backup
+                # diario guardaba solo las primeras 1000 filas de cada tabla (stops/routes/
+                # drivers ya superan 1000). .order("id") = orden estable para .range().
+                rows = fetch_all_rows(lambda t=table: supabase.table(t).select("*").order("id"))
                 backup_data[table] = {
-                    "count": len(result.data),
-                    "data": result.data,
+                    "count": len(rows),
+                    "data": rows,
                     "backed_up_at": datetime.now(timezone.utc).isoformat()
                 }
             except Exception as e:
