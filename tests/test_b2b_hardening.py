@@ -27,10 +27,12 @@ def _routes_table(route_row):
     def dispatch(name):
         chain = MagicMock()
         if name == "routes":
-            res = MagicMock(); res.data = [route_row] if route_row else []
+            res = MagicMock()
+            res.data = [route_row] if route_row else []
             chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = res
         elif name == "drivers":
-            res = MagicMock(); res.data = [{"company_id": route_row.get("company_id")}] if route_row else []
+            res = MagicMock()
+            res.data = [{"company_id": route_row.get("company_id")}] if route_row else []
             chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = res
         return chain
     return dispatch
@@ -73,7 +75,8 @@ async def test_route_access_company_admin_role_recognised():
 def _drivers_table(driver_company):
     def dispatch(name):
         chain = MagicMock()
-        res = MagicMock(); res.data = [{"company_id": driver_company}]
+        res = MagicMock()
+        res.data = [{"company_id": driver_company}]
         chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = res
         return chain
     return dispatch
@@ -102,6 +105,7 @@ async def test_driver_access_same_company_allowed():
 # --- Invite endpoint: privilege-escalation guard --------------------------------
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+
 from main import app, get_current_user
 
 
