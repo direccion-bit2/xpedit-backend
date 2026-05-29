@@ -4823,6 +4823,7 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
             "current_uses": 0,
             "active": True,
             "expires_at": expires_at,
+            "created_by": user["id"],  # auditoría: registrar quién generó la invitación
         }
 
         result = supabase.table("company_invites").insert(invite_data).execute()
