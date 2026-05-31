@@ -19,6 +19,20 @@ import pytest
 from tests.conftest import FAKE_USER_ID
 
 
+def _chain(result):
+    """Mock de builder Supabase chain-agnostic: cualquier secuencia de metodos
+    (select/order/range/eq/in_/gte/...) devuelve el mismo mock y .execute()
+    devuelve `result`. Robusto a la paginacion con fetch_all_rows (.range) y a
+    cambios de encadenamiento; los mocks que fijaban la cadena exacta se rompian
+    al anadir .order()/.range()."""
+    c = MagicMock()
+    for _m in ("select", "order", "range", "eq", "neq", "in_", "gte", "lte",
+               "lt", "gt", "not_", "is_", "or_", "filter", "limit", "ilike", "like"):
+        getattr(c, _m).return_value = c
+    c.execute.return_value = result
+    return c
+
+
 class TestAdminAccessControl:
     """Admin endpoints should reject non-admin users."""
 
@@ -76,10 +90,9 @@ class TestAdminUsers:
             ]
 
             def table_dispatch(name):
-                chain = MagicMock()
                 if name == "drivers":
-                    chain.select.return_value.order.return_value.execute.return_value = users_result
-                return chain
+                    return _chain(users_result)
+                return _chain(MagicMock(data=[], count=0))
 
             mock_sb.table = MagicMock(side_effect=table_dispatch)
 
@@ -545,38 +558,26 @@ class TestAdminStats:
             call_index = {"drivers": 0, "routes": 0, "stops": 0}
 
             def table_dispatch(name):
-                chain = MagicMock()
                 if name == "drivers":
                     call_index["drivers"] += 1
-                    if call_index["drivers"] == 1:
-                        chain.select.return_value.execute.return_value = drivers_result
-                    else:
-                        chain.select.return_value.gte.return_value.execute.return_value = new_month_result
+                    return _chain(drivers_result if call_index["drivers"] == 1 else new_month_result)
                 elif name == "routes":
                     call_index["routes"] += 1
-                    if call_index["routes"] == 1:
-                        chain.select.return_value.gte.return_value.execute.return_value = routes_today_result
-                    elif call_index["routes"] == 2:
-                        chain.select.return_value.gte.return_value.execute.return_value = routes_week_result
-                    elif call_index["routes"] == 3:
-                        chain.select.return_value.execute.return_value = routes_total_result
-                    else:
-                        chain.select.return_value.gte.return_value.execute.return_value = routes_month_result
+                    return _chain({
+                        1: routes_today_result,
+                        2: routes_week_result,
+                        3: routes_total_result,
+                    }.get(call_index["routes"], routes_month_result))
                 elif name == "stops":
                     call_index["stops"] += 1
-                    if call_index["stops"] == 1:
-                        chain.select.return_value.eq.return_value.execute.return_value = stops_total_result
-                    elif call_index["stops"] == 2:
-                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = stops_today_result
-                    elif call_index["stops"] == 3:
-                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = stops_week_result
-                    elif call_index["stops"] == 4:
-                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = stops_month_result
-                    elif call_index["stops"] == 5:
-                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = failed_today_result
-                    else:
-                        chain.select.return_value.eq.return_value.gte.return_value.execute.return_value = failed_week_result
-                return chain
+                    return _chain({
+                        1: stops_total_result,
+                        2: stops_today_result,
+                        3: stops_week_result,
+                        4: stops_month_result,
+                        5: failed_today_result,
+                    }.get(call_index["stops"], failed_week_result))
+                return _chain(MagicMock(data=[], count=0))
 
             mock_sb.table = MagicMock(side_effect=table_dispatch)
 
@@ -629,14 +630,13 @@ class TestAdminListCompanies:
             ]
 
             def table_dispatch(name):
-                chain = MagicMock()
                 if name == "companies":
-                    chain.select.return_value.order.return_value.execute.return_value = companies_result
+                    return _chain(companies_result)
                 elif name == "company_driver_links":
-                    chain.select.return_value.in_.return_value.execute.return_value = all_links_result
+                    return _chain(all_links_result)
                 elif name == "company_subscriptions":
-                    chain.select.return_value.in_.return_value.order.return_value.execute.return_value = all_subs_result
-                return chain
+                    return _chain(all_subs_result)
+                return _chain(MagicMock(data=[], count=0))
 
             mock_sb.table = MagicMock(side_effect=table_dispatch)
 
