@@ -2371,6 +2371,11 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
     }
     if driver_company_id:
         route_data["company_id"] = driver_company_id
+    # FIX (E2E 31 may): marcar la ruta como ASIGNADA por la empresa. Sin esto,
+    # assigned_by quedaba null y la app NO mostraba el badge "De tu empresa"
+    # (isCompanyAssigned = !!assigned_by), pese a enviarse el push. Mismo patron
+    # que /routes/{id}/assign-driver.
+    route_data["assigned_by"] = user["id"]
 
     route_result = await asyncio.to_thread(lambda: supabase.table("routes").insert(route_data).execute())
     route_row = safe_first(route_result)
