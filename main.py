@@ -7051,15 +7051,14 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
                     source="msi",
                     image_storage_path=storage_path,
                     model_name=_MSI_MODEL,
-                    model_extracted_address=stop.get("address") or stop.get("street"),
-                    model_extracted_parts={k: stop.get(k) for k in (
-                        "name", "business_name", "street", "city", "postalCode", "province", "floor_etc",
-                    ) if stop.get(k) is not None},
-                    model_confidence=float(stop.get("extraction_confidence")) if stop.get("extraction_confidence") is not None else None,
-                    carrier_hint=req.carrier_hint or carrier_detected,
+                    model_extracted_address=stop.get("formatted_address") or stop.get("street"),
+                    model_extracted_parts=_msi_model_parts(stop),
+                    model_confidence=_msi_numeric_confidence(stop),
+                    carrier_hint=(req.carrier_hint or carrier_detected or "").lower() or None,
                     country_iso=country,
                     model_latency_ms=extraction_ms if i == 0 else None,
                     consent=True,
+                    prompt_version="v1.1-persistfix",
                 )
                 correction_ids[i] = cid
                 # Mirror the id on the response stop so the app can keep the
@@ -7172,6 +7171,50 @@ def _upload_ocr_image_sync(
         return None
 
 
+# Campos del modelo que persistimos como ground-truth en ocr_corrections.
+# BUG histórico (OCR v1, arreglado en v1.1): la persistencia NO incluía 'number'
+# y leía la clave camelCase 'postalCode' cuando el modelo devuelve 'postal_code'
+# (snake_case) → el NÚMERO DE PORTAL y el CÓDIGO POSTAL se TIRABAN al guardar,
+# dejando el learning loop ciego justo en los dos campos que más rompen el reparto
+# (el modelo SÍ los extrae; los descartábamos). Aquí guardamos las claves correctas.
+_OCR_MODEL_PART_KEYS = (
+    "name", "business_name", "street", "number", "floor_etc",
+    "postal_code", "city", "province", "phone",
+)
+
+
+def _msi_numeric_confidence(stop: dict) -> Optional[float]:
+    """Confianza 0..1 PERSISTIBLE de una parada extraída.
+
+    Antes se guardaba `stop['extraction_confidence']`, una clave que el pipeline
+    NUNCA setea → `model_confidence` quedaba siempre NULL y no podía discriminar
+    acierto de fallo. Derivamos un número real: el mínimo de la confianza por campo
+    de los campos que rompen el reparto (calle/número/CP); si el modelo no la dio,
+    mapeamos la categoría high/medium/low. Una extracción vacía es siempre baja."""
+    if stop.get("is_empty_extraction"):
+        return 0.1
+    cpf = stop.get("confidence_per_field") or {}
+    vals = [float(cpf[k]) for k in ("street", "number", "postal_code")
+            if isinstance(cpf.get(k), (int, float))]
+    if vals:
+        return round(min(vals), 3)
+    cat = (stop.get("confidence") or "").lower()
+    return {"high": 0.9, "medium": 0.6, "low": 0.3}.get(cat)
+
+
+def _msi_model_parts(stop: dict) -> dict:
+    """Partes extraídas a persistir con las claves CORRECTAS (incl. `number` y
+    `postal_code`) + la confianza por campo + una traza del geocoding. Esto es lo
+    que alimenta el editor de ground-truth y la evaluación A/B del OCR."""
+    parts = {k: stop.get(k) for k in _OCR_MODEL_PART_KEYS if stop.get(k) not in (None, "")}
+    if stop.get("confidence_per_field"):
+        parts["confidence_per_field"] = stop["confidence_per_field"]
+    for k in ("geocoding_status", "place_id", "is_empty_extraction"):
+        if stop.get(k) is not None:
+            parts[k] = stop.get(k)
+    return parts
+
+
 def _create_ocr_correction_row(
     *,
     driver_id: str,
@@ -7186,6 +7229,7 @@ def _create_ocr_correction_row(
     model_latency_ms: Optional[int],
     consent: bool,
     app_version: Optional[str] = None,
+    prompt_version: str = "v1",
 ) -> Optional[str]:
     """Insert a row in `ocr_corrections` describing the model's output for
     a single extracted stop. Returns the row id, or None if the insert
@@ -7197,7 +7241,7 @@ def _create_ocr_correction_row(
         "source": source,
         "image_storage_path": image_storage_path,
         "model_name": model_name,
-        "prompt_version": "v1",
+        "prompt_version": prompt_version,
         "model_extracted_address": model_extracted_address,
         "model_extracted_parts": model_extracted_parts,
         "model_confidence": model_confidence,
