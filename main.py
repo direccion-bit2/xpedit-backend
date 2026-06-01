@@ -6878,6 +6878,20 @@ async def _msi_get_candidates_for_stop(
     return out
 
 
+def _msi_choose_formatted(is_empty: bool, is_usable_geo: bool,
+                          geo_formatted: Optional[str], flat: str) -> str:
+    """Dirección a MOSTRAR al repartidor. Solo usamos el formatted de Google cuando
+    geocodificó de verdad (usable). Si degradó (APPROXIMATE) o falló, su formatted
+    pierde la calle y devuelve solo 'CP Ciudad' (visto: 'Calle Vidrieros 1' →
+    'Sanlúcar' a secas) → preferimos el texto LEÍDO (flat: calle+nº+CP+ciudad) para
+    que el repartidor lo confirme/ajuste en vez de ver una dirección pobre."""
+    if is_empty:
+        return ""
+    if is_usable_geo:
+        return geo_formatted or flat
+    return flat or geo_formatted or ""
+
+
 def _msi_street_is_empty(s: dict) -> bool:
     """True si la parada NO tiene una vía entregable.
 
@@ -6993,7 +7007,15 @@ async def _msi_normalize_and_geocode(
         s["coords"] = (
             {"lat": geo["lat"], "lng": geo["lng"]} if _is_usable_geo else None
         )
-        s["formatted_address"] = "" if is_empty else (geo.get("formatted_address") or flat_address)
+        # CONSERVAR LO LEÍDO si el geocoding no es usable (APPROXIMATE/zero_results/
+        # error): el formatted de Google degradado pierde la calle y devuelve solo
+        # "11540 Sanlúcar" — visto en staging con "Calle Vidrieros 1" → "Sanlúcar"
+        # a secas. Mostrar el texto leído (flat: calle+nº+CP+ciudad) para que el
+        # repartidor lo confirme/ajuste, en vez de una dirección pobre que parece
+        # un fallo. Solo usamos el formatted de Google cuando geocodificó de verdad.
+        s["formatted_address"] = _msi_choose_formatted(
+            is_empty, _is_usable_geo, geo.get("formatted_address"), flat_address,
+        )
         s["place_id"] = geo.get("place_id", "")
         s["delivery_instructions"] = (s.get("floor_etc") or "").strip()
         s["geocoding_status"] = "empty_extraction" if is_empty else geo.get("status", "error")

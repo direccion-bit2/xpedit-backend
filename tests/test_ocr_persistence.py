@@ -6,11 +6,32 @@ clave camelCase 'postalCode' (el modelo devuelve 'postal_code'), y model_confide
 leía 'extraction_confidence' (clave inexistente) → number/CP/confianza se perdían.
 """
 from main import (
+    _msi_choose_formatted,
     _msi_model_parts,
     _msi_numeric_confidence,
     _msi_should_retry_without_country,
     _msi_street_is_empty,
 )
+
+
+class TestMsiChooseFormatted:
+    """Qué dirección mostrar: conservar lo leído si el geocoding degrada/falla."""
+
+    def test_geocoding_usable_usa_formatted_de_google(self):
+        out = _msi_choose_formatted(False, True, "Pl. de las Infantas, 24, 11540 Sanlúcar", "Plaza de las Infantas 24, 11540 Sanlucar")
+        assert out == "Pl. de las Infantas, 24, 11540 Sanlúcar"
+
+    def test_geocoding_degradado_conserva_lo_leido(self):
+        # Google degradó a "11540 Sanlúcar" (sin calle) → usar el flat leído.
+        out = _msi_choose_formatted(False, False, "11540 Sanlúcar de Barrameda, Cádiz, España", "CALLE VIDRIEROS 1, 11540 SANLUCAR DE BARRAMEDA")
+        assert out == "CALLE VIDRIEROS 1, 11540 SANLUCAR DE BARRAMEDA"
+
+    def test_zero_results_conserva_lo_leido(self):
+        out = _msi_choose_formatted(False, False, "", "Colonia monte algaida c/H 16, 11540 Sanlucar")
+        assert out == "Colonia monte algaida c/H 16, 11540 Sanlucar"
+
+    def test_vacia_devuelve_cadena_vacia(self):
+        assert _msi_choose_formatted(True, False, "", "") == ""
 
 
 class TestMsiShouldRetryWithoutCountry:
