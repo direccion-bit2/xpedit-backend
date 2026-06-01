@@ -845,9 +845,15 @@ _startup_smoke_ok: bool = False
 _startup_smoke_failures: list[str] = []
 
 # CORS
+# allow_origin_regex habilita los PREVIEWS de Vercel de ESTE proyecto/cuenta
+# (website-<hash>-miguels-projects-547e23cc.vercel.app) para poder validar ramas
+# B2B contra el backend sin abrir CORS a todo *.vercel.app. El backend sigue
+# exigiendo JWT válido en cada endpoint; CORS solo afecta a navegadores.
+VERCEL_PREVIEW_ORIGIN_REGEX = r"^https://website-[a-z0-9-]+-miguels-projects-547e23cc\.vercel\.app$"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://xpedit.es", "https://www.xpedit.es", "http://localhost:3000", "http://localhost:5173"],
+    allow_origin_regex=VERCEL_PREVIEW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2097,8 +2103,11 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
     if user["role"] == "admin":
         if driver_id:
             query = query.eq("driver_id", driver_id)
-    elif user["role"] == "dispatcher" and user.get("company_id"):
-        # Dispatcher: only routes from drivers in their company
+    elif user["role"] in ("dispatcher", "company_admin") and user.get("company_id"):
+        # Dispatcher / company_admin (dueño de empresa): solo rutas de conductores de SU
+        # empresa. company_admin es el rol que minta /company/register; sin incluirlo aquí
+        # el panel de empresa recibía [] al listar rutas (mismo patrón que assign-driver,
+        # que ya acepta company_admin vía require_admin_or_dispatcher).
         company_drivers = supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).execute()
         company_driver_ids = [d["id"] for d in (company_drivers.data or [])]
         if driver_id:
@@ -2334,13 +2343,55 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
     if len(req.rows) > 200:
         raise HTTPException(status_code=400, detail="Máximo 200 paradas por importación")
 
+    # Resolver la empresa ANTES de geocodificar: su directorio de clientes
+    # (customer_directory) sirve de CACHÉ de geocoding. Las empresas reparten a
+    # clientes recurrentes, así que una dirección ya conocida se reutiliza con coste
+    # CERO; solo pagamos Google Geocoding por las direcciones realmente nuevas.
+    driver_q = await asyncio.to_thread(
+        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+    )
+    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+
+    addr_cache: dict = {}
+    if driver_company_id:
+        try:
+            directory = await asyncio.to_thread(
+                lambda: supabase.table("customer_directory")
+                .select("normalized_address, lat, lng, phone, email")
+                .eq("company_id", driver_company_id)
+                .execute()
+            )
+            for entry in (directory.data or []):
+                if entry.get("lat") is not None and entry.get("lng") is not None:
+                    addr_cache[entry["normalized_address"]] = entry
+        except Exception as e:
+            logger.warning(f"Import: no se pudo cargar el directorio como caché: {e}")
+            sentry_sdk.capture_exception(e)
+
     stops_data: list[dict] = []
     failed: list[str] = []
+    from_cache = 0  # direcciones resueltas desde el directorio (0€)
+    geocoded = 0    # direcciones que sí costaron una llamada a Google
     for row in req.rows:
+        cached = addr_cache.get(normalize_address(row.address or ""))
+        if cached:
+            from_cache += 1
+            stops_data.append({
+                "address": row.address,
+                "lat": cached["lat"],
+                "lng": cached["lng"],
+                "position": len(stops_data),
+                "notes": row.notes,
+                "phone": row.phone or cached.get("phone"),
+                "email": cached.get("email"),
+                "packages": row.packages,
+            })
+            continue
         geo = await _geocode_address(row.address, req.country)
         if not geo:
             failed.append(row.address)
             continue
+        geocoded += 1
         stops_data.append({
             "address": geo["display_name"],
             "lat": geo["lat"],
@@ -2357,11 +2408,6 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
             "message": "Ninguna dirección se pudo geocodificar",
             "failed_addresses": failed,
         })
-
-    driver_q = await asyncio.to_thread(
-        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
-    )
-    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
 
     route_data: dict = {
         "driver_id": req.driver_id,
@@ -2392,9 +2438,13 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
 
     await notify_driver_route_assigned(req.driver_id, route_id)
     log_audit(user["id"], "import_route", "route", route_id,
-              {"driver_id": req.driver_id, "imported": len(stops_data), "failed": len(failed)})
+              {"driver_id": req.driver_id, "imported": len(stops_data), "failed": len(failed),
+               "from_cache": from_cache, "geocoded": geocoded})
+    # from_cache/geocoded: transparencia de coste — cuántas direcciones se resolvieron
+    # gratis desde el directorio vs cuántas costaron una llamada a Google Geocoding.
     return {"success": True, "route_id": route_id, "imported": len(stops_data),
-            "failed_count": len(failed), "failed_addresses": failed}
+            "failed_count": len(failed), "failed_addresses": failed,
+            "from_cache": from_cache, "geocoded": geocoded}
 
 
 class ReconcileOptimizationBody(BaseModel):
@@ -13290,9 +13340,23 @@ def compute_daily_health_digest() -> dict:
             )
     if stops_24h is not None and stops_processed_24h is not None and stops_24h > 0:
         processing_rate = 100.0 * stops_processed_24h / stops_24h
+        # En días de bajo volumen (fines de semana: ~30-60 paradas creadas) la tasa es
+        # estadísticamente ruidosa: unas pocas paradas creadas de madrugada y aún sin
+        # trabajar disparan <30% sin que haya ningún problema. El bug de abr 2026 que
+        # esto vigila ocurría con CIENTOS de paradas al 93% pending. Por eso solo
+        # escalamos a "bad" (error a Sentry) cuando hay volumen suficiente; por debajo
+        # del umbral degradamos a "warn" (visible en el digest, sin alarma de error).
+        LOW_VOLUME_THRESHOLD = 100
+        low_volume = stops_24h < LOW_VOLUME_THRESHOLD
         if processing_rate < 30:
-            rate_status = "bad"
-            rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
+            rate_status = "warn" if low_volume else "bad"
+            if low_volume:
+                rate_note = (
+                    f"Tasa baja ({processing_rate:.0f}%) pero solo {stops_24h} paradas "
+                    "creadas (bajo volumen, típico de fin de semana) — no concluyente."
+                )
+            else:
+                rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
         elif processing_rate < 50:
             rate_status = "warn"
             rate_note = "Tasa de procesamiento por debajo del objetivo (50%)."
