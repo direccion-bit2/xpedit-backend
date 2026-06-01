@@ -6665,6 +6665,20 @@ def _msi_geocode_cache_set(key: str, value: dict) -> None:
     _MSI_GEOCODE_CACHE[key] = (_time.time(), value)
 
 
+def _msi_should_retry_without_country(stop: dict, bbox: Optional[dict]) -> bool:
+    """True si conviene reintentar el geocoding SIN el filtro duro de país.
+
+    El componente `country:X` excluye resultados de otros países. Si el país del
+    repartidor viene mal (device country ≠ país real de reparto), puede estar
+    descartando el resultado correcto → ZERO_RESULTS. Cuando la dirección trae un
+    CP de 5 dígitos (ancla fuerte), merece un reintento sin el lock de país. Solo
+    en round 1 (sin bbox), para no encadenar llamadas."""
+    if bbox is not None:
+        return False
+    cp = (stop.get("postal_code") or "").strip()
+    return bool(re.fullmatch(r"\d{5}", cp))
+
+
 async def _msi_geocode_one(
     client: "httpx.AsyncClient",
     stop: dict,
@@ -6748,6 +6762,27 @@ async def _msi_geocode_one(
         return {"status": "error", "error": str(e)[:100]}
 
     status = data.get("status")
+    # RESCATE OCR v3 (autorizado Miguel 1 jun): si la dirección con CP falla por el
+    # lock duro de país (device country mal detectado), reintentar UNA vez sin él,
+    # anclando en el CP. Solo round 1 + solo ante ZERO_RESULTS → 1 llamada extra
+    # SOLO cuando una dirección ya falló (coste marginal, no bucle, no en resume).
+    if status == "ZERO_RESULTS" and _msi_should_retry_without_country(stop, bbox):
+        retry_params = dict(params)
+        retry_params["components"] = f"postal_code:{stop['postal_code'].strip()}"
+        retry_params.pop("region", None)
+        _bump_api_source("geocode", "msi-no-country-retry", user_id=None)
+        try:
+            resp2 = await client.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params=retry_params,
+                timeout=10.0,
+            )
+            data2 = resp2.json()
+            if data2.get("status") == "OK" and data2.get("results"):
+                data = data2
+                status = "OK"
+        except Exception as e:
+            logger.warning(f"MSI geocode no-country retry failed: {e}")
     if status == "ZERO_RESULTS":
         return {"status": "zero_results"}
     if status != "OK" or not data.get("results"):
