@@ -7050,6 +7050,27 @@ async def _msi_get_candidates_for_stop(
     return out
 
 
+def _msi_street_is_empty(s: dict) -> bool:
+    """True si la parada NO tiene una vía entregable.
+
+    Una vía es entregable si: tiene un dígito, O un tipo de vía reconocido
+    (Calle/Avda/Plaza…), O —RESCATE OCR v3— es un nombre de lugar/barrio sin
+    tipo de vía PERO con número de portal + CP de 5 dígitos + ciudad ("La
+    Cerámica 15, 11130 Chiclana"). Antes esa última se marcaba vacía y se
+    descartaba pese a estar bien leída."""
+    street_text = (s.get("street") or "").strip()
+    if not street_text:
+        return True
+    has_digit = bool(re.search(r"\d", street_text))
+    has_street_type = bool(_MSI_STREET_TYPE_RE.search(street_text))
+    deliverable_by_cp = (
+        bool((s.get("number") or "").strip())
+        and bool(re.fullmatch(r"\d{5}", (s.get("postal_code") or "").strip()))
+        and bool((s.get("city") or "").strip())
+    )
+    return not has_digit and not has_street_type and not deliverable_by_cp
+
+
 async def _msi_normalize_and_geocode(
     stops_raw: list,
     route_context: Optional[MSIRouteContext],
@@ -7113,20 +7134,9 @@ async def _msi_normalize_and_geocode(
     for s in stops:
         geo = s.pop("_geo", {}) or {}
 
-        # A stop is "insufficient" if it doesn't carry a *deliverable*
-        # street. Two failure modes seen in the field:
-        #   1) street is literally empty → obviously empty.
-        #   2) street has text but it's a city/town name with no number
-        #      and no street-type prefix (e.g. Gemini puts "San José del
-        #      Valle" in street because the label only has CP+town). The
-        #      driver still can't deliver — there's no calle.
-        # We accept a street only if it has a digit (likely number) OR a
-        # recognised street-type word (Avda, C/, Plaza, Camino, …). Any
-        # other case is treated as empty and the row goes red.
-        street_text = (s.get("street") or "").strip()
-        has_digit = bool(re.search(r"\d", street_text))
-        has_street_type = bool(_MSI_STREET_TYPE_RE.search(street_text))
-        is_empty = not street_text or (not has_digit and not has_street_type)
+        # Una parada es "insuficiente" si no tiene una vía entregable.
+        # Detalle y casos en _msi_street_is_empty (incluye el rescate por CP).
+        is_empty = _msi_street_is_empty(s)
 
         if is_empty:
             flat_address = ""

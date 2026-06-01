@@ -5,7 +5,37 @@ Blinda el bug raíz del OCR v1: model_extracted_parts omitía 'number' y usaba l
 clave camelCase 'postalCode' (el modelo devuelve 'postal_code'), y model_confidence
 leía 'extraction_confidence' (clave inexistente) → number/CP/confianza se perdían.
 """
-from main import _msi_model_parts, _msi_numeric_confidence
+from main import _msi_model_parts, _msi_numeric_confidence, _msi_street_is_empty
+
+
+class TestMsiStreetIsEmpty:
+    """is_empty no debe descartar direcciones válidas (bug visto en staging)."""
+
+    def test_rescata_lugar_sin_tipo_via_con_numero_cp_ciudad(self):
+        # "LA CERAMICA 15, 11130 Chiclana": el modelo la leyó bien; sin el rescate
+        # se marcaba vacía solo porque "La Cerámica" no empieza por Calle/Avda.
+        stop = {"street": "LA CERAMICA", "number": "15", "postal_code": "11130", "city": "Chiclana"}
+        assert _msi_street_is_empty(stop) is False
+
+    def test_calle_con_tipo_via_no_es_vacia(self):
+        assert _msi_street_is_empty({"street": "Calle Mayor"}) is False
+
+    def test_calle_con_digito_no_es_vacia(self):
+        assert _msi_street_is_empty({"street": "Gran Via 12"}) is False
+
+    def test_street_vacio_es_vacia(self):
+        assert _msi_street_is_empty({"street": ""}) is True
+        assert _msi_street_is_empty({}) is True
+
+    def test_nombre_lugar_sin_numero_sigue_vacia(self):
+        # Solo ciudad/lugar en street, sin número → NO entregable, sigue vacía.
+        stop = {"street": "San José del Valle", "postal_code": "11580", "city": "San José del Valle"}
+        assert _msi_street_is_empty(stop) is True
+
+    def test_lugar_con_cp_invalido_sigue_vacia(self):
+        # Número pero CP no de 5 dígitos → no se rescata.
+        stop = {"street": "La Cerámica", "number": "15", "postal_code": "111", "city": "Chiclana"}
+        assert _msi_street_is_empty(stop) is True
 
 
 class TestMsiModelParts:
