@@ -1150,3 +1150,73 @@ class TestComputeDailyHealthDigest:
         assert rate_metric["status"] == "bad"
         assert "ALERTA" in rate_metric.get("note", ""), "bad rate must come with an alert note"
         assert "10/100" in str(rate_metric["value"])
+
+    def test_processing_rate_low_volume_is_warn_not_bad(self):
+        """Weekend / low-volume days create few stops; a handful still pending
+        gives a noisy <30% rate that does NOT mean a sync bug. With < 100 stops
+        created in 24h, the rate must degrade to 'warn' (visible in the digest)
+        instead of 'bad' (which escalates to Sentry as an error). This kills the
+        recurring weekend false positive without blinding the abr-2026 watchdog."""
+        # 48 stops created, only 7 processed = 15% — but only 48 created (< 100),
+        # so it must NOT be flagged bad. Same stops-query order as the test above.
+        call_counter = {"stops_calls": 0}
+
+        def table_dispatch(name):
+            if name != "stops":
+                return _FixedResultChain(count=0)
+            call_counter["stops_calls"] += 1
+            if call_counter["stops_calls"] == 1:
+                return _FixedResultChain(count=48)
+            if call_counter["stops_calls"] == 2:
+                return _FixedResultChain(count=300)
+            return _FixedResultChain(count=7)
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=table_dispatch)
+        mock_sb.rpc = MagicMock(side_effect=lambda name, params=None: _FixedResultChain(data=[]))
+
+        with patch("main.supabase", mock_sb):
+            from main import compute_daily_health_digest
+            digest = compute_daily_health_digest()
+
+        rate_metric = next(
+            (m for m in digest["metrics"] if m["label"] == "Paradas procesadas (24h)"),
+            None,
+        )
+        assert rate_metric is not None, "processing rate metric must be present"
+        assert rate_metric["status"] == "warn", "low volume must downgrade bad -> warn"
+        assert "ALERTA" not in rate_metric.get("note", ""), "low volume must NOT alert"
+        assert "bajo volumen" in rate_metric.get("note", ""), "note must explain low volume"
+        assert "7/48" in str(rate_metric["value"])
+
+    def test_processing_rate_high_volume_still_bad(self):
+        """The watchdog must remain sharp: with >= 100 stops created and < 30%
+        processed (the abr-2026 mass-pending signature), status stays 'bad'."""
+        # 500 created, 50 processed = 10%, well above the low-volume threshold.
+        call_counter = {"stops_calls": 0}
+
+        def table_dispatch(name):
+            if name != "stops":
+                return _FixedResultChain(count=0)
+            call_counter["stops_calls"] += 1
+            if call_counter["stops_calls"] == 1:
+                return _FixedResultChain(count=500)
+            if call_counter["stops_calls"] == 2:
+                return _FixedResultChain(count=3500)
+            return _FixedResultChain(count=50)
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=table_dispatch)
+        mock_sb.rpc = MagicMock(side_effect=lambda name, params=None: _FixedResultChain(data=[]))
+
+        with patch("main.supabase", mock_sb):
+            from main import compute_daily_health_digest
+            digest = compute_daily_health_digest()
+
+        rate_metric = next(
+            (m for m in digest["metrics"] if m["label"] == "Paradas procesadas (24h)"),
+            None,
+        )
+        assert rate_metric is not None
+        assert rate_metric["status"] == "bad", "high volume <30% must stay bad"
+        assert "ALERTA" in rate_metric.get("note", "")

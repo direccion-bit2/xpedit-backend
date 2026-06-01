@@ -845,9 +845,15 @@ _startup_smoke_ok: bool = False
 _startup_smoke_failures: list[str] = []
 
 # CORS
+# allow_origin_regex habilita los PREVIEWS de Vercel de ESTE proyecto/cuenta
+# (website-<hash>-miguels-projects-547e23cc.vercel.app) para poder validar ramas
+# B2B contra el backend sin abrir CORS a todo *.vercel.app. El backend sigue
+# exigiendo JWT válido en cada endpoint; CORS solo afecta a navegadores.
+VERCEL_PREVIEW_ORIGIN_REGEX = r"^https://website-[a-z0-9-]+-miguels-projects-547e23cc\.vercel\.app$"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://xpedit.es", "https://www.xpedit.es", "http://localhost:3000", "http://localhost:5173"],
+    allow_origin_regex=VERCEL_PREVIEW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2097,8 +2103,11 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
     if user["role"] == "admin":
         if driver_id:
             query = query.eq("driver_id", driver_id)
-    elif user["role"] == "dispatcher" and user.get("company_id"):
-        # Dispatcher: only routes from drivers in their company
+    elif user["role"] in ("dispatcher", "company_admin") and user.get("company_id"):
+        # Dispatcher / company_admin (dueño de empresa): solo rutas de conductores de SU
+        # empresa. company_admin es el rol que minta /company/register; sin incluirlo aquí
+        # el panel de empresa recibía [] al listar rutas (mismo patrón que assign-driver,
+        # que ya acepta company_admin vía require_admin_or_dispatcher).
         company_drivers = supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).execute()
         company_driver_ids = [d["id"] for d in (company_drivers.data or [])]
         if driver_id:
@@ -13553,9 +13562,23 @@ def compute_daily_health_digest() -> dict:
             )
     if stops_24h is not None and stops_processed_24h is not None and stops_24h > 0:
         processing_rate = 100.0 * stops_processed_24h / stops_24h
+        # En días de bajo volumen (fines de semana: ~30-60 paradas creadas) la tasa es
+        # estadísticamente ruidosa: unas pocas paradas creadas de madrugada y aún sin
+        # trabajar disparan <30% sin que haya ningún problema. El bug de abr 2026 que
+        # esto vigila ocurría con CIENTOS de paradas al 93% pending. Por eso solo
+        # escalamos a "bad" (error a Sentry) cuando hay volumen suficiente; por debajo
+        # del umbral degradamos a "warn" (visible en el digest, sin alarma de error).
+        LOW_VOLUME_THRESHOLD = 100
+        low_volume = stops_24h < LOW_VOLUME_THRESHOLD
         if processing_rate < 30:
-            rate_status = "bad"
-            rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
+            rate_status = "warn" if low_volume else "bad"
+            if low_volume:
+                rate_note = (
+                    f"Tasa baja ({processing_rate:.0f}%) pero solo {stops_24h} paradas "
+                    "creadas (bajo volumen, típico de fin de semana) — no concluyente."
+                )
+            else:
+                rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
         elif processing_rate < 50:
             rate_status = "warn"
             rate_note = "Tasa de procesamiento por debajo del objetivo (50%)."

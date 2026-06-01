@@ -23,6 +23,23 @@ PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.taespack.rut
 APP_STORE_URL = "https://apps.apple.com/es/app/xpedit-rutas-de-reparto/id6759053639"
 
 
+def _resend_result(response) -> dict:
+    """Normaliza la respuesta de resend.Emails.send() a un dict uniforme.
+
+    Resend devuelve algo con 'id' cuando el envío sale, pero ante un error
+    recuperable (rate limit, dirección inválida, dominio no verificado…) puede
+    devolver un payload SIN 'id' en lugar de lanzar excepción. El patrón antiguo
+    `response["id"]` reventaba con KeyError('id'), que el except convertía en el
+    inútil "error: 'id'" ocultando la causa real (incidente PYTHON-FASTAPI-1Z).
+    Aquí extraemos el id de forma segura (dict u objeto) y, si no hay, devolvemos
+    el payload entero como error para poder diagnosticar.
+    """
+    rid = response.get("id") if isinstance(response, dict) else getattr(response, "id", None)
+    if rid:
+        return {"success": True, "id": rid}
+    return {"success": False, "error": f"resend sin id: {response}"}
+
+
 def get_base_template(content: str, title: str = "Xpedit") -> str:
     """Template base HTML para todos los emails"""
     return f"""
@@ -163,7 +180,7 @@ def send_welcome_email(to_email: str, user_name: str) -> dict:
             "subject": "Crea tu primera ruta en 2 minutos",
             "html": get_base_template(content, "Bienvenido a Xpedit")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -230,7 +247,7 @@ def send_delivery_started_email(
             "subject": "🚚 Tu pedido está en camino",
             "html": get_base_template(content, "Pedido en camino")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -299,7 +316,7 @@ def send_delivery_completed_email(
             "subject": "✅ Tu pedido ha sido entregado",
             "html": get_base_template(content, "Pedido entregado")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -354,7 +371,7 @@ def send_delivery_failed_email(
             "subject": "📦 No pudimos entregar tu pedido",
             "html": get_base_template(content, "Entrega no completada")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -430,7 +447,7 @@ def send_daily_summary_email(
             "subject": f"Resumen de entregas - {date}",
             "html": get_base_template(content, f"Resumen {date}")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -484,7 +501,7 @@ def send_plan_activated_email(to_email: str, user_name: str, plan_name: str, day
             "subject": f"Plan {plan_name} activado",
             "html": get_base_template(content, f"Plan {plan_name}")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -536,7 +553,7 @@ def send_referral_reward_email(to_email: str, user_name: str, referred_name: str
             "subject": f"🎉 Has ganado {reward_days} días Pro gratis",
             "html": get_base_template(content, "Recompensa referido")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -598,7 +615,7 @@ def send_upcoming_email(
             "subject": f"📦 Tu pedido está a {stops_away} paradas",
             "html": get_base_template(content, "Pedido en camino")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -651,7 +668,7 @@ def send_password_reset_email(to_email: str, user_name: str, new_password: str) 
             "subject": "Tu nueva contraseña de Xpedit",
             "html": get_base_template(content, "Nueva contraseña")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -672,7 +689,7 @@ def send_custom_email(to_email: str, subject: str, body_html: str) -> dict:
             "subject": subject,
             "html": get_base_template(content, subject)
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -721,7 +738,7 @@ def send_alert_email(to_email: str, alert_title: str, details: str) -> dict:
             "subject": f"[ALERTA] {alert_title}",
             "html": alert_template,
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -868,7 +885,7 @@ def send_reengagement_email(to_email: str, user_name: str) -> dict:
             "subject": "¡Hemos mejorado Xpedit! Mira las novedades",
             "html": get_base_template(content, "Novedades de Xpedit")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -963,7 +980,7 @@ def send_reactivation_persistence_email(to_email: str, user_name: str) -> dict:
             "subject": "Hemos arreglado lo de las paradas — vuelve a probarla",
             "html": get_base_template(content, "Hemos arreglado lo de las paradas"),
         })
-        return {"success": True, "id": response.get("id")}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1044,7 +1061,7 @@ def send_social_login_announcement(to_email: str, user_name: str) -> dict:
             "subject": "Nuevo: inicia sesión con Google o Apple",
             "html": get_base_template(content, "Inicio de sesión con Google y Apple")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1152,7 +1169,7 @@ def send_trial_expiring_email(to_email: str, user_name: str, plan_name: str, day
             "subject": TRIAL_EXPIRING_D3_SUBJECT,
             "html": get_base_template(content, "Tu prueba Pro termina pronto")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1213,7 +1230,7 @@ def send_trial_last_day_email(to_email: str, user_name: str) -> dict:
             "subject": TRIAL_EXPIRING_D1_SUBJECT,
             "html": get_base_template(content, "Mañana acaba tu prueba Pro")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1289,7 +1306,7 @@ def send_active_free_pro_invite_email(
             "subject": subject,
             "html": get_base_template(content, "Has optimizado varias rutas — prueba Pro")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1385,7 +1402,7 @@ def send_trial_value_recap_email(
             "subject": TRIAL_VALUE_RECAP_SUBJECT,
             "html": get_base_template(content, "Lo que has conseguido con Xpedit Pro")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1456,7 +1473,7 @@ def send_trial_expired_email(to_email: str, user_name: str, plan_name: str) -> d
             "subject": f"Tu prueba {plan_display} ha terminado — suscríbete desde {price}/mes",
             "html": get_base_template(content, f"Trial {plan_display} expirado")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1530,7 +1547,7 @@ def send_trial_feedback_email(to_email: str, user_name: str, driver_id: str, tok
             "subject": "Tu prueba de Xpedit ha terminado — nos encantaría saber por qué",
             "html": get_base_template(content, "Tu opinión nos importa")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1596,7 +1613,7 @@ def send_survey_email(to_email: str, user_name: str, campaign_id: str, driver_id
             "subject": "Hemos mejorado Xpedit — queremos escucharte",
             "html": get_base_template(content, "Tu opinión nos importa")
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1719,6 +1736,6 @@ def send_daily_health_digest_email(to_email: str, digest: dict) -> dict:
             "subject": subject,
             "html": get_base_template(content, "Xpedit Daily Health"),
         })
-        return {"success": True, "id": response["id"]}
+        return _resend_result(response)
     except Exception as e:
         return {"success": False, "error": str(e)}
