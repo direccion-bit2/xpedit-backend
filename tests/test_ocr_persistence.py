@@ -5,7 +5,29 @@ Blinda el bug raíz del OCR v1: model_extracted_parts omitía 'number' y usaba l
 clave camelCase 'postalCode' (el modelo devuelve 'postal_code'), y model_confidence
 leía 'extraction_confidence' (clave inexistente) → number/CP/confianza se perdían.
 """
-from main import _msi_model_parts, _msi_numeric_confidence, _msi_street_is_empty
+from main import (
+    _msi_model_parts,
+    _msi_numeric_confidence,
+    _msi_should_retry_without_country,
+    _msi_street_is_empty,
+)
+
+
+class TestMsiShouldRetryWithoutCountry:
+    """Reintento de geocoding sin lock de país cuando el país del móvil viene mal."""
+
+    def test_reintenta_si_cp_5_digitos_en_round1(self):
+        assert _msi_should_retry_without_country({"postal_code": "24001"}, None) is True
+
+    def test_no_reintenta_en_round2_con_bbox(self):
+        # round 2 (bbox) ya es un reintento; no encadenar más llamadas.
+        assert _msi_should_retry_without_country({"postal_code": "24001"}, {"sw_lat": 1}) is False
+
+    def test_no_reintenta_sin_cp_valido(self):
+        assert _msi_should_retry_without_country({"postal_code": ""}, None) is False
+        assert _msi_should_retry_without_country({"postal_code": "ABC"}, None) is False
+        assert _msi_should_retry_without_country({"postal_code": "123"}, None) is False
+        assert _msi_should_retry_without_country({}, None) is False
 
 
 class TestMsiStreetIsEmpty:
