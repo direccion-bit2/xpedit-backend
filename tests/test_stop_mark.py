@@ -156,3 +156,34 @@ class TestStopMark:
             })
 
         assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_mark_not_owner_is_logged_not_403(self, client):
+        """Si la parada NO es del driver (verify_stop_access lanza 403) NO
+        devolvemos 403 — un 403 haría que el cliente reintentara en bucle. El
+        marcado queda en el log (forensic) y devolvemos success+logged → el
+        cliente lo suelta sin bucle, sin aplicar a una parada ajena."""
+        from fastapi import HTTPException
+        with patch("main.supabase") as mock_sb, \
+             patch("main.verify_stop_access", new=AsyncMock(side_effect=HTTPException(status_code=403, detail="no"))):
+            log_insert = _mock([{"id": "log-9"}])
+            log_update = _mock([{"id": "log-9"}])
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = _driver_lookup()
+                elif name == "stop_mutation_log":
+                    chain.insert.return_value.execute.return_value = log_insert
+                    chain.update.return_value.eq.return_value.execute.return_value = log_update
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            resp = await client.post("/stops/mark", json={
+                "action": "completed", "stop_id": "foreign-stop", "marked_at": MARKED_AT,
+            })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["applied"] is False
+        assert data["logged"] is True
