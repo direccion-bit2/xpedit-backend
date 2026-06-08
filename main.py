@@ -2846,25 +2846,41 @@ async def mark_stop(body: StopMarkRequest, user=Depends(get_current_user)):
     # 3) Si se resuelve → ownership + UPDATE con service_role.
     applied = False
     if resolved_id:
-        await verify_stop_access(resolved_id, user)  # 403 si no es suya (log queda igual)
-        update_fields = {"status": action, "completed_at": marked_at}
-        if action == "failed":
-            update_fields["failed_at"] = marked_at
-        upd = await asyncio.to_thread(
-            lambda: supabase.table("stops").update(update_fields)
-                .eq("id", resolved_id).is_("deleted_at", "null").execute()
-        )
-        if safe_first(upd):
-            applied = True
+        owns = True
+        try:
+            await verify_stop_access(resolved_id, user)
+        except HTTPException:
+            # No es su parada (o no existe): NO aplicar. PERO el marcado YA quedó
+            # en el log (forensic), así que devolvemos success+logged en vez de
+            # 403 — un 403 haría que el cliente reintentara en bucle eternamente.
+            owns = False
             if log_id:
                 try:
                     await asyncio.to_thread(
                         lambda: supabase.table("stop_mutation_log")
-                            .update({"applied": True, "resolved_stop_id": resolved_id})
-                            .eq("id", log_id).execute()
+                            .update({"error": "ownership_or_not_found"}).eq("id", log_id).execute()
                     )
                 except Exception:
                     pass
+        if owns:
+            update_fields = {"status": action, "completed_at": marked_at}
+            if action == "failed":
+                update_fields["failed_at"] = marked_at
+            upd = await asyncio.to_thread(
+                lambda: supabase.table("stops").update(update_fields)
+                    .eq("id", resolved_id).is_("deleted_at", "null").execute()
+            )
+            if safe_first(upd):
+                applied = True
+                if log_id:
+                    try:
+                        await asyncio.to_thread(
+                            lambda: supabase.table("stop_mutation_log")
+                                .update({"applied": True, "resolved_stop_id": resolved_id})
+                                .eq("id", log_id).execute()
+                        )
+                    except Exception:
+                        pass
 
     # 4) Garantía de durabilidad.
     if applied:
