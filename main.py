@@ -2755,6 +2755,254 @@ async def soft_delete_stop(body: StopDeleteRequest, user=Depends(get_current_use
     return {"success": True, "stop_id": resolved_id}
 
 
+class StopMarkRequest(BaseModel):
+    """Marca DURABLE de parada (completed/failed) vía backend. Reemplaza el
+    UPDATE directo del cliente a Supabase (frágil: sesión caducada / RLS /
+    dbId aún sin resolver → se perdían entregas, #58). El cliente manda el
+    dbId si lo conoce, o (route_id + client_id + position) si el INSERT
+    inicial aún no confirmó el dbId (offline queue drain)."""
+    action: str  # 'completed' | 'failed'
+    stop_id: Optional[str] = None
+    route_id: Optional[str] = None
+    client_id: Optional[str] = None
+    position: Optional[int] = None
+    marked_at: Optional[str] = None  # ISO8601: CUÁNDO marcó el driver (no cuándo llegó)
+
+
+@app.post("/stops/mark", tags=["stops"], summary="Marcar parada completed/failed DURABLE (append-only + bypass RLS)")
+async def mark_stop(body: StopMarkRequest, user=Depends(get_current_user)):
+    """GARANTÍA: un marcado de parada NUNCA se pierde. Flujo:
+      1. Registrar SIEMPRE la intención en `stop_mutation_log` (append-only) —
+         durable aunque la fila aún no exista en BD (ruta sin sincronizar).
+      2. Resolver la fila (stop_id, o (route_id, client_id), o (route_id, position)).
+      3. Si se resuelve → verify_stop_access + UPDATE con service_role (sin RLS,
+         sin depender de la sesión del driver → casi nunca puede fallar).
+      4. Si no se resuelve ahora → queda en el log; el reconciliador lo aplica luego.
+    Solo devolvemos success si el dato quedó DURABLE (aplicado O logueado). Si no
+    pudimos ni loguear ni aplicar → 503, para que el cliente NO lo descarte y
+    reintente (jamás se descarta un marcado sin haberlo guardado en algún sitio)."""
+    action = (body.action or "").strip().lower()
+    if action not in ("completed", "failed"):
+        raise HTTPException(status_code=400, detail="action debe ser 'completed' o 'failed'")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    marked_at = body.marked_at or now_iso
+
+    # driver_id (drivers.id) del usuario autenticado, para trazar el log.
+    driver_id = None
+    try:
+        drv = await asyncio.to_thread(
+            lambda: supabase.table("drivers").select("id").eq("user_id", user["id"]).limit(1).execute()
+        )
+        drow = safe_first(drv)
+        driver_id = drow["id"] if drow else None
+    except Exception:
+        driver_id = None
+
+    # 1) DURABILIDAD PRIMERO: log append-only. Si esto falla intentamos aplicar
+    #    igual; solo si NADA queda durable devolvemos error para que reintente.
+    logged = False
+    log_id = None
+    try:
+        ins = await asyncio.to_thread(
+            lambda: supabase.table("stop_mutation_log").insert({
+                "driver_id": driver_id,
+                "stop_id": body.stop_id,
+                "route_id": body.route_id,
+                "client_id": body.client_id,
+                "position": body.position,
+                "action": action,
+                "marked_at": marked_at,
+                "applied": False,
+            }).execute()
+        )
+        lrow = safe_first(ins)
+        log_id = lrow["id"] if lrow else None
+        logged = True
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
+    # 2) Resolver la fila por cualquiera de los identificadores.
+    resolved_id = body.stop_id
+    if not resolved_id and body.route_id:
+        if body.client_id:
+            lk = await asyncio.to_thread(
+                lambda: supabase.table("stops").select("id")
+                    .eq("route_id", body.route_id).eq("client_id", body.client_id)
+                    .is_("deleted_at", "null").limit(1).execute()
+            )
+            r = safe_first(lk)
+            if r:
+                resolved_id = r["id"]
+        if not resolved_id and body.position is not None:
+            lk2 = await asyncio.to_thread(
+                lambda: supabase.table("stops").select("id")
+                    .eq("route_id", body.route_id).eq("position", body.position)
+                    .is_("deleted_at", "null").limit(1).execute()
+            )
+            r2 = safe_first(lk2)
+            if r2:
+                resolved_id = r2["id"]
+
+    # 3) Si se resuelve → ownership + UPDATE con service_role.
+    applied = False
+    if resolved_id:
+        owns = True
+        try:
+            await verify_stop_access(resolved_id, user)
+        except HTTPException:
+            # No es su parada (o no existe): NO aplicar. PERO el marcado YA quedó
+            # en el log (forensic), así que devolvemos success+logged en vez de
+            # 403 — un 403 haría que el cliente reintentara en bucle eternamente.
+            owns = False
+            if log_id:
+                try:
+                    await asyncio.to_thread(
+                        lambda: supabase.table("stop_mutation_log")
+                            .update({"error": "ownership_or_not_found"}).eq("id", log_id).execute()
+                    )
+                except Exception:
+                    pass
+        if owns:
+            update_fields = {"status": action, "completed_at": marked_at}
+            if action == "failed":
+                update_fields["failed_at"] = marked_at
+            upd = await asyncio.to_thread(
+                lambda: supabase.table("stops").update(update_fields)
+                    .eq("id", resolved_id).is_("deleted_at", "null").execute()
+            )
+            if safe_first(upd):
+                applied = True
+                if log_id:
+                    try:
+                        await asyncio.to_thread(
+                            lambda: supabase.table("stop_mutation_log")
+                                .update({"applied": True, "resolved_stop_id": resolved_id})
+                                .eq("id", log_id).execute()
+                        )
+                    except Exception:
+                        pass
+
+    # 4) Garantía de durabilidad.
+    if applied:
+        return {"success": True, "applied": True, "stop_id": resolved_id}
+    if logged:
+        # No resuelta ahora (ruta sin sincronizar) pero DURABLE en el log;
+        # el reconciliador la aplicará cuando la fila exista.
+        return {"success": True, "applied": False, "logged": True}
+    # Ni aplicado ni logueado → NO confirmamos; el cliente la mantiene y reintenta.
+    raise HTTPException(status_code=503, detail="no se pudo guardar el marcado, reintentar")
+
+
+# Reconciliador de stop_mutation_log (#58, OS-22): el endpoint /stops/mark deja
+# DURABLE la intención del driver aunque la fila aún no exista (ruta sin
+# sincronizar). Esto APLICA esas intenciones cuando la fila ya existe. 100%
+# Supabase (SELECT/UPDATE con service_role) — CERO llamadas a Google/Vertex,
+# así que no reintroduce el coste del reconciliador de rutas que retiramos.
+RECONCILE_GIVEUP_HOURS = 24  # tras 24h sin resolver, marcar error (le damos 1 día a que la ruta sincronice)
+
+
+async def reconcile_stop_mutation_log():
+    """Aplica a `stops` los marcados durables que aún no se reflejaron.
+    Procesa filas applied=false AND error IS NULL (las de ownership rechazado
+    ya llevan error y se saltan). Resuelve por stop_id / (route_id,client_id) /
+    (route_id,position) e idempotentemente hace el UPDATE con service_role.
+    Si una fila sigue sin resolver tras RECONCILE_GIVEUP_HOURS la sella con
+    error para no reintentarla en bucle (queda forensic, applied=false)."""
+    try:
+        pending = await asyncio.to_thread(
+            lambda: supabase.table("stop_mutation_log")
+                .select("id, stop_id, route_id, client_id, position, action, marked_at, created_at")
+                .eq("applied", False).is_("error", "null")
+                .order("created_at", desc=False).limit(200).execute()
+        )
+        rows = pending.data or []
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return {"scanned": 0, "applied": 0, "gaveup": 0, "error": str(e)}
+
+    if not rows:
+        return {"scanned": 0, "applied": 0, "gaveup": 0}
+
+    now = datetime.now(timezone.utc)
+    applied_n = 0
+    gaveup_n = 0
+    for row in rows:
+        try:
+            action = (row.get("action") or "").strip().lower()
+            if action not in ("completed", "failed"):
+                # acción corrupta: sellar para no reprocesar.
+                await asyncio.to_thread(
+                    lambda rid=row["id"]: supabase.table("stop_mutation_log")
+                        .update({"error": "invalid_action"}).eq("id", rid).execute()
+                )
+                gaveup_n += 1
+                continue
+
+            # Resolver la fila igual que /stops/mark (stop_id → route+client → route+position).
+            resolved_id = row.get("stop_id")
+            route_id = row.get("route_id")
+            if not resolved_id and route_id:
+                if row.get("client_id"):
+                    lk = await asyncio.to_thread(
+                        lambda: supabase.table("stops").select("id")
+                            .eq("route_id", route_id).eq("client_id", row["client_id"])
+                            .is_("deleted_at", "null").limit(1).execute()
+                    )
+                    r = safe_first(lk)
+                    if r:
+                        resolved_id = r["id"]
+                if not resolved_id and row.get("position") is not None:
+                    lk2 = await asyncio.to_thread(
+                        lambda: supabase.table("stops").select("id")
+                            .eq("route_id", route_id).eq("position", row["position"])
+                            .is_("deleted_at", "null").limit(1).execute()
+                    )
+                    r2 = safe_first(lk2)
+                    if r2:
+                        resolved_id = r2["id"]
+
+            applied = False
+            if resolved_id:
+                marked_at = row.get("marked_at") or now.isoformat()
+                update_fields = {"status": action, "completed_at": marked_at}
+                if action == "failed":
+                    update_fields["failed_at"] = marked_at
+                upd = await asyncio.to_thread(
+                    lambda rid=resolved_id: supabase.table("stops").update(update_fields)
+                        .eq("id", rid).is_("deleted_at", "null").execute()
+                )
+                if safe_first(upd):
+                    applied = True
+                    await asyncio.to_thread(
+                        lambda lid=row["id"], rid=resolved_id: supabase.table("stop_mutation_log")
+                            .update({"applied": True, "resolved_stop_id": rid}).eq("id", lid).execute()
+                    )
+                    applied_n += 1
+
+            if not applied:
+                # No resoluble (ruta aún sin sincronizar, o parada borrada). Si
+                # ya es vieja, sellar con error para no reprocesar eternamente.
+                created = row.get("created_at")
+                try:
+                    created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00")) if created else now
+                except Exception:
+                    created_dt = now
+                age_h = (now - created_dt).total_seconds() / 3600.0
+                if age_h >= RECONCILE_GIVEUP_HOURS:
+                    await asyncio.to_thread(
+                        lambda lid=row["id"]: supabase.table("stop_mutation_log")
+                            .update({"error": "unresolved_after_24h"}).eq("id", lid).execute()
+                    )
+                    gaveup_n += 1
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            continue
+
+    if applied_n or gaveup_n:
+        logger.info(f"stop_mutation_log reconciler: scanned={len(rows)} applied={applied_n} gaveup={gaveup_n}")
+    return {"scanned": len(rows), "applied": applied_n, "gaveup": gaveup_n}
+
+
 # -- Push Token --
 
 class PushTokenUpdate(BaseModel):
@@ -11698,6 +11946,21 @@ async def start_social_scheduler():
         misfire_grace_time=300,
     )
     logger.info("Cost alerts: cron HH:05 (4 thresholds, anti-spam 4h)")
+    # Reconciliador stop_mutation_log (#58 OS-22): aplica a `stops` los marcados
+    # durables que /stops/mark dejó logueados pero aún no reflejados (ruta sin
+    # sincronizar al marcar). 100% Supabase, CERO API de pago. Cada 5 min.
+    social_scheduler.add_job(
+        reconcile_stop_mutation_log, "interval", minutes=5,
+        id="stop_mutation_reconciler", replace_existing=True,
+        coalesce=True, max_instances=1, misfire_grace_time=120,
+    )
+    logger.info("Stop-mutation reconciler: cron cada 5 min (Supabase-only)")
+    # Bootstrap: primera pasada 90s tras startup para no esperar al primer intervalo.
+    social_scheduler.add_job(
+        reconcile_stop_mutation_log, "date",
+        run_date=datetime.now(timezone.utc) + _td(seconds=90),
+        id="stop_mutation_reconciler_bootstrap", replace_existing=True,
+    )
     # Siempre arrancar el scheduler (tambien para backups y retention)
     if not social_scheduler.running:
         social_scheduler.start()
