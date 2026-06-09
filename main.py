@@ -346,6 +346,20 @@ def normalize_address(address: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _same_postal_code(a: str, b: str) -> bool:
+    """True si ambas direcciones comparten el MISMO CP de 5 dígitos, o si NINGUNA
+    lo tiene. Evita que el cache de geocoding del import (clave = normalize_address,
+    que BORRA el CP) acepte un hit entre direcciones de igual calle+ciudad pero
+    DISTINTO CP → coordenadas equivocadas en silencio (IMP-05). El CP también
+    discrimina cross-country (IMP-06): formatos/valores de CP distintos casi nunca
+    coinciden. Si una tiene CP y la otra no → conservador: NO es hit (geocodificar)."""
+    ca = re.search(r"\b\d{5}\b", a or "")
+    cb = re.search(r"\b\d{5}\b", b or "")
+    if ca and cb:
+        return ca.group() == cb.group()
+    return ca is None and cb is None
+
+
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Distance in km between two lat/lng points."""
     R = 6371.0
@@ -2357,7 +2371,7 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
         try:
             directory = await asyncio.to_thread(
                 lambda: supabase.table("customer_directory")
-                .select("normalized_address, lat, lng, phone, email")
+                .select("normalized_address, address, lat, lng, phone, email")
                 .eq("company_id", driver_company_id)
                 .execute()
             )
@@ -2374,7 +2388,10 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
     geocoded = 0    # direcciones que sí costaron una llamada a Google
     for row in req.rows:
         cached = addr_cache.get(normalize_address(row.address or ""))
-        if cached:
+        # IMP-05: normalize_address borra el CP, así que misma calle+ciudad con
+        # CP distinto colisiona en la misma clave. Solo aceptar el hit si el CP
+        # también coincide; si no, geocodificar (no heredar coords erróneas).
+        if cached and _same_postal_code(row.address or "", cached.get("address") or ""):
             from_cache += 1
             stops_data.append({
                 "address": row.address,
