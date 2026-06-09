@@ -32,9 +32,18 @@ class TestRoutesV2RoutingPref:
         assert main._routes_v2_routing_pref("start-nav") == "TRAFFIC_AWARE"
         assert main._routes_v2_routing_pref("start-nav-401retry") == "TRAFFIC_AWARE"
 
+    def test_recalc_downgraded_to_essentials_on_purpose(self):
+        # (#64, 10 jun) recalc → Essentials es DECISIÓN, no error: el reroute tras
+        # desvío solo necesita geometría nueva (el ETA real lo da el GPS en vivo)
+        # y era el componente más frecuente del coste de nav (855 calls Pro/5d).
+        # Misma geometría, mitad de precio. Si esto falla, alguien revirtió el
+        # ahorro — confirmar con Miguel antes de tocar.
+        assert main._routes_v2_routing_pref("recalc") == "TRAFFIC_UNAWARE"
+        assert main._routes_v2_routing_pref("recalc-jwt-retry") == "TRAFFIC_UNAWARE"
+
     def test_unknown_and_empty_default_to_aware(self):
         # Conservador: ante la duda, Pro — nunca degradar la conducción por un source nuevo.
-        for src in ("unknown", "", "recalc", "reroute", "off-route", None):
+        for src in ("unknown", "", "reroute", "off-route", None):
             assert main._routes_v2_routing_pref(src) == "TRAFFIC_AWARE", repr(src)
 
     def test_case_and_whitespace_insensitive(self):
