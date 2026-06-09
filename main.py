@@ -346,6 +346,20 @@ def normalize_address(address: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _same_postal_code(a: str, b: str) -> bool:
+    """True si ambas direcciones comparten el MISMO CP de 5 dígitos, o si NINGUNA
+    lo tiene. Evita que el cache de geocoding del import (clave = normalize_address,
+    que BORRA el CP) acepte un hit entre direcciones de igual calle+ciudad pero
+    DISTINTO CP → coordenadas equivocadas en silencio (IMP-05). El CP también
+    discrimina cross-country (IMP-06): formatos/valores de CP distintos casi nunca
+    coinciden. Si una tiene CP y la otra no → conservador: NO es hit (geocodificar)."""
+    ca = re.search(r"\b\d{5}\b", a or "")
+    cb = re.search(r"\b\d{5}\b", b or "")
+    if ca and cb:
+        return ca.group() == cb.group()
+    return ca is None and cb is None
+
+
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Distance in km between two lat/lng points."""
     R = 6371.0
@@ -2343,13 +2357,58 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
     if len(req.rows) > 200:
         raise HTTPException(status_code=400, detail="Máximo 200 paradas por importación")
 
+    # Resolver la empresa ANTES de geocodificar: su directorio de clientes
+    # (customer_directory) sirve de CACHÉ de geocoding. Las empresas reparten a
+    # clientes recurrentes, así que una dirección ya conocida se reutiliza con coste
+    # CERO; solo pagamos Google Geocoding por las direcciones realmente nuevas.
+    driver_q = await asyncio.to_thread(
+        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
+    )
+    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
+
+    addr_cache: dict = {}
+    if driver_company_id:
+        try:
+            directory = await asyncio.to_thread(
+                lambda: supabase.table("customer_directory")
+                .select("normalized_address, address, lat, lng, phone, email")
+                .eq("company_id", driver_company_id)
+                .execute()
+            )
+            for entry in (directory.data or []):
+                if entry.get("lat") is not None and entry.get("lng") is not None:
+                    addr_cache[entry["normalized_address"]] = entry
+        except Exception as e:
+            logger.warning(f"Import: no se pudo cargar el directorio como caché: {e}")
+            sentry_sdk.capture_exception(e)
+
     stops_data: list[dict] = []
     failed: list[str] = []
+    from_cache = 0  # direcciones resueltas desde el directorio (0€)
+    geocoded = 0    # direcciones que sí costaron una llamada a Google
     for row in req.rows:
+        cached = addr_cache.get(normalize_address(row.address or ""))
+        # IMP-05: normalize_address borra el CP, así que misma calle+ciudad con
+        # CP distinto colisiona en la misma clave. Solo aceptar el hit si el CP
+        # también coincide; si no, geocodificar (no heredar coords erróneas).
+        if cached and _same_postal_code(row.address or "", cached.get("address") or ""):
+            from_cache += 1
+            stops_data.append({
+                "address": row.address,
+                "lat": cached["lat"],
+                "lng": cached["lng"],
+                "position": len(stops_data),
+                "notes": row.notes,
+                "phone": row.phone or cached.get("phone"),
+                "email": cached.get("email"),
+                "packages": row.packages,
+            })
+            continue
         geo = await _geocode_address(row.address, req.country)
         if not geo:
             failed.append(row.address)
             continue
+        geocoded += 1
         stops_data.append({
             "address": geo["display_name"],
             "lat": geo["lat"],
@@ -2366,11 +2425,6 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
             "message": "Ninguna dirección se pudo geocodificar",
             "failed_addresses": failed,
         })
-
-    driver_q = await asyncio.to_thread(
-        lambda: supabase.table("drivers").select("company_id").eq("id", req.driver_id).limit(1).execute()
-    )
-    driver_company_id = driver_q.data[0].get("company_id") if driver_q.data else None
 
     route_data: dict = {
         "driver_id": req.driver_id,
@@ -2401,9 +2455,13 @@ async def import_route_for_driver(req: RouteImportRequest, user=Depends(require_
 
     await notify_driver_route_assigned(req.driver_id, route_id)
     log_audit(user["id"], "import_route", "route", route_id,
-              {"driver_id": req.driver_id, "imported": len(stops_data), "failed": len(failed)})
+              {"driver_id": req.driver_id, "imported": len(stops_data), "failed": len(failed),
+               "from_cache": from_cache, "geocoded": geocoded})
+    # from_cache/geocoded: transparencia de coste — cuántas direcciones se resolvieron
+    # gratis desde el directorio vs cuántas costaron una llamada a Google Geocoding.
     return {"success": True, "route_id": route_id, "imported": len(stops_data),
-            "failed_count": len(failed), "failed_addresses": failed}
+            "failed_count": len(failed), "failed_addresses": failed,
+            "from_cache": from_cache, "geocoded": geocoded}
 
 
 class ReconcileOptimizationBody(BaseModel):
