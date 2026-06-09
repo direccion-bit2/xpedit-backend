@@ -574,3 +574,50 @@ class TestGetBaseTemplate:
         from emails import get_base_template
         html = get_base_template("<p>Content</p>")
         assert "Xpedit" in html
+
+
+class TestResendResult:
+    """Tests for _resend_result — normaliza la respuesta de Resend.
+
+    Reproduce y blinda el bug PYTHON-FASTAPI-1Z: cuando Resend devuelve un
+    payload SIN 'id' (error recuperable: rate limit, dirección inválida…) en
+    lugar de lanzar excepción, el código antiguo hacía response['id'] → KeyError
+    capturado como "error: 'id'", un mensaje inútil. Ahora debe ser success=False
+    con el payload real, NUNCA un KeyError ni un falso success=True."""
+
+    def test_dict_with_id_is_success(self):
+        from emails import _resend_result
+        r = _resend_result({"id": "abc123"})
+        assert r == {"success": True, "id": "abc123"}
+
+    def test_object_with_id_attr_is_success(self):
+        from emails import _resend_result
+
+        class Resp:
+            id = "obj456"
+        r = _resend_result(Resp())
+        assert r["success"] is True
+        assert r["id"] == "obj456"
+
+    def test_dict_without_id_is_failure_with_payload(self):
+        from emails import _resend_result
+        # Payload típico de error de Resend (rate limit) — antes daba KeyError('id')
+        err_payload = {"statusCode": 429, "name": "rate_limit_exceeded", "message": "Too many requests"}
+        r = _resend_result(err_payload)
+        assert r["success"] is False
+        assert "rate_limit_exceeded" in r["error"]  # surfacea la causa real, no "'id'"
+
+    def test_none_response_is_failure(self):
+        from emails import _resend_result
+        r = _resend_result(None)
+        assert r["success"] is False
+
+    def test_real_email_fn_survives_resend_error_payload(self):
+        """La función real send_trial_expiring_email no debe reventar (ni decir
+        éxito) cuando Resend devuelve un payload de error sin id."""
+        with patch("emails.resend") as mock_resend:
+            mock_resend.Emails.send.return_value = {"statusCode": 422, "name": "validation_error"}
+            from emails import send_trial_expiring_email
+            result = send_trial_expiring_email("bad@addr", "User", "pro", 3)
+        assert result["success"] is False
+        assert "validation_error" in result["error"]

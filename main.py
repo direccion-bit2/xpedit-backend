@@ -845,9 +845,15 @@ _startup_smoke_ok: bool = False
 _startup_smoke_failures: list[str] = []
 
 # CORS
+# allow_origin_regex habilita los PREVIEWS de Vercel de ESTE proyecto/cuenta
+# (website-<hash>-miguels-projects-547e23cc.vercel.app) para poder validar ramas
+# B2B contra el backend sin abrir CORS a todo *.vercel.app. El backend sigue
+# exigiendo JWT válido en cada endpoint; CORS solo afecta a navegadores.
+VERCEL_PREVIEW_ORIGIN_REGEX = r"^https://website-[a-z0-9-]+-miguels-projects-547e23cc\.vercel\.app$"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://xpedit.es", "https://www.xpedit.es", "http://localhost:3000", "http://localhost:5173"],
+    allow_origin_regex=VERCEL_PREVIEW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2097,8 +2103,11 @@ async def get_routes(driver_id: Optional[str] = None, date: Optional[str] = None
     if user["role"] == "admin":
         if driver_id:
             query = query.eq("driver_id", driver_id)
-    elif user["role"] == "dispatcher" and user.get("company_id"):
-        # Dispatcher: only routes from drivers in their company
+    elif user["role"] in ("dispatcher", "company_admin") and user.get("company_id"):
+        # Dispatcher / company_admin (dueño de empresa): solo rutas de conductores de SU
+        # empresa. company_admin es el rol que minta /company/register; sin incluirlo aquí
+        # el panel de empresa recibía [] al listar rutas (mismo patrón que assign-driver,
+        # que ya acepta company_admin vía require_admin_or_dispatcher).
         company_drivers = supabase.table("drivers").select("id").eq("company_id", user.get("company_id")).execute()
         company_driver_ids = [d["id"] for d in (company_drivers.data or [])]
         if driver_id:
@@ -6863,6 +6872,20 @@ def _msi_geocode_cache_set(key: str, value: dict) -> None:
     _MSI_GEOCODE_CACHE[key] = (_time.time(), value)
 
 
+def _msi_should_retry_without_country(stop: dict, bbox: Optional[dict]) -> bool:
+    """True si conviene reintentar el geocoding SIN el filtro duro de país.
+
+    El componente `country:X` excluye resultados de otros países. Si el país del
+    repartidor viene mal (device country ≠ país real de reparto), puede estar
+    descartando el resultado correcto → ZERO_RESULTS. Cuando la dirección trae un
+    CP de 5 dígitos (ancla fuerte), merece un reintento sin el lock de país. Solo
+    en round 1 (sin bbox), para no encadenar llamadas."""
+    if bbox is not None:
+        return False
+    cp = (stop.get("postal_code") or "").strip()
+    return bool(re.fullmatch(r"\d{5}", cp))
+
+
 async def _msi_geocode_one(
     client: "httpx.AsyncClient",
     stop: dict,
@@ -6946,6 +6969,27 @@ async def _msi_geocode_one(
         return {"status": "error", "error": str(e)[:100]}
 
     status = data.get("status")
+    # RESCATE OCR v3 (autorizado Miguel 1 jun): si la dirección con CP falla por el
+    # lock duro de país (device country mal detectado), reintentar UNA vez sin él,
+    # anclando en el CP. Solo round 1 + solo ante ZERO_RESULTS → 1 llamada extra
+    # SOLO cuando una dirección ya falló (coste marginal, no bucle, no en resume).
+    if status == "ZERO_RESULTS" and _msi_should_retry_without_country(stop, bbox):
+        retry_params = dict(params)
+        retry_params["components"] = f"postal_code:{stop['postal_code'].strip()}"
+        retry_params.pop("region", None)
+        _bump_api_source("geocode", "msi-no-country-retry", user_id=None)
+        try:
+            resp2 = await client.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params=retry_params,
+                timeout=10.0,
+            )
+            data2 = resp2.json()
+            if data2.get("status") == "OK" and data2.get("results"):
+                data = data2
+                status = "OK"
+        except Exception as e:
+            logger.warning(f"MSI geocode no-country retry failed: {e}")
     if status == "ZERO_RESULTS":
         return {"status": "zero_results"}
     if status != "OK" or not data.get("results"):
@@ -7041,6 +7085,41 @@ async def _msi_get_candidates_for_stop(
     return out
 
 
+def _msi_choose_formatted(is_empty: bool, is_usable_geo: bool,
+                          geo_formatted: Optional[str], flat: str) -> str:
+    """Dirección a MOSTRAR al repartidor. Solo usamos el formatted de Google cuando
+    geocodificó de verdad (usable). Si degradó (APPROXIMATE) o falló, su formatted
+    pierde la calle y devuelve solo 'CP Ciudad' (visto: 'Calle Vidrieros 1' →
+    'Sanlúcar' a secas) → preferimos el texto LEÍDO (flat: calle+nº+CP+ciudad) para
+    que el repartidor lo confirme/ajuste en vez de ver una dirección pobre."""
+    if is_empty:
+        return ""
+    if is_usable_geo:
+        return geo_formatted or flat
+    return flat or geo_formatted or ""
+
+
+def _msi_street_is_empty(s: dict) -> bool:
+    """True si la parada NO tiene una vía entregable.
+
+    Una vía es entregable si: tiene un dígito, O un tipo de vía reconocido
+    (Calle/Avda/Plaza…), O —RESCATE OCR v3— es un nombre de lugar/barrio sin
+    tipo de vía PERO con número de portal + CP de 5 dígitos + ciudad ("La
+    Cerámica 15, 11130 Chiclana"). Antes esa última se marcaba vacía y se
+    descartaba pese a estar bien leída."""
+    street_text = (s.get("street") or "").strip()
+    if not street_text:
+        return True
+    has_digit = bool(re.search(r"\d", street_text))
+    has_street_type = bool(_MSI_STREET_TYPE_RE.search(street_text))
+    deliverable_by_cp = (
+        bool((s.get("number") or "").strip())
+        and bool(re.fullmatch(r"\d{5}", (s.get("postal_code") or "").strip()))
+        and bool((s.get("city") or "").strip())
+    )
+    return not has_digit and not has_street_type and not deliverable_by_cp
+
+
 async def _msi_normalize_and_geocode(
     stops_raw: list,
     route_context: Optional[MSIRouteContext],
@@ -7104,20 +7183,9 @@ async def _msi_normalize_and_geocode(
     for s in stops:
         geo = s.pop("_geo", {}) or {}
 
-        # A stop is "insufficient" if it doesn't carry a *deliverable*
-        # street. Two failure modes seen in the field:
-        #   1) street is literally empty → obviously empty.
-        #   2) street has text but it's a city/town name with no number
-        #      and no street-type prefix (e.g. Gemini puts "San José del
-        #      Valle" in street because the label only has CP+town). The
-        #      driver still can't deliver — there's no calle.
-        # We accept a street only if it has a digit (likely number) OR a
-        # recognised street-type word (Avda, C/, Plaza, Camino, …). Any
-        # other case is treated as empty and the row goes red.
-        street_text = (s.get("street") or "").strip()
-        has_digit = bool(re.search(r"\d", street_text))
-        has_street_type = bool(_MSI_STREET_TYPE_RE.search(street_text))
-        is_empty = not street_text or (not has_digit and not has_street_type)
+        # Una parada es "insuficiente" si no tiene una vía entregable.
+        # Detalle y casos en _msi_street_is_empty (incluye el rescate por CP).
+        is_empty = _msi_street_is_empty(s)
 
         if is_empty:
             flat_address = ""
@@ -7146,7 +7214,15 @@ async def _msi_normalize_and_geocode(
         s["coords"] = (
             {"lat": geo["lat"], "lng": geo["lng"]} if _is_usable_geo else None
         )
-        s["formatted_address"] = "" if is_empty else (geo.get("formatted_address") or flat_address)
+        # CONSERVAR LO LEÍDO si el geocoding no es usable (APPROXIMATE/zero_results/
+        # error): el formatted de Google degradado pierde la calle y devuelve solo
+        # "11540 Sanlúcar" — visto en staging con "Calle Vidrieros 1" → "Sanlúcar"
+        # a secas. Mostrar el texto leído (flat: calle+nº+CP+ciudad) para que el
+        # repartidor lo confirme/ajuste, en vez de una dirección pobre que parece
+        # un fallo. Solo usamos el formatted de Google cuando geocodificó de verdad.
+        s["formatted_address"] = _msi_choose_formatted(
+            is_empty, _is_usable_geo, geo.get("formatted_address"), flat_address,
+        )
         s["place_id"] = geo.get("place_id", "")
         s["delivery_instructions"] = (s.get("floor_etc") or "").strip()
         s["geocoding_status"] = "empty_extraction" if is_empty else geo.get("status", "error")
@@ -7299,15 +7375,14 @@ async def ocr_screenshots_batch(req: MSIBatchRequest, user=Depends(get_current_u
                     source="msi",
                     image_storage_path=storage_path,
                     model_name=_MSI_MODEL,
-                    model_extracted_address=stop.get("address") or stop.get("street"),
-                    model_extracted_parts={k: stop.get(k) for k in (
-                        "name", "business_name", "street", "city", "postalCode", "province", "floor_etc",
-                    ) if stop.get(k) is not None},
-                    model_confidence=float(stop.get("extraction_confidence")) if stop.get("extraction_confidence") is not None else None,
-                    carrier_hint=req.carrier_hint or carrier_detected,
+                    model_extracted_address=stop.get("formatted_address") or stop.get("street"),
+                    model_extracted_parts=_msi_model_parts(stop),
+                    model_confidence=_msi_numeric_confidence(stop),
+                    carrier_hint=(req.carrier_hint or carrier_detected or "").lower() or None,
                     country_iso=country,
                     model_latency_ms=extraction_ms if i == 0 else None,
                     consent=True,
+                    prompt_version="v1.1-persistfix",
                 )
                 correction_ids[i] = cid
                 # Mirror the id on the response stop so the app can keep the
@@ -7420,6 +7495,50 @@ def _upload_ocr_image_sync(
         return None
 
 
+# Campos del modelo que persistimos como ground-truth en ocr_corrections.
+# BUG histórico (OCR v1, arreglado en v1.1): la persistencia NO incluía 'number'
+# y leía la clave camelCase 'postalCode' cuando el modelo devuelve 'postal_code'
+# (snake_case) → el NÚMERO DE PORTAL y el CÓDIGO POSTAL se TIRABAN al guardar,
+# dejando el learning loop ciego justo en los dos campos que más rompen el reparto
+# (el modelo SÍ los extrae; los descartábamos). Aquí guardamos las claves correctas.
+_OCR_MODEL_PART_KEYS = (
+    "name", "business_name", "street", "number", "floor_etc",
+    "postal_code", "city", "province", "phone",
+)
+
+
+def _msi_numeric_confidence(stop: dict) -> Optional[float]:
+    """Confianza 0..1 PERSISTIBLE de una parada extraída.
+
+    Antes se guardaba `stop['extraction_confidence']`, una clave que el pipeline
+    NUNCA setea → `model_confidence` quedaba siempre NULL y no podía discriminar
+    acierto de fallo. Derivamos un número real: el mínimo de la confianza por campo
+    de los campos que rompen el reparto (calle/número/CP); si el modelo no la dio,
+    mapeamos la categoría high/medium/low. Una extracción vacía es siempre baja."""
+    if stop.get("is_empty_extraction"):
+        return 0.1
+    cpf = stop.get("confidence_per_field") or {}
+    vals = [float(cpf[k]) for k in ("street", "number", "postal_code")
+            if isinstance(cpf.get(k), (int, float))]
+    if vals:
+        return round(min(vals), 3)
+    cat = (stop.get("confidence") or "").lower()
+    return {"high": 0.9, "medium": 0.6, "low": 0.3}.get(cat)
+
+
+def _msi_model_parts(stop: dict) -> dict:
+    """Partes extraídas a persistir con las claves CORRECTAS (incl. `number` y
+    `postal_code`) + la confianza por campo + una traza del geocoding. Esto es lo
+    que alimenta el editor de ground-truth y la evaluación A/B del OCR."""
+    parts = {k: stop.get(k) for k in _OCR_MODEL_PART_KEYS if stop.get(k) not in (None, "")}
+    if stop.get("confidence_per_field"):
+        parts["confidence_per_field"] = stop["confidence_per_field"]
+    for k in ("geocoding_status", "place_id", "is_empty_extraction"):
+        if stop.get(k) is not None:
+            parts[k] = stop.get(k)
+    return parts
+
+
 def _create_ocr_correction_row(
     *,
     driver_id: str,
@@ -7434,6 +7553,7 @@ def _create_ocr_correction_row(
     model_latency_ms: Optional[int],
     consent: bool,
     app_version: Optional[str] = None,
+    prompt_version: str = "v1",
 ) -> Optional[str]:
     """Insert a row in `ocr_corrections` describing the model's output for
     a single extracted stop. Returns the row id, or None if the insert
@@ -7445,7 +7565,7 @@ def _create_ocr_correction_row(
         "source": source,
         "image_storage_path": image_storage_path,
         "model_name": model_name,
-        "prompt_version": "v1",
+        "prompt_version": prompt_version,
         "model_extracted_address": model_extracted_address,
         "model_extracted_parts": model_extracted_parts,
         "model_confidence": model_confidence,
@@ -13553,9 +13673,23 @@ def compute_daily_health_digest() -> dict:
             )
     if stops_24h is not None and stops_processed_24h is not None and stops_24h > 0:
         processing_rate = 100.0 * stops_processed_24h / stops_24h
+        # En días de bajo volumen (fines de semana: ~30-60 paradas creadas) la tasa es
+        # estadísticamente ruidosa: unas pocas paradas creadas de madrugada y aún sin
+        # trabajar disparan <30% sin que haya ningún problema. El bug de abr 2026 que
+        # esto vigila ocurría con CIENTOS de paradas al 93% pending. Por eso solo
+        # escalamos a "bad" (error a Sentry) cuando hay volumen suficiente; por debajo
+        # del umbral degradamos a "warn" (visible en el digest, sin alarma de error).
+        LOW_VOLUME_THRESHOLD = 100
+        low_volume = stops_24h < LOW_VOLUME_THRESHOLD
         if processing_rate < 30:
-            rate_status = "bad"
-            rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
+            rate_status = "warn" if low_volume else "bad"
+            if low_volume:
+                rate_note = (
+                    f"Tasa baja ({processing_rate:.0f}%) pero solo {stops_24h} paradas "
+                    "creadas (bajo volumen, típico de fin de semana) — no concluyente."
+                )
+            else:
+                rate_note = "ALERTA: <30% procesadas — posible bug de sync (abr 2026 revisitado)."
         elif processing_rate < 50:
             rate_status = "warn"
             rate_note = "Tasa de procesamiento por debajo del objetivo (50%)."
