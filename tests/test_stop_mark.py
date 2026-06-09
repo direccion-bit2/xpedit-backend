@@ -187,3 +187,78 @@ class TestStopMark:
         data = resp.json()
         assert data["applied"] is False
         assert data["logged"] is True
+
+    @pytest.mark.asyncio
+    async def test_mark_failed_applies_both_timestamps(self, client):
+        """action='failed' aplica status=failed + completed_at Y failed_at (la
+        def canónica de 'trabajada' del dashboard = completed_at OR failed_at)."""
+        captured = {}
+
+        with patch("main.supabase") as mock_sb, \
+             patch("main.verify_stop_access", new=AsyncMock(return_value=None)):
+            log_insert = _mock([{"id": "log-f"}])
+            log_update = _mock([{"id": "log-f"}])
+
+            def _capture_update(payload):
+                captured.update(payload)
+                upd_chain = MagicMock()
+                upd_chain.eq.return_value.is_.return_value.execute.return_value = _mock([{"id": "stop-f"}])
+                return upd_chain
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = _driver_lookup()
+                elif name == "stop_mutation_log":
+                    chain.insert.return_value.execute.return_value = log_insert
+                    chain.update.return_value.eq.return_value.execute.return_value = log_update
+                elif name == "stops":
+                    chain.update = MagicMock(side_effect=_capture_update)
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            resp = await client.post("/stops/mark", json={
+                "action": "failed", "stop_id": "stop-f", "marked_at": MARKED_AT,
+            })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["applied"] is True
+        assert captured.get("status") == "failed"
+        assert captured.get("completed_at") == MARKED_AT
+        assert captured.get("failed_at") == MARKED_AT
+
+    @pytest.mark.asyncio
+    async def test_mark_resolves_by_route_position(self, client):
+        """Sin stop_id ni client_id, solo (route_id, position) → resuelve por
+        posición y aplica. Fallback del drain offline cuando el op no llevaba
+        clientId (p.ej. tras reordenar)."""
+        with patch("main.supabase") as mock_sb, \
+             patch("main.verify_stop_access", new=AsyncMock(return_value=None)):
+            log_insert = _mock([{"id": "log-p"}])
+            log_update = _mock([{"id": "log-p"}])
+            found = _mock([{"id": "stop-by-pos"}])
+            stop_update = _mock([{"id": "stop-by-pos"}])
+
+            def table_dispatch(name):
+                chain = MagicMock()
+                if name == "drivers":
+                    chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = _driver_lookup()
+                elif name == "stop_mutation_log":
+                    chain.insert.return_value.execute.return_value = log_insert
+                    chain.update.return_value.eq.return_value.execute.return_value = log_update
+                elif name == "stops":
+                    chain.select.return_value.eq.return_value.eq.return_value.is_.return_value.limit.return_value.execute.return_value = found
+                    chain.update.return_value.eq.return_value.is_.return_value.execute.return_value = stop_update
+                return chain
+
+            mock_sb.table = MagicMock(side_effect=table_dispatch)
+            resp = await client.post("/stops/mark", json={
+                "action": "completed", "route_id": "route-1", "position": 5,
+                "marked_at": MARKED_AT,
+            })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["applied"] is True
+        assert data["stop_id"] == "stop-by-pos"
