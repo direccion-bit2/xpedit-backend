@@ -2990,6 +2990,138 @@ async def mark_stop(body: StopMarkRequest, user=Depends(get_current_user)):
     raise HTTPException(status_code=503, detail="no se pudo guardar el marcado, reintentar")
 
 
+class StopAddRequest(BaseModel):
+    """Alta DURABLE de parada vía backend (#82). Reemplaza el INSERT/upsert directo
+    del cliente a Supabase, que bajo RLS (`can_insert_stop`) fallaba en silencio en
+    dos casos y el cliente DESCARTABA la parada:
+      - Free que supera 10 paradas/día → RLS 42501 → parada perdida sin avisar.
+      - Fila de driver sin policy INSERT, o fallo de red → 42501 / drop.
+    Aquí: service_role (bypassa RLS), límite free como 402 LIMPIO (no drop silencioso),
+    e idempotente por (route_id, client_id). El cliente lo encola igual que el marcado,
+    así un fallo de red NO pierde la parada."""
+    route_id: str
+    client_id: str  # idempotencia: misma client_id → misma fila
+    address: str
+    lat: float
+    lng: float
+    position: int
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    notes: Optional[str] = None
+    time_window_start: Optional[str] = None
+    time_window_end: Optional[str] = None
+    packages: Optional[int] = 1
+    place_id: Optional[str] = None
+    name: Optional[str] = None
+    color: Optional[str] = None
+    opening_hours: Optional[str] = None
+    type: Optional[str] = None
+    is_business: Optional[bool] = False
+    parking_spot: Optional[str] = None
+    package_id: Optional[int] = None
+    recurring_place_id: Optional[str] = None
+
+
+FREE_DAILY_STOP_LIMIT = 10  # mismo tope que can_insert_stop (RLS). Fuente única aquí.
+
+
+@app.post("/stops/add", tags=["stops"], summary="Alta DURABLE de parada (bypass RLS + límite free como 402 limpio, #82)")
+async def add_stop(body: StopAddRequest, user=Depends(get_current_user)):
+    """Crea una parada por service_role en vez del INSERT directo del cliente (que
+    RLS tiraba en silencio). Idempotente por (route_id, client_id). Enforça el límite
+    free (10/día) devolviendo 402 con mensaje claro de upsell, en lugar del rechazo
+    silencioso que perdía la parada (#82)."""
+    # 1) Resolver driver del usuario + verificar que la ruta es suya.
+    drv = await asyncio.to_thread(
+        lambda: supabase.table("drivers").select("id").eq("user_id", user["id"]).limit(1).execute()
+    )
+    drow = safe_first(drv)
+    if not drow:
+        raise HTTPException(status_code=403, detail="driver no encontrado para el usuario")
+    driver_id = drow["id"]
+    await verify_route_access(body.route_id, user)  # 403 si la ruta no es del driver
+
+    # 2) Idempotencia: si ya existe la fila (reintento de la cola offline), devolverla
+    #    sin re-chequear límite ni re-contar (ya se contó al crearla).
+    existing = await asyncio.to_thread(
+        lambda: supabase.table("stops").select("id")
+            .eq("route_id", body.route_id).eq("client_id", body.client_id)
+            .is_("deleted_at", "null").limit(1).execute()
+    )
+    erow = safe_first(existing)
+    if erow:
+        return {"success": True, "id": erow["id"], "existing": True}
+
+    # 3) Límite del plan free (mismas funciones DB que usaba la RLS, sin drift). Solo
+    #    para FREE; trial/pro/pro_plus sin tope. 402 LIMPIO → el cliente muestra upsell,
+    #    NO descarta la parada en silencio.
+    tier, _ = _resolve_user_tier(user["id"])
+    if tier == "free":
+        cnt = await asyncio.to_thread(
+            lambda: supabase.rpc("get_today_stop_count", {"p_driver_id": driver_id}).execute()
+        )
+        today_count = cnt.data if isinstance(cnt.data, int) else (cnt.data or 0)
+        if today_count >= FREE_DAILY_STOP_LIMIT:
+            raise HTTPException(
+                status_code=402,
+                detail={"error": "free_daily_stop_limit", "limit": FREE_DAILY_STOP_LIMIT,
+                        "message": "Has alcanzado el límite de paradas diarias del plan gratuito. Mejora a Pro para añadir paradas ilimitadas."},
+            )
+
+    # 4) Insertar con service_role (bypassa can_insert_stop). onConflict para carrera
+    #    con un reintento concurrente de la misma client_id.
+    payload = {
+        "route_id": body.route_id,
+        "client_id": body.client_id,
+        "address": body.address,
+        "lat": body.lat,
+        "lng": body.lng,
+        "position": body.position,
+        "status": "pending",
+        "phone": body.phone or None,
+        "email": body.email or None,
+        "notes": body.notes or None,
+        "time_window_start": body.time_window_start or None,
+        "time_window_end": body.time_window_end or None,
+        "packages": body.packages or 1,
+        "place_id": body.place_id or None,
+        "name": body.name or None,
+        "color": body.color or None,
+        "opening_hours": body.opening_hours or None,
+        "type": body.type or None,
+        "is_business": bool(body.is_business),
+        "parking_spot": body.parking_spot or None,
+        "package_id": body.package_id,
+        "recurring_place_id": body.recurring_place_id or None,
+    }
+    try:
+        ins = await asyncio.to_thread(
+            lambda: supabase.table("stops").upsert(payload, on_conflict="route_id,client_id").select("id").execute()
+        )
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=503, detail="no se pudo crear la parada, reintentar")
+    new_row = safe_first(ins)
+    if not new_row:
+        raise HTTPException(status_code=503, detail="no se pudo crear la parada, reintentar")
+
+    # 5) Contabilizar la parada del día (free) con la misma RPC que el cliente, para
+    #    que el límite siga siendo correcto. Best-effort: si falla, no revertimos la
+    #    parada (perder una parada es peor que un descuadre de 1 en el contador).
+    if tier == "free":
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            await asyncio.to_thread(
+                lambda: supabase.rpc("increment_daily_usage", {
+                    "p_driver_id": driver_id, "p_date": today, "p_field": "stops_added", "p_amount": 1,
+                }).execute()
+            )
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+
+    return {"success": True, "id": new_row["id"], "existing": False}
+
+
 # Reconciliador de stop_mutation_log (#58, OS-22): el endpoint /stops/mark deja
 # DURABLE la intención del driver aunque la fila aún no exista (ruta sin
 # sincronizar). Esto APLICA esas intenciones cuando la fila ya existe. 100%
