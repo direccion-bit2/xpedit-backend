@@ -79,12 +79,16 @@ def create_distance_matrix(locations: List[Dict[str, float]]) -> List[List[int]]
 
 
 def _parse_time_to_minutes(time_str: Optional[str]) -> Optional[int]:
-    """Convierte '09:00' a minutos desde medianoche (540)."""
+    """Convierte '09:00' a minutos desde medianoche (540). '25:99' u otros
+    valores fuera de rango devuelven None (antes 1599 → llegaba al solver)."""
     if not time_str:
         return None
     try:
         parts = time_str.split(':')
-        return int(parts[0]) * 60 + int(parts[1])
+        hours, minutes = int(parts[0]), int(parts[1])
+        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+            return None
+        return hours * 60 + minutes
     except (ValueError, IndexError):
         return None
 

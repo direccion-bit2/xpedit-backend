@@ -1038,3 +1038,20 @@ class TestGreedyFallback:
         assert result["success"] is True
         assert result["solver"] == "fallback-greedy"
         assert len(result["route"]) == 3
+
+
+class TestParseTimeRangeValidation:
+    """(#81 review) '25:99' parseaba como 1599 min y llegaba al solver — ahora None."""
+
+    def test_out_of_range_hours_returns_none(self):
+        from optimizer import _parse_time_to_minutes
+        assert _parse_time_to_minutes("25:99") is None
+        assert _parse_time_to_minutes("24:00") is None
+        assert _parse_time_to_minutes("10:60") is None
+        assert _parse_time_to_minutes("-1:30") is None
+
+    def test_valid_bounds_still_parse(self):
+        from optimizer import _parse_time_to_minutes
+        assert _parse_time_to_minutes("00:00") == 0
+        assert _parse_time_to_minutes("23:59") == 1439
+        assert _parse_time_to_minutes("09:00") == 540

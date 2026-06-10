@@ -13607,10 +13607,14 @@ async def degrade_expired_trials():
             if driver.get("email"):
                 already_sent = False
                 try:
+                    # Ventana 24h, NO all-time: el dedup protege del doble-envío
+                    # multi-réplica del MISMO evento; un driver que recibe OTRO
+                    # trial meses después SÍ debe recibir su email cuando expire.
                     probe = (
                         supabase.table("email_log").select("id")
                         .eq("recipient_email", driver["email"])
                         .eq("sent_by", "cron:trial_expired")
+                        .gte("created_at", (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat())
                         .limit(1).execute()
                     )
                     already_sent = bool(probe.data)
