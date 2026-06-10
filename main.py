@@ -12991,7 +12991,11 @@ async def backup_critical_tables():
                 status="in_progress",
             )
 
-        tables = ["drivers", "users", "routes", "stops", "referrals", "promo_codes"]
+        # (O3, Tanda 2) Añadidas delivery_proofs (evidencia legal de entrega) y
+        # stop_mutation_log (log de durabilidad #58) — eran justo las 2 tablas de
+        # evidencia/auditoría que NO se respaldaban. Ambas tienen `id` (paginación OK).
+        tables = ["drivers", "users", "routes", "stops", "referrals", "promo_codes",
+                  "delivery_proofs", "stop_mutation_log"]
         backup_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         backup_data = {}
 
