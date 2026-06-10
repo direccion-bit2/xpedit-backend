@@ -37,8 +37,9 @@ def _sb_for(existing=None, today_count=0, new_id="stop-new"):
         elif name == "stops":
             # existing check: select().eq().eq().is_().limit().execute()
             chain.select.return_value.eq.return_value.eq.return_value.is_.return_value.limit.return_value.execute.return_value = _mock(existing or [])
-            # upsert(...).select().execute()
-            chain.upsert.return_value.select.return_value.execute.return_value = _mock([{"id": new_id}])
+            # upsert(...).execute() — supabase-py devuelve la fila por defecto;
+            # NO se encadena .select() tras upsert (eso era el bug del smoke-test).
+            chain.upsert.return_value.execute.return_value = _mock([{"id": new_id}])
         return chain
 
     mock_sb.table = MagicMock(side_effect=table_dispatch)

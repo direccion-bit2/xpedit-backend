@@ -3095,8 +3095,10 @@ async def add_stop(body: StopAddRequest, user=Depends(get_current_user)):
         "recurring_place_id": body.recurring_place_id or None,
     }
     try:
+        # upsert devuelve la fila por defecto (return=representation); NO encadenar
+        # .select() tras .upsert() (no existe en supabase-py → AttributeError).
         ins = await asyncio.to_thread(
-            lambda: supabase.table("stops").upsert(payload, on_conflict="route_id,client_id").select("id").execute()
+            lambda: supabase.table("stops").upsert(payload, on_conflict="route_id,client_id").execute()
         )
     except Exception as e:
         sentry_sdk.capture_exception(e)
