@@ -4488,6 +4488,15 @@ async def list_admin_users(user=Depends(require_admin)):
             lambda: supabase.table("drivers").select("*").order("created_at", desc=True).order("id")
         )
 
+        # (S2, Tanda 2) select('*') traía session_token/session_device/push_token
+        # en la respuesta admin. No los necesita el panel y son credenciales/secretos
+        # de sesión → quitarlos. Strip por seguridad sin enumerar columnas (no romper
+        # ningún campo que el panel sí use).
+        for u in users:
+            u.pop("session_token", None)
+            u.pop("session_device", None)
+            u.pop("push_token", None)
+
         return {"success": True, "users": users}
 
     except Exception as e:
@@ -9014,10 +9023,10 @@ def _country_iso_from_coords(lat: Optional[float], lng: Optional[float]) -> Opti
 
 @app.get("/places/autocomplete", tags=["places"], summary="Autocompletado de direcciones")
 async def places_autocomplete(
-    input: str,
-    lat: Optional[float] = None,
-    lng: Optional[float] = None,
-    country: Optional[str] = None,
+    input: str = Query(..., min_length=1, max_length=200),  # (S3) acota input → no quemar cuota Google con basura
+    lat: Optional[float] = Query(default=None, ge=-90, le=90),
+    lng: Optional[float] = Query(default=None, ge=-180, le=180),
+    country: Optional[str] = Query(default=None, max_length=8),
     sessiontoken: Optional[str] = None,
     origin_lat: Optional[float] = None,
     origin_lng: Optional[float] = None,
@@ -9370,7 +9379,7 @@ async def places_autocomplete(
 
 @app.get("/places/details", tags=["places"], summary="Detalles de lugar")
 async def places_details(
-    place_id: str,
+    place_id: str = Query(..., min_length=1, max_length=300),  # (S3) acota place_id
     sessiontoken: Optional[str] = None,
     x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
     user=Depends(get_current_user),
@@ -9428,7 +9437,7 @@ async def places_details(
 
 
 @app.get("/places/snap", tags=["places"], summary="Alinear coordenadas a la red de carreteras de Google")
-async def places_snap(lat: float, lng: float, user=Depends(get_current_user)):
+async def places_snap(lat: float = Query(..., ge=-90, le=90), lng: float = Query(..., ge=-180, le=180), user=Depends(get_current_user)):  # (S3) bounds: lat=200 ya no quema cuota Google en ZERO_RESULTS
     """Reverse geocode via Google to get road-aligned coordinates.
     Used when stops come from Nominatim (which can be 30-40m off from Google's road network)."""
     # /places/snap usa Google Geocoding API (reverse) → cuenta como geocode.
@@ -10188,9 +10197,9 @@ def check_cost_alerts() -> dict:
 
 @app.get("/places/directions", tags=["places"], summary="Obtener direcciones de ruta")
 async def places_directions(
-    origin: str,
-    destination: str,
-    waypoints: Optional[str] = None,
+    origin: str = Query(..., max_length=200),  # (S3) acota origin/destination/waypoints
+    destination: str = Query(..., max_length=200),
+    waypoints: Optional[str] = Query(default=None, max_length=4000),  # ~25 wp "lat,lng|..." caben de sobra
     avoid: Optional[str] = None,
     heading: Optional[float] = None,
     x_triggered_by: Optional[str] = Header(default=None, alias="X-Triggered-By"),
@@ -15277,6 +15286,11 @@ async def send_fleet_message(msg: FleetMessageCreate, user=Depends(require_admin
 @app.get("/fleet/messages/{driver_id}", tags=["fleet"], summary="Get chat history")
 async def get_fleet_messages(driver_id: str, limit: int = Query(default=50, le=200), user=Depends(require_admin_or_dispatcher)):
     """Get chat history between dispatcher and driver."""
+    # (S1, Tanda 2) El POST /fleet/messages YA verifica acceso al driver; el GET
+    # no lo hacía → un dispatcher podía pasar el uuid de un driver de otra empresa.
+    # Va ANTES del try para que el 403 propague (el except Exception de abajo lo
+    # convertiría en 500). verify_driver_access ya scoping por company_id.
+    await verify_driver_access(driver_id, user)
     try:
         dispatcher_id = user["id"]
         # Get messages where sender/recipient is either the dispatcher or driver
