@@ -89,6 +89,87 @@ def _parse_time_to_minutes(time_str: Optional[str]) -> Optional[int]:
         return None
 
 
+def _sanitize_time_windows(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    (O5) Normaliza ventanas horarias inválidas (inicio >= fin).
+
+    Una ventana invertida (p.ej. "17:00"-"09:00") deja a OR-Tools/PyVRP/VROOM
+    INFACTIBLES y, en silencio, se acababa descartando la restricción horaria de
+    TODAS las paradas (OR-Tools reintenta sin ninguna ventana). En vez de penalizar
+    a todas por el dato malo de una sola, dejamos ESA parada sin ventana (cualquier
+    hora) y conservamos las ventanas válidas del resto. Se registra en el log para
+    que el descarte no sea silencioso. Devuelve una copia (no muta el input).
+    Coste 0 (sin llamadas externas).
+    """
+    sanitized: List[Dict[str, Any]] = []
+    dropped: List[Any] = []
+    for idx, loc in enumerate(locations):
+        tw_start = _parse_time_to_minutes(loc.get('time_window_start'))
+        tw_end = _parse_time_to_minutes(loc.get('time_window_end'))
+        if tw_start is not None and tw_end is not None and tw_start >= tw_end:
+            clean = {k: v for k, v in loc.items() if k not in ('time_window_start', 'time_window_end')}
+            sanitized.append(clean)
+            dropped.append(loc.get('id', idx))
+        else:
+            sanitized.append(loc)
+    if dropped:
+        logger.warning(
+            f"Ventanas horarias inválidas (inicio >= fin) ignoradas en {len(dropped)} parada(s): {dropped}. "
+            f"Se optimiza sin ventana para esas paradas; el resto conserva la suya."
+        )
+    return sanitized
+
+
+def _greedy_nearest_neighbor(
+    locations: List[Dict[str, Any]],
+    depot_index: int,
+    distance_matrix: List[List[int]],
+) -> Dict[str, Any]:
+    """
+    (O7) Fallback GARANTIZADO: orden vecino-más-cercano desde el depósito.
+
+    Cuando TODOS los solvers fallan (PyVRP/VROOM/OR-Tools), antes se devolvía
+    success:false sin ruta usable y el cliente la descartaba → el conductor se
+    quedaba SIN NADA. Esto siempre produce una permutación válida con la matriz
+    YA calculada (0 llamadas a API). No es óptimo, pero el conductor nunca se
+    queda tirado.
+    """
+    n = len(locations)
+    visited = [False] * n
+    visited[depot_index] = True
+    order = [depot_index]
+    current = depot_index
+    total_distance = 0
+    for _ in range(n - 1):
+        nearest = -1
+        nearest_d: Optional[int] = None
+        for j in range(n):
+            if visited[j]:
+                continue
+            d = distance_matrix[current][j]
+            if nearest_d is None or d < nearest_d:
+                nearest_d = d
+                nearest = j
+        if nearest < 0:
+            break
+        visited[nearest] = True
+        order.append(nearest)
+        total_distance += nearest_d or 0
+        current = nearest
+    route = [locations[i] for i in order]
+    return {
+        "success": True,
+        "route": route,
+        "total_distance_meters": total_distance,
+        "total_distance_km": round(total_distance / 1000, 2),
+        "num_stops": len(route),
+        "solver": "fallback-greedy",
+        "degraded": True,
+        "warning": "Los optimizadores no encontraron solución; orden aproximado (vecino más cercano) para no dejar la ruta sin paradas.",
+        "message": f"Ruta aproximada (fallback): {len(route)} paradas, {round(total_distance / 1000, 2)} km",
+    }
+
+
 def optimize_route(
     locations: List[Dict[str, Any]],
     depot_index: int = 0,
@@ -125,6 +206,9 @@ def optimize_route(
     # Validar depot_index
     if depot_index < 0 or depot_index >= len(locations):
         depot_index = 0
+
+    # (O5) Normalizar ventanas inválidas antes de construir el modelo.
+    locations = _sanitize_time_windows(locations)
 
     if distance_matrix is None:
         distance_matrix = create_distance_matrix(locations)
@@ -236,11 +320,10 @@ def optimize_route(
             result = optimize_route(locations_copy, depot_index, num_vehicles)
             result['warning'] = 'No se pudo respetar todas las ventanas horarias. Ruta optimizada sin restricciones horarias.'
             return result
-        return {
-            "success": False,
-            "error": "No se encontró solución",
-            "route": locations
-        }
+        # (O7) Ni con ni sin ventanas hubo solución → fallback garantizado
+        # (vecino más cercano) para no devolver una ruta vacía/descartable.
+        logger.warning("OR-Tools no encontró solución; usando fallback vecino-más-cercano")
+        return _greedy_nearest_neighbor(locations, depot_index, distance_matrix)
 
     # Extraer la ruta optimizada
     optimized_route = []
@@ -282,6 +365,7 @@ def solve_with_vroom(
     if not HAS_VROOM:
         return {"success": False, "error": "VROOM not available"}
 
+    locations = _sanitize_time_windows(locations)  # (O5) ventanas inválidas → sin ventana
     n = len(locations)
     if n < 2:
         return {
@@ -370,6 +454,7 @@ def solve_with_pyvrp(
     if not HAS_PYVRP:
         return {"success": False, "error": "PyVRP not available"}
 
+    locations = _sanitize_time_windows(locations)  # (O5) ventanas inválidas → sin ventana
     n = len(locations)
     if n < 2:
         return {
@@ -558,17 +643,28 @@ def hybrid_optimize_route(
             logger.error(f"VROOM crashed: {type(e).__name__}: {e}, falling back to OR-Tools")
 
     # === PRIORITY 3: OR-Tools (always available) ===
-    logger.info(f"Hybrid optimizer: using OR-Tools fallback for {n} stops")
-    result = optimize_route(
-        locations=locations,
-        depot_index=depot_index,
-        distance_matrix=distance_matrix,
-        duration_matrix=duration_matrix,
-        avg_speed_kmh=avg_speed_kmh,
-        stop_time_minutes=stop_time_minutes,
-    )
-    result["solver"] = "ortools"
-    return result
+    try:
+        logger.info(f"Hybrid optimizer: using OR-Tools fallback for {n} stops")
+        result = optimize_route(
+            locations=locations,
+            depot_index=depot_index,
+            distance_matrix=distance_matrix,
+            duration_matrix=duration_matrix,
+            avg_speed_kmh=avg_speed_kmh,
+            stop_time_minutes=stop_time_minutes,
+        )
+        if result.get("success"):
+            # optimize_route ya cae internamente a greedy si no hay solución (O7),
+            # devolviendo solver="fallback-greedy"; solo etiquetamos "ortools" si
+            # no vino marcado (solución real de OR-Tools).
+            result.setdefault("solver", "ortools")
+            return result
+        logger.error(f"OR-Tools sin éxito: {result.get('error')}; usando fallback greedy")
+    except Exception as e:
+        logger.error(f"OR-Tools crashed: {type(e).__name__}: {e}; usando fallback greedy")
+
+    # === PRIORITY 4: fallback GARANTIZADO (O7) — nunca dejar al conductor sin ruta ===
+    return _greedy_nearest_neighbor(locations, depot_index, distance_matrix)
 
 
 # ============================================================

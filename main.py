@@ -1682,7 +1682,7 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
             for r in range(biz_matrix_size):
                 biz_dist_matrix[r][0] = 0
                 biz_dur_matrix[r][0] = 0
-            biz_result = hybrid_optimize_route(biz_locs, 0, biz_dist_matrix, biz_dur_matrix)
+            biz_result = await asyncio.to_thread(hybrid_optimize_route, biz_locs, 0, biz_dist_matrix, biz_dur_matrix)
 
             # Phase 2: Optimize non-business stops (open-ended from last business stop)
             if non_business_indices:
@@ -1696,7 +1696,7 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
                 for r in range(non_biz_size):
                     non_biz_dist_matrix[r][0] = 0
                     non_biz_dur_matrix[r][0] = 0
-                non_biz_result = hybrid_optimize_route(non_biz_locs, 0, non_biz_dist_matrix, non_biz_dur_matrix)
+                non_biz_result = await asyncio.to_thread(hybrid_optimize_route, non_biz_locs, 0, non_biz_dist_matrix, non_biz_dur_matrix)
                 # Combine: depot + business route + non-business route (skip depot of each)
                 combined_route = [locations_data[depot_index]]
                 if biz_result.get("success"):
@@ -1731,18 +1731,25 @@ async def optimize(request: OptimizeRequest, user=Depends(get_current_user)):
                 eff_dist[i][depot_index] = 0
                 eff_dur[i][depot_index] = 0
 
-        # Allow forcing a specific solver for testing/comparison
+        # Allow forcing a specific solver for testing/comparison.
+        # (O2) Los solvers son CPU-bound SÍNCRONOS: ejecutarlos directos en este
+        # endpoint async bloqueaba el event loop hasta 45s, congelando health-checks
+        # y peticiones de TODOS los demás drivers. asyncio.to_thread los saca a un
+        # hilo y mantiene el loop responsivo (mismo patrón ya usado para Supabase).
         if request.solver == "vroom":
             from optimizer import solve_with_vroom
-            result = solve_with_vroom(locations_data, depot_index, eff_dist, eff_dur)
+            result = await asyncio.to_thread(solve_with_vroom, locations_data, depot_index, eff_dist, eff_dur)
         elif request.solver == "pyvrp":
             from optimizer import solve_with_pyvrp
-            result = solve_with_pyvrp(locations_data, depot_index, eff_dist, eff_dur)
+            result = await asyncio.to_thread(solve_with_pyvrp, locations_data, depot_index, eff_dist, eff_dur)
         elif request.solver == "ortools":
-            result = optimize_route(locations_data, depot_index, distance_matrix=eff_dist, duration_matrix=eff_dur)
+            result = await asyncio.to_thread(
+                optimize_route, locations_data, depot_index, distance_matrix=eff_dist, duration_matrix=eff_dur
+            )
             result["solver"] = "ortools"
         else:
-            result = hybrid_optimize_route(
+            result = await asyncio.to_thread(
+                hybrid_optimize_route,
                 locations=locations_data,
                 depot_index=depot_index,
                 distance_matrix=eff_dist,
@@ -1844,7 +1851,9 @@ async def optimize_multi(request: MultiVehicleOptimizeRequest, user=Depends(get_
     if request.max_distance_per_vehicle_km:
         max_distance = int(request.max_distance_per_vehicle_km * 1000)
 
-    result = optimize_multi_vehicle(
+    # (O2) solver síncrono CPU-bound → hilo aparte para no bloquear el event loop.
+    result = await asyncio.to_thread(
+        optimize_multi_vehicle,
         locations=locations_data,
         num_vehicles=request.num_vehicles,
         depot_index=request.depot_index or 0,
@@ -12281,7 +12290,14 @@ async def check_scheduled_posts():
 
 
 # Initialize scheduler
-social_scheduler = AsyncIOScheduler()
+# (O4) job_defaults global: el default de APScheduler para misfire_grace_time es
+# 1s, así que si el event loop está ocupado cuando toca un cron (p.ej. un /optimize
+# pesado), el disparo se descartaba ENTERO — el degrade horario o el backup diario
+# se saltaban esa ejecución en silencio. 300s da margen para que se ejecuten igual.
+# coalesce/max_instances ya son el default (True/1) pero los hacemos explícitos.
+social_scheduler = AsyncIOScheduler(
+    job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 300}
+)
 
 # RUN_SCHEDULER controls whether this process owns the cron jobs (digest,
 # trial expiry, reactivation followup, snapshot, etc.). When the backend runs
@@ -13579,13 +13595,40 @@ async def degrade_expired_trials():
             }).eq("id", driver["id"]).execute()
             degraded += 1
 
-            # Send notification email
+            # Send notification email.
+            # (O4) Dedup vía email_log: si dos procesos/réplicas ejecutan este cron
+            # a la vez (multi-réplica), ambos verían al mismo trial sin degradar y
+            # mandarían el "trial expirado" DOS veces. El probe lo evita y, de paso,
+            # deja por fin registro de a quién se notificó (antes no se guardaba).
             if driver.get("email"):
+                already_sent = False
+                try:
+                    probe = (
+                        supabase.table("email_log").select("id")
+                        .eq("driver_id", driver["id"]).eq("type", "trial_expired")
+                        .limit(1).execute()
+                    )
+                    already_sent = bool(probe.data)
+                except Exception:
+                    already_sent = False  # fail-open: ante duda, notificar (mejor que silenciar)
+                if already_sent:
+                    continue
                 email_result = send_trial_expired_email(
                     driver["email"], driver.get("name", ""), old_plan
                 )
                 if email_result.get("success"):
                     emailed += 1
+                    try:
+                        supabase.table("email_log").insert({
+                            "recipient": driver["email"],
+                            "subject": "Tu prueba de Xpedit ha terminado",
+                            "type": "trial_expired",
+                            "status": "sent",
+                            "driver_id": driver["id"],
+                            "metadata": {"old_plan": old_plan},
+                        }).execute()
+                    except Exception:
+                        pass
 
         logger.info(f"Trial degrade: {degraded} users downgraded to Free, {emailed} emails sent")
         if SENTRY_DSN:

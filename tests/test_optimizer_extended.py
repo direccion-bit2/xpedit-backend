@@ -958,3 +958,83 @@ class TestPyVrpDurationUnits:
                     f"got {e['duration']}"
                 )
                 assert e["distance"] == 0
+
+
+# ===================== O5: SANITIZE TIME WINDOWS (#81) =====================
+
+
+class TestSanitizeTimeWindows:
+    """(#81 O5) Ventanas invertidas (inicio >= fin) → se ignora SOLO esa, el resto conserva la suya."""
+
+    def test_drops_inverted_window_keeps_valid(self):
+        from optimizer import _sanitize_time_windows
+        locs = [
+            {"id": 0, "lat": 40.0, "lng": -3.0},
+            {"id": 1, "lat": 40.1, "lng": -3.1, "time_window_start": "17:00", "time_window_end": "09:00"},  # invertida
+            {"id": 2, "lat": 40.2, "lng": -3.2, "time_window_start": "09:00", "time_window_end": "17:00"},  # válida
+        ]
+        out = _sanitize_time_windows(locs)
+        assert "time_window_start" not in out[1] and "time_window_end" not in out[1]
+        assert out[2]["time_window_start"] == "09:00" and out[2]["time_window_end"] == "17:00"
+        # no muta el input original
+        assert locs[1]["time_window_start"] == "17:00"
+
+    def test_equal_start_end_is_invalid(self):
+        from optimizer import _sanitize_time_windows
+        locs = [{"id": 1, "lat": 40.0, "lng": -3.0, "time_window_start": "10:00", "time_window_end": "10:00"}]
+        out = _sanitize_time_windows(locs)
+        assert "time_window_start" not in out[0]
+
+    def test_optimize_route_with_inverted_window_does_not_silently_fail(self):
+        # Antes: una ventana invertida hacía a OR-Tools infactible → reintento sin
+        # NINGUNA ventana. Ahora se normaliza esa parada y la ruta sale OK.
+        locs = [
+            {"id": 0, "lat": 40.4168, "lng": -3.7038},
+            {"id": 1, "lat": 40.4065, "lng": -3.6895, "time_window_start": "20:00", "time_window_end": "08:00"},
+            {"id": 2, "lat": 40.4153, "lng": -3.6845, "time_window_start": "09:00", "time_window_end": "18:00"},
+        ]
+        result = optimize_route(locs)
+        assert result["success"] is True
+        assert len(result["route"]) == 3
+
+
+# ===================== O7: GREEDY FALLBACK (#81) =====================
+
+
+class TestGreedyFallback:
+    """(#81 O7) Si TODOS los solvers fallan, el conductor recibe SIEMPRE una ruta usable."""
+
+    def test_greedy_returns_valid_route_depot_first(self):
+        from optimizer import _greedy_nearest_neighbor
+        locs = [{"id": 0}, {"id": 1}, {"id": 2}]
+        matrix = [
+            [0, 10, 20],
+            [10, 0, 5],
+            [20, 5, 0],
+        ]
+        result = _greedy_nearest_neighbor(locs, 0, matrix)
+        assert result["success"] is True
+        assert result["solver"] == "fallback-greedy"
+        assert result["degraded"] is True
+        # depósito primero + vecino más cercano: A(0) -> B(1, d=10) -> C(2, d=5)
+        assert [s["id"] for s in result["route"]] == [0, 1, 2]
+        assert result["total_distance_meters"] == 15
+        # permutación completa (no pierde paradas)
+        assert sorted(s["id"] for s in result["route"]) == [0, 1, 2]
+
+    def test_hybrid_always_returns_route_when_all_solvers_fail(self):
+        # PyVRP/VROOM no disponibles + OR-Tools peta → debe caer al greedy (P4),
+        # NUNCA devolver success:false sin ruta (el cliente la descartaría).
+        from unittest.mock import patch as _patch
+        locs = [
+            {"id": 0, "lat": 40.4168, "lng": -3.7038},
+            {"id": 1, "lat": 40.4065, "lng": -3.6895},
+            {"id": 2, "lat": 40.4153, "lng": -3.6845},
+        ]
+        with _patch("optimizer.HAS_PYVRP", False), \
+             _patch("optimizer.HAS_VROOM", False), \
+             _patch("optimizer.optimize_route", side_effect=Exception("boom")):
+            result = hybrid_optimize_route(locs)
+        assert result["success"] is True
+        assert result["solver"] == "fallback-greedy"
+        assert len(result["route"]) == 3

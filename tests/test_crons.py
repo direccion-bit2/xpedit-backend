@@ -780,6 +780,37 @@ class TestDegradeExpiredTrials:
 
         mock_sentry.capture_exception.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_skips_email_if_already_logged_O4(self):
+        """(#81 O4) Si email_log ya tiene un 'trial_expired' para el driver (otra
+        réplica ya lo mandó en la misma hora), NO se reenvía → cero spam al usuario."""
+        expired = {
+            "id": "driver-dup",
+            "email": "dup@test.com",
+            "name": "Dup",
+            "promo_plan": "pro",
+            "promo_plan_expires_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+        }
+
+        def table_dispatch(name):
+            if name == "email_log":
+                # el probe de dedup encuentra un envío previo
+                return _FixedResultChain(data=[{"id": "prior-send"}])
+            if name == "drivers":
+                return _FixedResultChain(data=[expired])
+            return _FixedResultChain()
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=table_dispatch)
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expired_email", return_value={"success": True}) as mock_email:
+            from main import degrade_expired_trials
+            await degrade_expired_trials()
+
+        mock_email.assert_not_called()
+
 
 # ===================== PERIODIC HEALTH CHECK =====================
 
