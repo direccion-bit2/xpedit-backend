@@ -9409,6 +9409,14 @@ _ROUTES_V2_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 # añade el cliente RN (useRoutes.ts). Doc: routes/config_trade_offs.
 _ROUTES_V2_UNAWARE_PREFIXES = (
     "optimize", "load-route", "cold-start", "resume", "invert", "auto-effect",
+    # "recalc" degradado a Essentials A PROPÓSITO (#64, 10 jun): el recálculo
+    # tras desvío solo necesita una GEOMETRÍA nueva — el ETA-con-tráfico del
+    # recalc aporta poco (el ETA real lo actualiza el GPS en cada fix) y pagaba
+    # Pro $10/1k en el componente MÁS frecuente del coste de nav (recalc = 855
+    # calls de pago en 5 días). Essentials $5/1k = -50% por recálculo con la
+    # MISMA geometría de reroute. "start-nav" se queda en Pro: el ETA inicial
+    # con tráfico del tramo sí aporta valor al arrancar.
+    "recalc",
 )
 
 
