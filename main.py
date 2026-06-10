@@ -1061,9 +1061,34 @@ def _resolve_user_tier(auth_user_id: str) -> tuple[str, Optional[str]]:
     try:
         d = supabase.table("drivers").select(
             "id, promo_plan, promo_plan_expires_at, subscription_source, subscription_period"
-        ).eq("user_id", auth_user_id).single().execute()
-        row = d.data or {}
+        ).eq("user_id", auth_user_id).maybe_single().execute()
+        row = (d.data if d else None) or {}
     except Exception:
+        row = {}
+    # (D3 fix, 10-jun) Si no hay fila de driver (p.ej. pagó por web sin registro
+    # de driver) o falló la lectura, el plan puede vivir en `users` (el webhook
+    # de Stripe escribe AMBAS). No devolver free a un pagante: consultar users.
+    if not row:
+        try:
+            u = supabase.table("users").select(
+                "promo_plan, promo_plan_expires_at"
+            ).eq("id", auth_user_id).maybe_single().execute()
+            urow = (u.data if u else None) or {}
+            uplan = urow.get("promo_plan")
+            uexp = urow.get("promo_plan_expires_at")
+            if uplan in ("pro", "pro_plus"):
+                # Vigente si no caduca o caduca en el futuro (cubre pago + permanente
+                # + trial; todos con derecho a cuota OCR). Sin sub_src en users, no
+                # afinamos más: para cuota OCR pro≈trial es equivalente.
+                if not uexp:
+                    return uplan, None
+                try:
+                    if datetime.fromisoformat(uexp.replace("Z", "+00:00")) > datetime.now(timezone.utc):
+                        return uplan, None
+                except (ValueError, AttributeError):
+                    pass
+        except Exception:
+            pass
         return "free", None
     driver_id = row.get("id")
     promo = row.get("promo_plan")
@@ -2933,9 +2958,14 @@ async def mark_stop(body: StopMarkRequest, user=Depends(get_current_user)):
             update_fields = {"status": action, "completed_at": marked_at}
             if action == "failed":
                 update_fields["failed_at"] = marked_at
+            # (A3 forward-only, 10-jun) Solo aplicar sobre 'pending' o el MISMO
+            # estado (idempotente). Un terminal NO se voltea al otro por una op
+            # tardía de la cola offline (un 'failed' rezagado NO pisa un
+            # 'completed' ya entregado, ni al revés). El primer terminal manda.
             upd = await asyncio.to_thread(
                 lambda: supabase.table("stops").update(update_fields)
-                    .eq("id", resolved_id).is_("deleted_at", "null").execute()
+                    .eq("id", resolved_id).is_("deleted_at", "null")
+                    .in_("status", ["pending", action]).execute()
             )
             if safe_first(upd):
                 applied = True
@@ -3029,14 +3059,33 @@ async def reconcile_stop_mutation_log():
                         resolved_id = r2["id"]
 
             applied = False
-            if resolved_id:
+            ownership_changed = False
+            if resolved_id and route_id:
+                # (#71 ownership, 10-jun) Re-verificar que la ruta sigue siendo del
+                # driver que marcó. Si se reasignó (dispatcher B2B) entre el marcado
+                # offline y ahora, NO aplicar el marcado del driver antiguo: sellar
+                # con error. service_role bypassa RLS, así que esta es la única
+                # barrera (la RLS company-scoped aún no está en prod).
+                try:
+                    rt = await asyncio.to_thread(
+                        lambda rid=route_id: supabase.table("routes").select("driver_id")
+                            .eq("id", rid).maybe_single().execute()
+                    )
+                    rt_driver = (rt.data or {}).get("driver_id") if rt else None
+                    if rt_driver and row.get("driver_id") and rt_driver != row["driver_id"]:
+                        ownership_changed = True
+                except Exception:
+                    pass
+            if resolved_id and not ownership_changed:
                 marked_at = row.get("marked_at") or now.isoformat()
                 update_fields = {"status": action, "completed_at": marked_at}
                 if action == "failed":
                     update_fields["failed_at"] = marked_at
+                # (A3 forward-only) mismo guard que /stops/mark: no voltear un terminal.
                 upd = await asyncio.to_thread(
                     lambda rid=resolved_id: supabase.table("stops").update(update_fields)
-                        .eq("id", rid).is_("deleted_at", "null").execute()
+                        .eq("id", rid).is_("deleted_at", "null")
+                        .in_("status", ["pending", action]).execute()
                 )
                 if safe_first(upd):
                     applied = True
@@ -3046,7 +3095,15 @@ async def reconcile_stop_mutation_log():
                     )
                     applied_n += 1
 
-            if not applied:
+            if not applied and ownership_changed:
+                # (#71) La ruta se reasignó a otro driver: el marcado del driver
+                # antiguo ya no es válido. Sellar de inmediato (no esperar 24h).
+                await asyncio.to_thread(
+                    lambda lid=row["id"]: supabase.table("stop_mutation_log")
+                        .update({"error": "ownership_changed"}).eq("id", lid).execute()
+                )
+                gaveup_n += 1
+            elif not applied:
                 # No resoluble (ruta aún sin sincronizar, o parada borrada). Si
                 # ya es vieja, sellar con error para no reprocesar eternamente.
                 created = row.get("created_at")
@@ -7993,7 +8050,10 @@ async def revenuecat_webhook(request: Request):
     event_id = event.get("id", "")
     if _is_webhook_processed(event_id, "revenuecat"):
         return {"received": True, "status": "already_processed"}
-    _mark_webhook_processed(event_id, "revenuecat")
+    # (D2 fix, 10-jun) NO marcar procesado aquí: si el procesado falla (driver
+    # inexistente → 0 filas, o excepción), marcar antes haría que RC NO reintente
+    # = cobrado sin plan. Se marca al FINAL del try, solo tras éxito. El UPDATE
+    # por id es idempotente, así que un reintento de un evento ya aplicado es seguro.
 
     logger.info(f"RevenueCat webhook: type={event_type}, driver_id={app_user_id}, product={product_id}, entitlements={entitlement_ids}")
 
@@ -8039,9 +8099,16 @@ async def revenuecat_webhook(request: Request):
 
                 result = supabase.table("drivers").update(update_payload).eq("id", app_user_id).execute()
 
+                # (D2 fix) 0 filas = driver inexistente para este app_user_id.
+                # Cobrado en RC pero sin a quién aplicar el plan → NO tragar en
+                # silencio: alertar y lanzar 500 (sin marcar procesado) para que
+                # RC reintente y quede rastro de la incidencia de pago.
+                if not result.data:
+                    raise ValueError(f"RC grant: no driver for app_user_id={app_user_id} (plan={plan}, paid but not applied)")
+
                 # Also update users table via driver's user_id
-                driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()
-                if driver.data and driver.data.get("user_id"):
+                driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).maybe_single().execute()
+                if driver and driver.data and driver.data.get("user_id"):
                     supabase.table("users").update({
                         "promo_plan": plan,
                         "promo_plan_expires_at": expires_at,
@@ -8058,8 +8125,8 @@ async def revenuecat_webhook(request: Request):
                 "subscription_period": None,
             }).eq("id", app_user_id).execute()
 
-            driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).single().execute()
-            if driver.data and driver.data.get("user_id"):
+            driver = supabase.table("drivers").select("user_id").eq("id", app_user_id).maybe_single().execute()
+            if driver and driver.data and driver.data.get("user_id"):
                 supabase.table("users").update({
                     "promo_plan": None,
                     "promo_plan_expires_at": None,
@@ -8074,6 +8141,9 @@ async def revenuecat_webhook(request: Request):
         else:
             logger.info(f"RevenueCat webhook unhandled: {event_type}")
 
+        # (D2 fix) marcar procesado SOLO tras procesar con éxito (idempotencia
+        # real: un fallo deja el evento sin marcar → RC reintenta).
+        _mark_webhook_processed(event_id, "revenuecat")
         _last_revenuecat_webhook_ok = datetime.now(timezone.utc)
 
     except Exception as e:
@@ -13328,6 +13398,11 @@ async def degrade_expired_trials():
             .select("id, email, name, promo_plan, promo_plan_expires_at")
             .in_("promo_plan", ["pro", "pro_plus"])
             .eq("is_ambassador", False)
+            # (D1 fix, 10-jun) SOLO degradar TRIALS (subscription_source NULL).
+            # Un pagante Stripe/RevenueCat (source='stripe'/'revenuecat') cuyo
+            # expires_at se quedó atrás por un webhook de renovación fallido NO
+            # debe caer a free: este cron es para trials, no para suscriptores.
+            .is_("subscription_source", "null")
             .not_.is_("promo_plan_expires_at", "null")
             .lt("promo_plan_expires_at", now)
             .execute()
