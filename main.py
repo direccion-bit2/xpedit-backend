@@ -13600,12 +13600,17 @@ async def degrade_expired_trials():
             # a la vez (multi-réplica), ambos verían al mismo trial sin degradar y
             # mandarían el "trial expirado" DOS veces. El probe lo evita y, de paso,
             # deja por fin registro de a quién se notificó (antes no se guardaba).
+            # COLUMNAS REALES de email_log: recipient_email/recipient_name/subject/
+            # sent_by/status (verificado en BD 10-jun; NO existen driver_id/type/
+            # metadata — el primer intento las usaba y fallaba EN SILENCIO, mismo
+            # patrón roto que el dedup de surveys). Discriminador = sent_by.
             if driver.get("email"):
                 already_sent = False
                 try:
                     probe = (
                         supabase.table("email_log").select("id")
-                        .eq("driver_id", driver["id"]).eq("type", "trial_expired")
+                        .eq("recipient_email", driver["email"])
+                        .eq("sent_by", "cron:trial_expired")
                         .limit(1).execute()
                     )
                     already_sent = bool(probe.data)
@@ -13620,12 +13625,11 @@ async def degrade_expired_trials():
                     emailed += 1
                     try:
                         supabase.table("email_log").insert({
-                            "recipient": driver["email"],
-                            "subject": "Tu prueba de Xpedit ha terminado",
-                            "type": "trial_expired",
+                            "recipient_email": driver["email"],
+                            "recipient_name": driver.get("name"),
+                            "subject": f"Tu prueba de Xpedit ha terminado (plan {old_plan})",
+                            "sent_by": "cron:trial_expired",
                             "status": "sent",
-                            "driver_id": driver["id"],
-                            "metadata": {"old_plan": old_plan},
                         }).execute()
                     except Exception:
                         pass
