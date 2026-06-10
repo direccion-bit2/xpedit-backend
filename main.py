@@ -14,6 +14,7 @@ import random
 import re
 import time
 import unicodedata
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Literal, Optional
 from zoneinfo import ZoneInfo
@@ -33,7 +34,7 @@ def sentry_check_in(monitor_slug: str, status: str):
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from supabase import Client, create_client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -3014,6 +3015,18 @@ class StopAddRequest(BaseModel):
     lat: float
     lng: float
     position: int
+
+    @field_validator("route_id", "client_id")
+    @classmethod
+    def _must_be_uuid(cls, v: str) -> str:
+        # Sin esto, un id malformado llegaba a Postgres como error de cast
+        # (22P02) y el cliente recibía un 500/503 que reintentaba para siempre.
+        # 422 limpio = la cola lo trata como permanente y no entra en bucle.
+        try:
+            uuid.UUID(v)
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("debe ser un UUID válido")
+        return v
     phone: Optional[str] = None
     email: Optional[str] = None
     notes: Optional[str] = None
@@ -3116,20 +3129,11 @@ async def add_stop(body: StopAddRequest, user=Depends(get_current_user)):
     if not new_row:
         raise HTTPException(status_code=503, detail="no se pudo crear la parada, reintentar")
 
-    # 5) Contabilizar la parada del día (free) con la misma RPC que el cliente, para
-    #    que el límite siga siendo correcto. Best-effort: si falla, no revertimos la
-    #    parada (perder una parada es peor que un descuadre de 1 en el contador).
-    if tier == "free":
-        try:
-            today = datetime.now(timezone.utc).date().isoformat()
-            await asyncio.to_thread(
-                lambda: supabase.rpc("increment_daily_usage", {
-                    "p_driver_id": driver_id, "p_date": today, "p_field": "stops_added", "p_amount": 1,
-                }).execute()
-            )
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
-
+    # 5) Contador diario: NO se incrementa aquí. El CLIENTE sigue siendo el dueño
+    #    del contador (trackStopAdded → increment_daily_usage en add-time, como
+    #    siempre). Si el backend también contara, cada parada sumaría 2 y un free
+    #    quedaría bloqueado a 5 en vez de 10 (#82, decisión de diseño 10-jun).
+    #    Este endpoint solo LEE el contador (get_today_stop_count) para el 402.
     return {"success": True, "id": new_row["id"], "existing": False}
 
 

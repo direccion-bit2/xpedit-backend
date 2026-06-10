@@ -21,7 +21,9 @@ def _mock(data):
 
 
 BODY = {
-    "route_id": "route-1", "client_id": "cid-1", "address": "Calle Test 1",
+    "route_id": "11111111-1111-4111-8111-111111111111",
+    "client_id": "22222222-2222-4222-8222-222222222222",
+    "address": "Calle Test 1",
     "lat": 40.4, "lng": -3.7, "position": 0, "packageId": 5,
 }
 
@@ -83,17 +85,30 @@ class TestStopAdd:
         assert detail["error"] == "free_daily_stop_limit" and detail["limit"] == 10
 
     @pytest.mark.asyncio
-    async def test_free_under_limit_inserts_and_counts(self, client):
+    async def test_free_under_limit_inserts_without_backend_count(self, client):
+        """El backend solo LEE el contador para el 402; el CLIENTE sigue siendo el
+        dueño del increment (trackStopAdded). Si el backend también contara, cada
+        parada sumaría 2 → free bloqueado a 5 en vez de 10 (#82, diseño 10-jun)."""
         sb = _sb_for(existing=[], today_count=3)
         with patch("main.supabase", sb), \
              patch("main.verify_route_access", new=AsyncMock(return_value=None)), \
              patch("main._resolve_user_tier", return_value=("free", FAKE_DRIVER_ID)):
             resp = await client.post("/stops/add", json=BODY)
         assert resp.status_code == 200, resp.text
-        # contabiliza la parada del día (increment_daily_usage)
         rpc_calls = [c.args[0] for c in sb.rpc.call_args_list]
         assert "get_today_stop_count" in rpc_calls
-        assert "increment_daily_usage" in rpc_calls
+        assert "increment_daily_usage" not in rpc_calls
+
+    @pytest.mark.asyncio
+    async def test_malformed_uuid_returns_422_not_500(self, client):
+        """client_id no-UUID antes llegaba a Postgres (22P02) → 500/503 y la cola
+        reintentaba en bucle. Ahora 422 limpio = permanente, no se reintenta."""
+        bad = {**BODY, "client_id": "not-a-uuid"}
+        with patch("main.supabase", _sb_for(existing=[])), \
+             patch("main.verify_route_access", new=AsyncMock(return_value=None)), \
+             patch("main._resolve_user_tier", return_value=("pro", FAKE_DRIVER_ID)):
+            resp = await client.post("/stops/add", json=bad)
+        assert resp.status_code == 422, resp.text
 
     @pytest.mark.asyncio
     async def test_route_not_owned_403(self, client):
