@@ -701,6 +701,31 @@ class TestDegradeExpiredTrials:
         mock_email.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_does_not_degrade_paying_subscribers_D1(self):
+        """(#79 D1) El cron SOLO debe tocar trials: la query DEBE filtrar
+        subscription_source IS NULL para no degradar a un pagante Stripe/RC
+        cuyo expires_at se quedó atrás por un webhook de renovación fallido."""
+        is_calls = []
+
+        class _RecordingChain(_FixedResultChain):
+            def is_(self, col, val):
+                is_calls.append((col, val))
+                return self
+
+        mock_sb = make_mock_supabase()
+        mock_sb.table = MagicMock(side_effect=lambda name: _RecordingChain())
+
+        with patch("main.supabase", mock_sb), \
+             patch("main.SENTRY_DSN", ""), \
+             patch("main.send_trial_expired_email", return_value={"success": True}):
+            from main import degrade_expired_trials
+            await degrade_expired_trials()
+
+        # El filtro que protege a los pagantes tiene que estar en la query.
+        assert ("subscription_source", "null") in is_calls, \
+            f"degrade_expired_trials NO filtra subscription_source IS NULL → degradaría pagantes. is_ calls: {is_calls}"
+
+    @pytest.mark.asyncio
     async def test_no_expired_trials(self):
         mock_sb = make_mock_supabase()
         mock_sb.table = MagicMock(side_effect=lambda name: _FixedResultChain())
