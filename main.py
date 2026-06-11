@@ -10488,7 +10488,8 @@ async def closures_near(
 # Pricing 2026 (USD per 1.000 calls) — actualizar si cambia:
 # ============================================================================
 _API_PRICING_USD_PER_1K = {
-    "places": 5.0,            # Place Autocomplete + Details mix promedio
+    "places": 5.0,            # Place Autocomplete + Details mix promedio (API New)
+    "places_legacy": 5.0,     # Places Legacy residual (places-backend)
     "geocoding": 5.0,         # Geocoding API
     "routes": 5.0,            # Routes API v2 Essentials
     "directions_legacy": 5.0, # Directions API legacy (Sanlúcar pre-cache)
@@ -10499,12 +10500,18 @@ _API_PRICING_USD_PER_1K = {
 # factura. Aplica al pool conjunto de todos los servicios Maps (places, geocoding,
 # routes, directions). Vertex AI NO tiene free tier — cobra desde la 1ª llamada.
 _MAPS_FREE_TIER_USD_MONTHLY = 200.0
-_MAPS_SERVICES = {"places", "geocoding", "routes", "directions_legacy"}
+_MAPS_SERVICES = {"places", "places_legacy", "geocoding", "routes", "directions_legacy"}
 _VERTEX_SERVICES = {"vertex_gemini"}
 
-# Mapping servicio interno → service name del Google Cloud Monitoring
+# Mapping servicio interno → service name del Google Cloud Monitoring.
+# OJO (#87, 11-jun): "places" debe apuntar a places.googleapis.com (Places API
+# NEW, migración may-2026) — el viejo places-backend.googleapis.com es la
+# Legacy y solo lleva tráfico residual (~95/día vs ~2.000/día de la New).
+# Con el nombre viejo el dashboard de costes mostraba 0 para el servicio
+# más caro. Verificado contra Cloud Monitoring real el 11-jun.
 _GCP_SERVICE_MAP = {
-    "places": "places-backend.googleapis.com",
+    "places": "places.googleapis.com",
+    "places_legacy": "places-backend.googleapis.com",
     "geocoding": "geocoding-backend.googleapis.com",
     "routes": "routes.googleapis.com",
     "directions_legacy": "directions-backend.googleapis.com",
