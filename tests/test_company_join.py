@@ -95,7 +95,16 @@ class TestCompanyJoin:
                     mock.select.return_value.eq.return_value.limit.return_value.execute.return_value = MagicMock(
                         data=[{"id": "d1", "promo_plan": "pro"}]
                     )
+                elif table_name == "company_subscriptions":
+                    # Enforcement max_drivers: empresa con plan de 15 asientos.
+                    mock.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = MagicMock(
+                        data=[{"max_drivers": 15}]
+                    )
                 elif table_name == "company_driver_links":
+                    # Conteo de asientos usados (2 < 15 → hay sitio) + insert del link.
+                    mock.select.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(
+                        count=2, data=[]
+                    )
                     mock.insert = links_insert_mock
                     links_insert_mock.return_value.execute.return_value = MagicMock(data=[{"id": "link1"}])
                 elif table_name == "company_invite_uses":
@@ -144,7 +153,15 @@ class TestCompanyJoin:
                     mock.select.return_value.eq.return_value.limit.return_value.execute.return_value = MagicMock(
                         data=[{"id": "d1", "promo_plan": None}]
                     )
+                elif table_name == "company_subscriptions":
+                    mock.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = MagicMock(
+                        data=[{"max_drivers": 15}]
+                    )
                 elif table_name == "company_driver_links":
+                    # Hay sitio (1 < 15) para que el flujo LLEGUE al insert que falla.
+                    mock.select.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(
+                        count=1, data=[]
+                    )
                     # This is the failure point
                     mock.insert.return_value.execute.side_effect = Exception("simulated link insert failure")
                 return mock

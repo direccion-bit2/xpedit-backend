@@ -185,6 +185,168 @@ def send_welcome_email(to_email: str, user_name: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def send_welcome_company_email(to_email: str, company_name: str, owner_name: Optional[str] = None) -> dict:
+    """Email de bienvenida tras registrar una EMPRESA (B2B beta).
+
+    Distinto del welcome de conductor: aquí el destinatario es el gestor de flota,
+    no el repartidor. Le explica los 3 pasos del panel (invitar conductores,
+    importar rutas, ver la flota en el mapa) y que tiene 7 días de prueba sin tarjeta.
+    """
+    raw_company = (company_name or "tu empresa").strip()
+    company_name = html_escape(raw_company)
+    greeting = html_escape(owner_name) if owner_name else "Hola"
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px;">{greeting}, {company_name} ya está en Xpedit</h2>
+
+        <p style="margin: 0 0 25px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            Tu cuenta de empresa está lista. Tienes <strong>7 días de prueba gratis</strong>
+            (sin tarjeta) para organizar a tu equipo de reparto desde un solo panel.
+        </p>
+
+        <!-- Paso 1 -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 18px;">
+            <tr>
+                <td width="50" valign="top" style="padding-right: 14px;">
+                    <div style="background-color: #3b82f6; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px;">1</div>
+                </td>
+                <td valign="top">
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Invita a tus conductores</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Genera un código de invitación y compártelo. Se unen a tu flota al instante.</p>
+                </td>
+            </tr>
+        </table>
+
+        <!-- Paso 2 -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 18px;">
+            <tr>
+                <td width="50" valign="top" style="padding-right: 14px;">
+                    <div style="background-color: #10b981; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px;">2</div>
+                </td>
+                <td valign="top">
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Importa y asigna rutas</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Sube tus paradas (CSV/Excel), optimízalas y asígnalas a cada conductor.</p>
+                </td>
+            </tr>
+        </table>
+
+        <!-- Paso 3 -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 18px;">
+            <tr>
+                <td width="50" valign="top" style="padding-right: 14px;">
+                    <div style="background-color: #6366f1; color: #fff; width: 36px; height: 36px; border-radius: 50%; text-align: center; line-height: 36px; font-weight: 700; font-size: 18px;">3</div>
+                </td>
+                <td valign="top">
+                    <p style="margin: 0 0 4px 0; color: #111827; font-size: 16px; font-weight: 600;">Sigue la flota en el mapa</p>
+                    <p style="margin: 0; color: #6b7280; font-size: 14px;">Ve dónde está cada conductor y cómo avanza cada ruta en tiempo real.</p>
+                </td>
+            </tr>
+        </table>
+
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="https://www.xpedit.es/empresa/panel" style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 10px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
+                Abrir el panel de empresa
+            </a>
+        </div>
+
+        <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            ¿Dudas para empezar? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escríbenos por WhatsApp</a> o responde a este email. Te ayudo personalmente con el alta.
+        </p>
+
+        <p style="margin: 25px 0 0 0; color: #4b5563; font-size: 14px; text-align: center; font-style: italic;">
+            &mdash; Miguel, Xpedit
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": f"{raw_company} ya está en Xpedit — 7 días de prueba",
+            "html": get_base_template(content, "Bienvenido a Xpedit Empresa"),
+        })
+        return _resend_result(response)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_driver_invite_email(
+    to_email: str,
+    invite_code: str,
+    company_name: str,
+    driver_name: Optional[str] = None,
+    role: str = "driver",
+) -> dict:
+    """Email de invitación a un conductor para unirse a una EMPRESA (B2B beta).
+
+    El gestor de flota genera un código XPD-XXXX; este email se lo manda al
+    conductor con el código + enlaces de descarga. El conductor instala la app,
+    inicia sesión y mete el código en "Unirse a empresa".
+    """
+    raw_company = (company_name or "una empresa").strip()
+    company_name = html_escape(raw_company)
+    invite_code = html_escape(invite_code or "")
+    greeting = html_escape(driver_name) if driver_name else "Hola"
+    role_label = {
+        "dispatcher": "como coordinador/a de flota",
+        "company_admin": "como administrador/a de la empresa",
+    }.get((role or "driver").strip().lower(), "como conductor/a")
+    content = f"""
+        <h2 style="margin: 0 0 20px 0; color: #111827; font-size: 24px; text-align: center;">
+            {company_name} te invita a su flota en Xpedit
+        </h2>
+
+        <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+            {greeting}, <strong>{company_name}</strong> te ha invitado a unirte a su equipo de
+            reparto {role_label} en Xpedit, la app que organiza las rutas en minutos.
+        </p>
+
+        <p style="margin: 0 0 12px 0; color: #4b5563; font-size: 15px; text-align: center;">
+            Tu código de invitación
+        </p>
+
+        <div style="text-align: center; margin: 0 0 25px 0;">
+            <div style="display: inline-block; background-color: #eff6ff; border: 2px dashed #3b82f6; border-radius: 12px; padding: 16px 32px;">
+                <span style="font-family: 'Courier New', monospace; font-size: 30px; font-weight: 700; letter-spacing: 4px; color: #1d4ed8;">{invite_code}</span>
+            </div>
+        </div>
+
+        <div style="background-color: #f8fafc; border-left: 4px solid #3b82f6; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+            <p style="margin: 0 0 10px 0; color: #1e293b; font-size: 15px; font-weight: 600;">Cómo unirte (1 minuto):</p>
+            <ol style="margin: 0; padding-left: 20px; color: #475569; font-size: 14px; line-height: 1.7;">
+                <li>Descarga Xpedit e inicia sesión (o crea tu cuenta gratis)</li>
+                <li>Ve a tu perfil &rarr; <strong>"Unirse a una empresa"</strong></li>
+                <li>Introduce el código <strong>{invite_code}</strong> y listo</li>
+            </ol>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0 18px 0;">
+            <a href="{APP_STORE_URL}" style="display: inline-block; background-color: #111827; color: #ffffff; text-decoration: none; padding: 12px 26px; border-radius: 8px; font-weight: 500; font-size: 14px; margin: 4px 6px;">
+                Descargar para iPhone
+            </a>
+            <a href="{PLAY_STORE_URL}" style="display: inline-block; background-color: #111827; color: #ffffff; text-decoration: none; padding: 12px 26px; border-radius: 8px; font-weight: 500; font-size: 14px; margin: 4px 6px;">
+                Descargar para Android
+            </a>
+        </div>
+
+        <p style="margin: 25px 0 0 0; color: #6b7280; font-size: 14px; text-align: center;">
+            ¿Algún problema? <a href="{WHATSAPP_URL}" style="color: #22c55e; text-decoration: none; font-weight: 500;">Escríbenos por WhatsApp</a>.
+        </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "reply_to": REPLY_TO,
+            "subject": f"{raw_company} te invita a su flota en Xpedit",
+            "html": get_base_template(content, "Invitación a una flota en Xpedit"),
+        })
+        return _resend_result(response)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def send_delivery_started_email(
     to_email: str,
     client_name: str,

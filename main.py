@@ -114,6 +114,7 @@ from emails import (
     send_delivery_completed_email,
     send_delivery_failed_email,
     send_delivery_started_email,
+    send_driver_invite_email,
     send_plan_activated_email,
     send_reactivation_persistence_email,
     send_reengagement_broadcast,
@@ -126,6 +127,7 @@ from emails import (
     send_trial_last_day_email,
     send_trial_value_recap_email,
     send_upcoming_email,
+    send_welcome_company_email,
     send_welcome_email,
 )
 from optimizer import (
@@ -5155,6 +5157,11 @@ class CompanyInviteRequest(BaseModel):
     role: str = "driver"
     max_uses: Optional[int] = None
     expires_hours: int = 168  # 7 days
+    # Opcionales: si se pasa email, además de crear el código se envía la
+    # invitación por correo al conductor. Sin email → comportamiento idéntico
+    # al anterior (solo devuelve el código para compartir a mano).
+    email: Optional[str] = None
+    name: Optional[str] = None
 
 
 class CompanyJoinRequest(BaseModel):
@@ -5185,6 +5192,48 @@ def _generate_invite_code() -> str:
     """Generate a random invite code in the format XPD-XXXX"""
     suffix = "".join(random.choice(INVITE_CHARS) for _ in range(4))
     return f"XPD-{suffix}"
+
+
+# Default seat cap for a company without an explicit subscription row.
+# Mirrors the value seeded in /company/register (company_subscriptions.max_drivers).
+DEFAULT_COMPANY_MAX_DRIVERS = 15
+
+
+def _company_seat_status(company_id: str) -> tuple:
+    """Devuelve (asientos_usados, max_drivers) de una empresa.
+
+    asientos_usados = nº de company_driver_links ACTIVOS de la empresa.
+    max_drivers     = de su suscripción (la más reciente); si no hay fila,
+                      DEFAULT_COMPANY_MAX_DRIVERS.
+
+    Usamos count="exact" (no len de filas) para no toparnos con el cap de 1000
+    de PostgREST si una empresa creciera por encima de eso.
+    """
+    sub = supabase.table("company_subscriptions") \
+        .select("max_drivers") \
+        .eq("company_id", company_id) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+    sub_row = safe_first(sub)
+    raw_max = (sub_row or {}).get("max_drivers")
+    try:
+        max_drivers = int(raw_max)
+    except (TypeError, ValueError):
+        max_drivers = DEFAULT_COMPANY_MAX_DRIVERS
+    if max_drivers <= 0:
+        max_drivers = DEFAULT_COMPANY_MAX_DRIVERS
+
+    links = supabase.table("company_driver_links") \
+        .select("id", count="exact") \
+        .eq("company_id", company_id) \
+        .eq("active", True) \
+        .execute()
+    try:
+        used = int(links.count)
+    except (TypeError, ValueError):
+        used = len(links.data or [])
+    return used, max_drivers
 
 
 # 1. POST /company/register
@@ -5245,6 +5294,17 @@ async def register_company(request: CompanyRegisterRequest, user=Depends(get_cur
             "current_period_end": trial_end.isoformat(),
         }
         supabase.table("company_subscriptions").insert(subscription_data).execute()
+
+        # Email de bienvenida a la empresa — NO-FATAL: si Resend falla, el registro
+        # ya está hecho y no debe romperse. Se manda en thread aparte para no
+        # bloquear el event loop con la llamada HTTP saliente.
+        try:
+            await asyncio.to_thread(
+                send_welcome_company_email, request.email, request.name, None
+            )
+        except Exception as email_err:  # noqa: BLE001 — best-effort, nunca rompe el alta
+            logger.warning(f"welcome_company_email failed: {type(email_err).__name__}: {email_err}")
+            sentry_sdk.capture_exception(email_err)
 
         return {"success": True, "company": company}
 
@@ -5573,7 +5633,32 @@ async def create_company_invite(request: CompanyInviteRequest, user=Depends(get_
         if not invite:
             raise HTTPException(status_code=500, detail="Failed to create invite")
 
-        return {"success": True, "invite": invite}
+        # Si se aportó un email, enviar la invitación al conductor (NO-FATAL: el
+        # código ya existe y se devuelve igual aunque el email falle). Validación
+        # de email mínima para no llamar a Resend con basura.
+        invite_email = (request.email or "").strip()
+        email_sent = None
+        if invite_email and "@" in invite_email and "." in invite_email.split("@")[-1]:
+            try:
+                company_row = safe_first(
+                    supabase.table("companies").select("name").eq("id", company_id).limit(1).execute()
+                )
+                company_name = (company_row or {}).get("name") or "una empresa"
+                send_result = await asyncio.to_thread(
+                    send_driver_invite_email,
+                    invite_email,
+                    code,
+                    company_name,
+                    request.name,
+                    requested_role,
+                )
+                email_sent = bool(send_result.get("success"))
+            except Exception as email_err:  # noqa: BLE001 — best-effort
+                logger.warning(f"driver_invite_email failed: {type(email_err).__name__}: {email_err}")
+                sentry_sdk.capture_exception(email_err)
+                email_sent = False
+
+        return {"success": True, "invite": invite, "email_sent": email_sent}
 
     except HTTPException:
         raise
@@ -5681,6 +5766,17 @@ async def join_company(request: CompanyJoinRequest, user=Depends(get_current_use
             raise HTTPException(status_code=400, detail="User is already part of a company")
 
         company_id = invite["company_id"]
+
+        # ENFORCEMENT max_drivers: no dejar entrar más conductores de los que el
+        # plan de la empresa permite. Se comprueba ANTES de crear el link/mutar al
+        # usuario para no dejar a alguien medio-unido. Beta = plan free, 15 asientos.
+        seats_used, max_seats = _company_seat_status(company_id)
+        if seats_used >= max_seats:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Esta empresa ha alcanzado su límite de {max_seats} conductores. "
+                       "Pide al administrador que amplíe el plan.",
+            )
 
         # Honor the invite's role, but ONLY allow the two safe company-operator roles
         # (never the global platform 'admin'). A plain driver invite leaves role untouched.
@@ -5802,6 +5898,15 @@ async def leave_company(request: CompanyLeaveRequest, user=Depends(get_current_u
 async def create_company_driver(request: CompanyCreateDriverRequest, user=Depends(get_current_user)):
     """Crea una cuenta de conductor directamente en la empresa. Solo admin/dispatcher."""
     await verify_company_management(user, request.company_id)
+    # ENFORCEMENT max_drivers: comprobar el cupo ANTES de crear la cuenta auth, así
+    # no dejamos un usuario huérfano en auth.users si la empresa ya está llena.
+    seats_used, max_seats = _company_seat_status(request.company_id)
+    if seats_used >= max_seats:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Esta empresa ha alcanzado su límite de {max_seats} conductores. "
+                   "Amplía el plan para añadir más.",
+        )
     try:
         # Use supabase admin auth to create a new user
         auth_response = supabase.auth.admin.create_user({
