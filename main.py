@@ -10001,9 +10001,22 @@ _COST_ALERT_ANTISPAM_HOURS = 4
 # Umbrales (Miguel confirmó "OK los 4 tal cual" 23 may 14:25 CEST).
 _COST_ALERT_THRESHOLDS = {
     "routes_v2_eur_day": {"amber": 15.0, "red": 25.0},
+    # Umbral genérico para sources de bajo volumen (un pico ahí SÍ es sospechoso).
     "source_calls_hour": {"amber": 30, "red": 80},
     "unknown_calls_day": {"amber": 20, "red": 50},
     "driver_eur_day": {"amber": 5.0, "red": 10.0},
+}
+
+# Overrides por (endpoint, source) de ALTO VOLUMEN LEGÍTIMO: el autocompletado de
+# direcciones (address-search) hace ~2.200 autocomplete + ~600 details/día normales,
+# concentrados en la hora punta (10-14h) → cientos/h es lo NORMAL, no una fuga.
+# Con el umbral genérico 30/80 saltaba un RED en cada mañana de reparto (y tras CADA
+# deploy, porque el counter in-memory se resetea en boot y acumulaba >80 en ~20 min).
+# Falso positivo verificado 11-jun (incidente de las alertas de Miguel). Umbral real
+# = por encima del pico normal, por debajo de una fuga 2-3x. [[project_google_api_costs]]
+_COST_ALERT_SOURCE_OVERRIDES = {
+    ("places_autocomplete", "address-search"): {"amber": 450, "red": 800},
+    ("places_details", "address-search"): {"amber": 150, "red": 300},
 }
 
 
@@ -10090,20 +10103,29 @@ def check_cost_alerts() -> dict:
             fired.append(payload | {"level": level})
 
         # 2) Source individual calls/hora (últimos 60 min, in-memory counter)
+        uptime_min = (time.time() - _api_counters_started_at) / 60
         for endpoint_key, source_map in _api_source_counters.items():
             for source_key, count in source_map.items():
-                # Solo cuenta la última hora — usamos un proxy: tomar el delta
-                # del counter in-memory (resetea en boot Railway). Conservador:
-                # cuando uptime <1h, count ya refleja <1h de tráfico.
-                uptime_min = (time.time() - _api_counters_started_at) / 60
-                if uptime_min < 60:
-                    calls_in_hour = count  # in-memory cubre <1h
-                else:
-                    # Después de >1h uptime, no podemos extraer "última hora"
-                    # del counter in-memory acumulado. Skip — el cron diario
-                    # captura via routes_v2_eur_day total.
+                # El counter in-memory es ACUMULADO-DESDE-BOOT (resetea en cada
+                # deploy Railway), NO "última hora". Dos arreglos (11-jun):
+                #  (a) gate 20min: con <20min de uptime la muestra es ruido y,
+                #      peor, tras un deploy en hora punta el acumulado dispara
+                #      falsos RED (tarea #69). No evaluamos hasta tener muestra.
+                #  (b) PRORRATEAR a tasa/hora real cuando uptime<60min, en vez
+                #      de comparar el acumulado bruto contra un umbral horario.
+                if uptime_min < 20:
                     continue
-                th = _COST_ALERT_THRESHOLDS["source_calls_hour"]
+                if uptime_min < 60:
+                    calls_in_hour = int(round(count / (uptime_min / 60.0)))
+                else:
+                    # >60min: el counter ya cubre >1h acumulado; sin ventana
+                    # deslizante real, lo dejamos al cron diario (routes_v2_eur_day).
+                    continue
+                # Umbral específico para sources de alto volumen legítimo
+                # (address-search), genérico para el resto.
+                th = _COST_ALERT_SOURCE_OVERRIDES.get(
+                    (endpoint_key, source_key), _COST_ALERT_THRESHOLDS["source_calls_hour"]
+                )
                 if calls_in_hour >= th["red"]:
                     level, threshold = "red", th["red"]
                 elif calls_in_hour >= th["amber"]:
@@ -10112,10 +10134,11 @@ def check_cost_alerts() -> dict:
                     level, threshold = None, None
                 if level:
                     metric_key = f"source_{endpoint_key}_{source_key}"
-                    title = f"[Xpedit] Costs ALERT {level.upper()}: {endpoint_key}/{source_key} {calls_in_hour}/h > {threshold}/h"
+                    title = f"[Xpedit] Costs ALERT {level.upper()}: {endpoint_key}/{source_key} ~{calls_in_hour}/h > {threshold}/h"
                     body = (
-                        f"Endpoint {endpoint_key}, source '{source_key}' lleva {calls_in_hour} calls en menos de 1h. "
-                        f"Umbral {level} {threshold}/h. Posible regresión tipo bug #266 — revisa /admin/costs."
+                        f"Endpoint {endpoint_key}, source '{source_key}' a tasa ~{calls_in_hour}/h "
+                        f"(prorrateada sobre {uptime_min:.0f}min de uptime). Umbral {level} {threshold}/h. "
+                        f"Posible regresión tipo bug #266 — revisa /admin/costs."
                     )
                     payload = {"metric": metric_key, "value": calls_in_hour, "endpoint": endpoint_key, "source": source_key}
                     _fire_cost_alert(metric_key, level, title, body, payload)

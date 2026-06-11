@@ -33,7 +33,9 @@ def _setup_counters_under_threshold():
     """Reset in-memory counters so no spurious source-hour alerts fire."""
     import main
     main._api_source_counters.clear()
-    main._api_counters_started_at = time.time()  # uptime <1h so source check runs
+    # uptime 55min: >20min (pasa el gate) y <60min (se evalúa); a 55min el
+    # prorrateo a tasa/h es casi neutro, así los tests de umbral miden el umbral.
+    main._api_counters_started_at = time.time() - 55 * 60
 
 
 # =============== 1) Routes V2 €/day TOTAL ===============
@@ -121,6 +123,53 @@ class TestSourceCallsHourThreshold:
         source_fired = [f for f in result["fired"] if "source_places_directions_resume" in f.get("metric", "")]
         assert len(source_fired) == 1
         assert source_fired[0]["level"] == "red"
+
+    def test_address_search_high_volume_does_not_fire(self):
+        """11-jun: address-search es alto volumen LEGÍTIMO (~cientos/h en punta).
+        Con el override (amber 450 / red 800) un volumen normal de mañana NO debe
+        alertar (antes saltaba RED con el umbral genérico 80 → falso positivo)."""
+        _setup_counters_under_threshold()
+        import main
+        main._api_source_counters["places_autocomplete"] = {"address-search": 350}  # ~382/h, <450
+        mock_sb = MagicMock()
+        mock_sb.table = MagicMock(return_value=_FixedResultChain([]))
+        with patch("main.supabase", mock_sb), \
+             patch("main.send_alert_email"), \
+             patch("main._cost_alert_already_sent_recently", return_value=False):
+            from main import check_cost_alerts
+            result = check_cost_alerts()
+        assert [f for f in result["fired"] if "address-search" in f.get("metric", "")] == []
+
+    def test_address_search_real_leak_still_fires(self):
+        """Pero una FUGA real (muy por encima del pico normal) SÍ alerta."""
+        _setup_counters_under_threshold()
+        import main
+        main._api_source_counters["places_autocomplete"] = {"address-search": 800}  # ~873/h > 800 red
+        mock_sb = MagicMock()
+        mock_sb.table = MagicMock(return_value=_FixedResultChain([]))
+        with patch("main.supabase", mock_sb), \
+             patch("main.send_alert_email"), \
+             patch("main._cost_alert_already_sent_recently", return_value=False):
+            from main import check_cost_alerts
+            result = check_cost_alerts()
+        fired = [f for f in result["fired"] if "address-search" in f.get("metric", "")]
+        assert len(fired) == 1 and fired[0]["level"] == "red"
+
+    def test_fresh_boot_under_20min_does_not_fire(self):
+        """Tras un deploy (counter reseteado), <20min de uptime NO evalúa la alerta
+        horaria — evita el falso RED que disparó el incidente del 11-jun."""
+        _setup_counters_under_threshold()
+        import main
+        main._api_counters_started_at = time.time() - 8 * 60  # 8min uptime
+        main._api_source_counters["places_directions"] = {"resume": 200}  # acumulado alto post-boot
+        mock_sb = MagicMock()
+        mock_sb.table = MagicMock(return_value=_FixedResultChain([]))
+        with patch("main.supabase", mock_sb), \
+             patch("main.send_alert_email"), \
+             patch("main._cost_alert_already_sent_recently", return_value=False):
+            from main import check_cost_alerts
+            result = check_cost_alerts()
+        assert [f for f in result["fired"] if "source_" in f.get("metric", "")] == []
 
 
 # =============== 3) Unknown calls/day ===============
